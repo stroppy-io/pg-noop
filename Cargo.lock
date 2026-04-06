@@ -699,6 +699,7 @@ dependencies = [
  "clap",
  "futures",
  "pgwire",
+ "postgres-types",
  "serde",
  "serde_json",
  "tokio",

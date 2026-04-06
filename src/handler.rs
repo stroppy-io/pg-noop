@@ -9,19 +9,109 @@ use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
-    CopyResponse, DescribePortalResponse, DescribeResponse, DescribeStatementResponse,
-    QueryResponse, Response, Tag,
+    CopyResponse, DescribePortalResponse, DescribeResponse, DescribeStatementResponse, FieldFormat,
+    FieldInfo, QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
-use pgwire::api::ClientInfo;
+use pgwire::api::{ClientInfo, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::PgWireBackendMessage;
+use postgres_types::Kind;
 
 pub struct NoopHandler;
 
 // Accept all connections without authentication.
 impl NoopStartupHandler for NoopHandler {}
+
+/// Returns a `Type` with OID 0. When pgtype v5 sees OID 0 it falls back to
+/// Go-type based codec lookup (TypeForValue), so int64, string, float64, etc.
+/// all encode correctly without us knowing the actual schema.
+fn oid_zero() -> Type {
+    Type::new("?".to_owned(), 0, Kind::Simple, "pg_catalog".to_owned())
+}
+
+/// Counts SELECT columns at paren-depth 0 between SELECT and FROM.
+/// Works reliably for pgx's `select "c1", "c2" from "t"` pattern.
+fn count_select_columns(sql: &str) -> usize {
+    let upper = sql.trim().to_ascii_uppercase();
+    let body = match upper.strip_prefix("SELECT ") {
+        Some(rest) => rest,
+        None => return 1,
+    };
+    // Find " FROM " outside parens
+    let mut depth: u32 = 0;
+    let bytes = body.as_bytes();
+    let mut from_at = body.len();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b' ' if depth == 0 => {
+                if body[i..].starts_with(" FROM ") {
+                    from_at = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let select_list = &body[..from_at];
+    // Count commas at depth 0
+    depth = 0;
+    let mut cols: usize = 1;
+    for &b in select_list.as_bytes() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => cols += 1,
+            _ => {}
+        }
+    }
+    cols
+}
+
+/// Counts columns in `COPY table (col1, col2) FROM STDIN` by finding the
+/// paren-group between the table name and FROM.
+fn count_copy_columns(sql: &str) -> usize {
+    let upper = sql.trim().to_ascii_uppercase();
+    // Take the part before " FROM "
+    let before_from = match upper.find(" FROM ") {
+        Some(i) => &sql[..i],
+        None => return 1,
+    };
+    // Find the last '(' — that's the column list
+    let open = match before_from.rfind('(') {
+        Some(i) => i,
+        None => return 1, // no explicit column list
+    };
+    let after_open = &before_from[open + 1..];
+    let close = match after_open.find(')') {
+        Some(i) => i,
+        None => return 1,
+    };
+    let cols_str = after_open[..close].trim();
+    if cols_str.is_empty() {
+        return 1;
+    }
+    cols_str.bytes().filter(|&b| b == b',').count() + 1
+}
+
+fn copy_is_binary(sql: &str) -> bool {
+    let upper = sql.to_ascii_uppercase();
+    upper.contains("FORMAT BINARY") || upper.ends_with(" BINARY") || upper.ends_with(" BINARY;")
+}
+
+/// Builds N dummy FieldInfo entries with OID 0 so drivers can resolve
+/// encoders by their own Go/native type rather than by a schema OID.
+fn dummy_fields(n: usize) -> Vec<FieldInfo> {
+    let t = oid_zero();
+    (0..n)
+        .map(|_| FieldInfo::new("?column?".into(), None, None, t.clone(), FieldFormat::Text))
+        .collect()
+}
 
 fn classify_simple(sql: &str) -> Vec<Response> {
     let upper = sql.trim().to_ascii_uppercase();
@@ -48,13 +138,14 @@ fn classify_simple(sql: &str) -> Vec<Response> {
         vec![Response::TransactionEnd(Tag::new("ROLLBACK"))]
     } else if upper.starts_with("COPY") {
         if upper.contains("FROM STDIN") {
+            let cols = count_copy_columns(sql);
+            let fmt: i8 = if copy_is_binary(sql) { 1 } else { 0 };
             vec![Response::CopyIn(CopyResponse::new(
-                0,
-                0,
+                fmt,
+                cols,
                 stream::empty::<PgWireResult<CopyData>>(),
             ))]
         } else {
-            // COPY TO STDOUT — return empty stream
             vec![Response::CopyOut(CopyResponse::new(
                 0,
                 0,
@@ -129,23 +220,35 @@ impl ExtendedQueryHandler for NoopHandler {
     async fn do_describe_statement<C>(
         &self,
         _client: &mut C,
-        _stmt: &StoredStatement<Self::Statement>,
+        stmt: &StoredStatement<Self::Statement>,
     ) -> PgWireResult<DescribeStatementResponse>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        Ok(DescribeStatementResponse::no_data())
+        let upper = stmt.statement.trim().to_ascii_uppercase();
+        if upper.starts_with("SELECT") || upper.starts_with("WITH") {
+            let n = count_select_columns(&stmt.statement);
+            Ok(DescribeStatementResponse::new(vec![], dummy_fields(n)))
+        } else {
+            Ok(DescribeStatementResponse::no_data())
+        }
     }
 
     async fn do_describe_portal<C>(
         &self,
         _client: &mut C,
-        _portal: &Portal<Self::Statement>,
+        portal: &Portal<Self::Statement>,
     ) -> PgWireResult<DescribePortalResponse>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        Ok(DescribePortalResponse::no_data())
+        let upper = portal.statement.statement.trim().to_ascii_uppercase();
+        if upper.starts_with("SELECT") || upper.starts_with("WITH") {
+            let n = count_select_columns(&portal.statement.statement);
+            Ok(DescribePortalResponse::new(dummy_fields(n)))
+        } else {
+            Ok(DescribePortalResponse::no_data())
+        }
     }
 }
 
