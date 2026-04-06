@@ -2,6 +2,11 @@
 name = "pg-noop"
 version = "0.1.0"
 edition = "2021"
+description = "NoOp PostgreSQL blackhole server for benchmarking"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/stroppy-io/pg-noop"
+keywords = ["postgresql", "benchmark", "database", "noop", "blackhole"]
+categories = ["database", "command-line-utilities"]
 
 [[bin]]
 name = "pgnoop"
@@ -23,3 +28,8 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

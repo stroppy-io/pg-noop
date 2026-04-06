@@ -1,0 +1,16 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+cargo-dist-version = "0.31.0"
+ci = "github"
+installers = ["shell"]
+# Linux: static musl binaries (drop anywhere, no glibc dependency)
+# macOS: standard dynamic binaries (for dev/testing)
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]

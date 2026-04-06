@@ -4,6 +4,20 @@ A NoOp PostgreSQL server — a black hole for benchmark tools.
 
 Speaks the full PostgreSQL wire protocol (simple query, extended query, COPY), accepts connections from any driver, and discards everything. Returns mechanically valid but empty responses. The goal is to saturate benchmark tools and measure their maximum theoretical throughput without a real database in the way.
 
+## Install
+
+**One-line installer** (Linux x86-64 / ARM64, macOS):
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/stroppy-io/pg-noop/releases/latest/download/pg-noop-installer.sh | sh
+```
+
+**Direct download** (static Linux binary, no dependencies):
+```sh
+wget https://github.com/stroppy-io/pg-noop/releases/latest/download/pgnoop-x86_64-unknown-linux-musl.tar.gz
+tar xf pgnoop-x86_64-unknown-linux-musl.tar.gz
+./pgnoop --help
+```
+
 ## Build
 
 **Regular build:**
@@ -65,7 +79,7 @@ psql -h 127.0.0.1 -p 5432 -U any_user
 
 | Statement | Response |
 |---|---|
-| `SELECT` / `WITH` / `VALUES` | Empty result set (0 rows) |
+| `SELECT` / `WITH` / `TABLE` / `VALUES` | Empty result set (0 rows) |
 | `INSERT` | `INSERT 0 0` |
 | `UPDATE` | `UPDATE 0` |
 | `DELETE` | `DELETE 0` |
