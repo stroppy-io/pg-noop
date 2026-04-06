@@ -23,7 +23,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 # binary: target/x86_64-unknown-linux-musl/release/pgnoop
 ```
 
-The static binary can be `scp`'d to any x86-64 Linux server and run directly.
+Uses [jemalloc](https://github.com/jemalloc/jemalloc) instead of musl's default allocator to recover the performance lost in a musl build. The static binary can be `scp`'d to any x86-64 Linux server and run directly.
 
 ## Configuration
 
