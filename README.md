@@ -89,3 +89,5 @@ psql -h 127.0.0.1 -p 5432 -U any_user
 | Everything else | `OK` |
 
 Both **simple query** (psql) and **extended query** (pgx, psycopg3, JDBC, etc.) protocols are supported. No authentication — all connections are accepted.
+
+Wire protocol handling is provided by [`pgwire`](https://github.com/sunng87/pgwire), a Rust implementation of the PostgreSQL frontend/backend protocol ([crates.io](https://crates.io/crates/pgwire) · [docs.rs](https://docs.rs/pgwire)).
