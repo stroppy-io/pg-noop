@@ -20,7 +20,7 @@ struct NoopFactory(Arc<NoopHandler>);
 
 impl NoopFactory {
     fn new() -> Self {
-        NoopFactory(Arc::new(NoopHandler))
+        NoopFactory(Arc::new(NoopHandler::new()))
     }
 }
 
