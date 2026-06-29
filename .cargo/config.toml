@@ -1,5 +1,12 @@
-# Static musl build (requires musl-gcc: sudo dnf install musl-gcc musl-libc-static)
+# Static musl build: produces a dependency-free static-pie binary that runs
+# anywhere (glibc, musl/Alpine, scratch) with no system libc assumptions.
 # Usage: cargo build --release --target x86_64-unknown-linux-musl
+#
+# musl-gcc is needed only as the C compiler for jemalloc-sys (cc-rs auto-detects
+# it; install via `apt install musl-tools` / `dnf install musl-gcc`). Do NOT set
+# `linker = "musl-gcc"` here: that wrapper links against the system musl .so and
+# overrides crt-static, producing a *dynamic* musl binary (interp /lib/ld-musl)
+# that fails on glibc hosts and segfaults on musl/runtime mismatch. Leaving the
+# linker unset lets rustc's self-contained lld do the static link.
 [target.x86_64-unknown-linux-musl]
-linker = "musl-gcc"
 rustflags = ["-C", "target-feature=+crt-static"]

@@ -1,6 +1,6 @@
 [package]
 name = "pg-noop"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "NoOp PostgreSQL blackhole server for benchmarking"
 license = "MIT OR Apache-2.0"
