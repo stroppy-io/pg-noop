@@ -1,5 +1,6 @@
 mod config;
 mod handler;
+mod uring;
 mod wire;
 
 #[global_allocator]
@@ -11,7 +12,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use config::Config;
+use config::{Config, Io};
 use handler::{CatalogView, NoopHandler};
 use wire::Conn;
 
@@ -96,7 +97,7 @@ async fn serve(mut socket: TcpStream, catalog: CatalogView) {
 
 /// One shard: a pinned thread, its own single-threaded reactor, its own
 /// listener, and every connection it accepts served to completion on it.
-fn run_shard(id: usize, addr: SocketAddr, pin: bool, catalog: CatalogView) {
+fn run_shard(id: usize, addr: SocketAddr, pin: bool, io: Io, catalog: CatalogView) {
     if pin && !pin_to_cpu(id) {
         eprintln!("pgnoop: shard {id} could not pin to cpu {id}; continuing unpinned");
     }
@@ -109,9 +110,19 @@ fn run_shard(id: usize, addr: SocketAddr, pin: bool, catalog: CatalogView) {
         }
     };
 
+    // io_uring needs no runtime at all: the codec is sans-io, so a shard is a
+    // loop that submits reads, runs the codec, and submits writes. epoll keeps
+    // tokio because that is what tokio is for.
+    if io == Io::Uring {
+        if let Err(e) = crate::uring::run(listener, catalog, 4096) {
+            eprintln!("pgnoop: shard {id} io_uring loop ended: {e}");
+        }
+        return;
+    }
+
     // current_thread, not multi_thread: a shard IS one thread. There is no work
     // stealing because there is nothing to steal from -- which is the entire
-    // point. The measured cost of the alternative on lab2x1 was 1.14 futex
+    // point. The measured cost of the alternative was 1.14 futex
     // calls per query, a cross-core handoff per request.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -161,8 +172,8 @@ fn main() {
     let pin = shards <= std::thread::available_parallelism().map_or(1, |n| n.get());
 
     eprintln!(
-        "pgnoop listening on {}:{} ({} shards, SO_REUSEPORT, pinned={})",
-        config.host, config.port, shards, pin
+        "pgnoop listening on {}:{} ({} shards, {}, SO_REUSEPORT, pinned={})",
+        config.host, config.port, shards, config.io.as_str(), pin
     );
 
     // One handler, shared by every shard. This is NOT full share-nothing and the
@@ -173,13 +184,14 @@ fn main() {
     // remains shared per query is the Arc refcount, not the catalog.
     let catalog = CatalogView(Arc::new(NoopHandler::new()));
 
+    let io = config.io;
     let mut threads = Vec::with_capacity(shards);
     for id in 0..shards {
         let catalog = catalog.clone();
         threads.push(
             std::thread::Builder::new()
                 .name(format!("pgnoop-shard-{id}"))
-                .spawn(move || run_shard(id, addr, pin, catalog))
+                .spawn(move || run_shard(id, addr, pin, io, catalog))
                 .expect("spawn shard"),
         );
     }

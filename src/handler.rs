@@ -858,7 +858,7 @@ impl CatalogView {
 /// pgwire's own `NoopQueryParser` sets `Statement = String`, so the server gets
 /// the raw SQL back on every Execute and has to work out the answer again --
 /// for a client-cached prepared statement that is the identical bytes, every
-/// time, forever. Measured on lab2x1: a `select 1` re-ran a failed CREATE TABLE
+/// time, forever. Measured: a `select 1` re-ran a failed CREATE TABLE
 /// parse, a failed DROP TABLE parse, a scan for FROM and a comma count on every
 /// single execution.
 ///

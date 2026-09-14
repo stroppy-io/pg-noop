@@ -2,7 +2,7 @@
 //!
 //! # Why this exists
 //!
-//! Measured on lab2x1 2026-09-14: driving pg-noop with four stroppy processes
+//! Measured on a 16-core / 32-thread x86-64 host: driving pg-noop with four stroppy processes
 //! at 256 connections reached 825,238 q/s with **pgnoop at 4% of one core and
 //! the clients at 2259%** -- 22.6 of 32 cores. At that point the number is a
 //! measurement of the load generator, and every further improvement to the
@@ -23,7 +23,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 fn arg(name: &str, default: usize) -> usize {
@@ -125,10 +125,19 @@ fn main() {
 
     let done = Arc::new(AtomicBool::new(false));
     let total = Arc::new(AtomicU64::new(0));
+    // Per-batch round-trip times, nanoseconds. At --depth 1 a batch IS a query,
+    // so these are query latencies; above that they are the time to answer a
+    // pipelined batch and the label says so.
+    //
+    // Why this is measured at all: throughput medians hide the tail, and the
+    // tail is where a scheduler shows itself. Two backends can agree on median
+    // q/s and disagree completely about p99.
+    let lat: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
     let mut threads = Vec::new();
 
     for _ in 0..conns {
         let (batch, done, total) = (batch.clone(), done.clone(), total.clone());
+        let lat = lat.clone();
         let addr = addr.clone();
         let sql = sql.clone();
 
@@ -143,8 +152,10 @@ fn main() {
 
             let mut chunk = vec![0u8; 64 * 1024];
             let mut count: u64 = 0;
+            let mut mine: Vec<u64> = Vec::with_capacity(1 << 16);
 
             while !done.load(Ordering::Relaxed) {
+                let t0 = Instant::now();
                 if sock.write_all(&batch).is_err() {
                     break;
                 }
@@ -156,10 +167,14 @@ fn main() {
                         Ok(n) => got += chunk[..n].iter().filter(|&&b| b == b'Z').count(),
                     }
                 }
+                mine.push(t0.elapsed().as_nanos() as u64);
                 count += depth as u64;
             }
 
             total.fetch_add(count, Ordering::Relaxed);
+            if let Ok(mut all) = lat.lock() {
+                all.extend_from_slice(&mine);
+            }
         }));
     }
 
@@ -172,12 +187,30 @@ fn main() {
     let elapsed = start.elapsed().as_secs_f64();
 
     let q = total.load(Ordering::Relaxed);
+    let mut all = lat.lock().map(|g| g.clone()).unwrap_or_default();
+    all.sort_unstable();
+
+    let pct = |p: f64| -> f64 {
+        if all.is_empty() {
+            return 0.0;
+        }
+        let i = ((all.len() - 1) as f64 * p).round() as usize;
+        all[i] as f64 / 1e6
+    };
+
+    let unit = if depth == 1 { "query" } else { "batch" };
     println!(
-        "{} conns, depth {}, {:.1}s: {} queries, {:.0} q/s",
+        "{} conns, depth {}, {:.1}s: {} queries, {:.0} q/s | {} ms p50 {:.3} p90 {:.3} p99 {:.3} p999 {:.3} max {:.3}",
         conns,
         depth,
         elapsed,
         q,
-        q as f64 / elapsed
+        q as f64 / elapsed,
+        unit,
+        pct(0.50),
+        pct(0.90),
+        pct(0.99),
+        pct(0.999),
+        pct(1.0),
     );
 }

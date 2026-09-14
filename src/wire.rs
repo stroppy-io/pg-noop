@@ -184,7 +184,7 @@ impl Conn {
             tag::QUERY => {
                 let sql = cstr_read(body).unwrap_or("");
                 let plan = PreparedPlan::build(sql);
-                self.answer(&plan, out, catalog, true);
+                answer(&plan, out, catalog, true);
                 ready(out);
             }
 
@@ -201,7 +201,14 @@ impl Conn {
                 // [portal][stmt_name] then parameters we never look at.
                 let (portal, after) = cstr_at(body, 0)?;
                 let (stmt, _) = cstr_at(body, after)?;
-                self.portals.insert(portal.to_string(), stmt.to_string());
+                // Two String allocations per query if done unconditionally, and
+                // a driver binds the SAME portal to the SAME statement forever.
+                match self.portals.get(portal) {
+                    Some(cur) if cur == stmt => {}
+                    _ => {
+                        self.portals.insert(portal.to_string(), stmt.to_string());
+                    }
+                }
                 msg(out, b'2', |_| {});
             }
 
@@ -217,24 +224,29 @@ impl Conn {
                     msg(out, b't', |b| b.extend_from_slice(&0i16.to_be_bytes()));
                 }
 
-                match plan.and_then(|p| row_description(p, catalog)) {
-                    Some(desc) => out.extend_from_slice(&desc),
-                    None => msg(out, b'n', |_| {}),
+                let described = match plan {
+                    Some(p) => row_description(p, catalog, out),
+                    None => false,
+                };
+                if !described {
+                    msg(out, b'n', |_| {});
                 }
             }
 
             tag::EXECUTE => {
                 let (portal, _) = cstr_at(body, 0)?;
-                let plan = self
+                // No clone: `answer` is a free function precisely so the plan can
+                // stay borrowed out of `self`. It used to be a method, which made
+                // the borrow checker demand `.cloned()` -- a DEEP copy of the sql
+                // String and the parsed table/column Vecs, on every Execute.
+                match self
                     .portals
                     .get(portal)
                     .and_then(|s| self.statements.get(s))
-                    .cloned();
-
-                match plan {
+                {
                     // Execute does NOT re-send RowDescription; Describe did.
-                    Some(p) => self.answer(&p, out, catalog, false),
-                    None => msg(out, b'C', |b| cstr(b, "SELECT 0")),
+                    Some(p) => answer(p, out, catalog, false),
+                    None => complete(out, "SELECT", Some(0)),
                 }
             }
 
@@ -273,37 +285,38 @@ impl Conn {
         }
     }
 
-    /// The rows and the completion tag for one plan.
-    fn answer(&self, plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, describe: bool) {
-        match &plan.kind {
-            PlanKind::SelectMeta { .. } | PlanKind::SelectStub { .. } => {
-                let cols = plan_columns(plan, catalog);
-                if describe {
-                    if let Some(desc) = row_description(plan, catalog) {
-                        out.extend_from_slice(&desc);
-                    }
-                }
-                // A metadata select answers empty; a stub select answers one row.
-                let rows = if matches!(plan.kind, PlanKind::SelectMeta { .. }) && cols.resolved {
-                    0
-                } else {
-                    data_row(out, cols.count);
-                    1
-                };
-                msg(out, b'C', |b| cstr(b, &format!("SELECT {rows}")));
+}
+
+/// The rows and the completion tag for one plan. A FREE function, not a method:
+/// it never needed `self`, and being a method is what forced a deep clone of the
+/// plan at every Execute.
+fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, describe: bool) {
+    match &plan.kind {
+        PlanKind::SelectMeta { .. } | PlanKind::SelectStub { .. } => {
+            let cols = plan_columns(plan, catalog);
+            if describe {
+                row_description(plan, catalog, out);
             }
-            PlanKind::Insert => msg(out, b'C', |b| cstr(b, "INSERT 0 1")),
-            PlanKind::Update => msg(out, b'C', |b| cstr(b, "UPDATE 1")),
-            PlanKind::Delete => msg(out, b'C', |b| cstr(b, "DELETE 1")),
-            PlanKind::Begin => msg(out, b'C', |b| cstr(b, "BEGIN")),
-            PlanKind::Commit => msg(out, b'C', |b| cstr(b, "COMMIT")),
-            PlanKind::Rollback => msg(out, b'C', |b| cstr(b, "ROLLBACK")),
-            PlanKind::Ddl => {
-                catalog.apply(&plan.sql);
-                msg(out, b'C', |b| cstr(b, ddl_tag(&plan.sql)));
-            }
-            PlanKind::FromText => msg(out, b'C', |b| cstr(b, "SELECT 0")),
+            // A metadata select answers empty; a stub select answers one row.
+            let rows = if matches!(plan.kind, PlanKind::SelectMeta { .. }) && cols.resolved {
+                0
+            } else {
+                data_row(out, cols.count);
+                1
+            };
+            complete(out, "SELECT", Some(rows));
         }
+        PlanKind::Insert => complete_raw(out, "INSERT 0 1"),
+        PlanKind::Update => complete_raw(out, "UPDATE 1"),
+        PlanKind::Delete => complete_raw(out, "DELETE 1"),
+        PlanKind::Begin => complete_raw(out, "BEGIN"),
+        PlanKind::Commit => complete_raw(out, "COMMIT"),
+        PlanKind::Rollback => complete_raw(out, "ROLLBACK"),
+        PlanKind::Ddl => {
+            catalog.apply(&plan.sql);
+            complete_raw(out, ddl_tag(&plan.sql));
+        }
+        PlanKind::FromText => complete(out, "SELECT", Some(0)),
     }
 }
 
@@ -317,6 +330,38 @@ fn msg(out: &mut Vec<u8>, tag: u8, body: impl FnOnce(&mut Vec<u8>)) {
     body(out);
     let len = (out.len() - at) as i32;
     out[at..at + 4].copy_from_slice(&len.to_be_bytes());
+}
+
+/// CommandComplete with a trailing count, written WITHOUT formatting into a
+/// temporary String. `format!("SELECT {n}")` was one heap allocation per query.
+fn complete(out: &mut Vec<u8>, verb: &str, n: Option<u64>) {
+    msg(out, b'C', |b| {
+        b.extend_from_slice(verb.as_bytes());
+        if let Some(n) = n {
+            b.push(b' ');
+            push_u64(b, n);
+        }
+        b.push(0);
+    });
+}
+
+fn complete_raw(out: &mut Vec<u8>, tag: &str) {
+    msg(out, b'C', |b| cstr(b, tag));
+}
+
+fn push_u64(out: &mut Vec<u8>, mut n: u64) {
+    if n == 0 {
+        out.push(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    out.extend_from_slice(&buf[i..]);
 }
 
 fn cstr(out: &mut Vec<u8>, s: &str) {
@@ -370,23 +415,23 @@ fn plan_columns(plan: &PreparedPlan, catalog: &CatalogView) -> Columns {
 /// RowDescription, using the client's own column names when the catalog knows
 /// the table -- a driver that created a table and selects from it gets its names
 /// back, which is the one piece of real behaviour this server has.
-fn row_description(plan: &PreparedPlan, catalog: &CatalogView) -> Option<Vec<u8>> {
-    let (names, oids) = match &plan.kind {
-        PlanKind::SelectMeta { table, columns } => match catalog.columns_for(table, columns) {
-            Some(cols) => {
-                let (n, o): (Vec<String>, Vec<u32>) = cols.into_iter().unzip();
-                (n, o)
-            }
-            None => stub_names(columns.len().max(1)),
-        },
-        PlanKind::SelectStub { columns } => stub_names(*columns),
-        _ => return None,
+fn row_description(plan: &PreparedPlan, catalog: &CatalogView, out: &mut Vec<u8>) -> bool {
+    // Resolved names only when the catalog knows the table; otherwise n stub
+    // columns, named from a &'static str rather than n freshly allocated
+    // Strings.
+    let resolved = match &plan.kind {
+        PlanKind::SelectMeta { table, columns } => catalog
+            .columns_for(table, columns)
+            .or_else(|| Some(stub_cols(columns.len().max(1)))),
+        PlanKind::SelectStub { columns } => Some(stub_cols(*columns)),
+        _ => return false,
     };
 
-    let mut buf = Vec::with_capacity(16 + names.len() * 24);
-    msg(&mut buf, b'T', |b| {
-        b.extend_from_slice(&(names.len() as i16).to_be_bytes());
-        for (name, oid) in names.iter().zip(oids.iter()) {
+    let Some(cols) = resolved else { return false };
+
+    msg(out, b'T', |b| {
+        b.extend_from_slice(&(cols.len() as i16).to_be_bytes());
+        for (name, oid) in cols.iter() {
             cstr(b, name);
             b.extend_from_slice(&0i32.to_be_bytes()); // table oid
             b.extend_from_slice(&0i16.to_be_bytes()); // column no
@@ -397,11 +442,13 @@ fn row_description(plan: &PreparedPlan, catalog: &CatalogView) -> Option<Vec<u8>
         }
     });
 
-    Some(buf)
+    true
 }
 
-fn stub_names(n: usize) -> (Vec<String>, Vec<u32>) {
-    ((0..n).map(|_| "?column?".to_string()).collect(), vec![20; n])
+const STUB_COL: &str = "?column?";
+
+fn stub_cols(n: usize) -> Vec<(String, u32)> {
+    (0..n).map(|_| (STUB_COL.to_string(), 20u32)).collect()
 }
 
 fn ddl_tag(sql: &str) -> &'static str {
