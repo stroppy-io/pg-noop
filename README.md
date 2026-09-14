@@ -47,7 +47,8 @@ Parameters are resolved in order: **CLI flag → environment variable → `pgnoo
 |---|---|---|---|
 | Bind host | `--host` | `PGNOOP_HOST` | `0.0.0.0` |
 | Port | `--port` | `PGNOOP_PORT` | `5432` |
-| Worker threads | `--workers` | `PGNOOP_WORKERS` | number of logical CPUs |
+| Shards (threads) | `--workers` | `PGNOOP_WORKERS` | number of logical CPUs |
+| I/O backend | `--io` | `PGNOOP_IO` | `uring` (`epoll` also available) |
 | Config file path | `--config` | `PGNOOP_CONFIG` | `./pgnoop.json` |
 
 **`pgnoop.json` example:**
@@ -74,6 +75,70 @@ PGNOOP_PORT=15432 PGNOOP_WORKERS=8 ./pgnoop
 # Connect with psql
 psql -h 127.0.0.1 -p 5432 -U any_user
 ```
+
+## Throughput
+
+16-core / 32-thread x86-64 host, 32 connections, `select 1`, extended protocol,
+statement prepared once.
+
+| pipeline depth | before | after | ratio |
+|---|---|---|---|
+| 1 | 183,766 | **2,955,570** | **16.1** |
+| 8 | 778,586 | 18,948,021 | 24.3 |
+| 32 | 1,789,643 | 45,539,268 | 25.5 |
+
+Depth 1 is one query per round trip. PostgreSQL 18.6, same host and client,
+answers 548,217 q/s at that depth.
+
+### Limit
+
+| depth | q/s | µs/query |
+|---|---|---|
+| 1 | 2,831,421 | 8.000 |
+| 2 | 5,333,392 | 4.500 |
+| 4 | 10,651,482 | 2.000 |
+| 8 | 18,012,011 | 1.500 |
+| 16 | 31,548,029 | 0.875 |
+| 32 | 46,320,724 | 0.594 |
+| 64 | 71,358,174 | 0.344 |
+
+Per-query cost falls 23× under amortisation; per-batch median is flat.
+Decomposition: ~0.3 µs work, ~7.7 µs kernel TCP loopback. **At depth 1 the
+server is round-trip bound, not work bound.** A benchmark plateauing near these
+figures is probably not plateauing on pg-noop.
+
+### I/O backends
+
+Shard-per-core over the same codec, differing only in byte movement. Selected
+with `--io`.
+
+| | syscalls/query | q/s at depth 1 |
+|---|---|---|
+| `epoll` | 3.00 (`epoll_wait` + `recvfrom` + `sendto`) | 2,886,260 |
+| `uring` | 1.51 (`io_uring_enter`) | 2,944,008 |
+
+io_uring halves syscalls for +2%: the codec had already reduced the reply to one
+write.
+
+`SINGLE_ISSUER` + `DEFER_TASKRUN` (Linux 6.1+) are default on and worth +19% at
+depth 1 over plain io_uring; without them io_uring is slower than epoll.
+`PGNOOP_NO_DEFER=1` disables.
+
+`PGNOOP_SQPOLL=<idle_ms>` is off by default and should stay off at one shard per
+core: one spinning kernel poller per shard, 174× slower.
+
+### Reproducing
+
+```sh
+cargo build --release
+./target/release/pgnoop --host 127.0.0.1 &
+./target/release/saturate --conns 32 --depth 1 --secs 5
+```
+
+`saturate`: raw sockets, pre-encoded pipelined messages, no allocation in the
+loop, reports p50/p90/p99/p99.9/max. Conventional load tools saturate first —
+four instances reached 825,238 q/s with pg-noop at 4% of one core, at which
+point the figure describes the client.
 
 ## Protocol support
 
