@@ -7,13 +7,13 @@ use futures::Sink;
 use futures::{future, stream};
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::copy::CopyHandler;
-use pgwire::api::portal::Portal;
+use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
     CopyResponse, DataRowEncoder, DescribePortalResponse, DescribeResponse,
     DescribeStatementResponse, FieldFormat, FieldInfo, QueryResponse, Response, Tag,
 };
-use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
+use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
@@ -25,21 +25,33 @@ pub struct NoopHandler {
     /// extended-query path for EVERY statement, and it used to return
     /// `Arc::new(NoopQueryParser)` -- a heap allocation per query to hand back a
     /// zero-sized type.
-    parser: Arc<NoopQueryParser>,
+    parser: Arc<PlanParser>,
 }
 
 impl NoopHandler {
     pub fn new() -> Self {
         Self {
             catalog: RwLock::new(SchemaCatalog::default()),
-            parser: Arc::new(NoopQueryParser),
+            parser: Arc::new(PlanParser),
         }
     }
 
     fn fields_for_metadata_select(&self, sql: &str) -> Option<Arc<Vec<FieldInfo>>> {
         let (table_name, selected_columns) = parse_metadata_select(sql)?;
+
+        self.fields_for_parsed_select(&table_name, &selected_columns)
+    }
+
+    /// The catalog half, split out so a plan prepared once can reuse it without
+    /// re-parsing the statement on every execution.
+    fn fields_for_parsed_select(
+        &self,
+        table_name: &[String],
+        selected_columns: &[SelectColumn],
+    ) -> Option<Arc<Vec<FieldInfo>>> {
         let catalog = self.catalog.read().expect("schema catalog poisoned");
-        catalog.fields_for_select(&table_name, &selected_columns)
+
+        catalog.fields_for_select(table_name, selected_columns)
     }
 
     fn apply_schema_change(&self, sql: &str) {
@@ -298,7 +310,7 @@ fn copy_is_binary(sql: &str) -> bool {
     upper.contains("FORMAT BINARY") || upper.ends_with(" BINARY") || upper.ends_with(" BINARY;")
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SelectColumn {
     name: Option<String>,
     is_star: bool,
@@ -808,6 +820,173 @@ fn empty_query(fields: &Arc<Vec<FieldInfo>>) -> QueryResponse {
     QueryResponse::new(Arc::clone(fields), stream::empty())
 }
 
+/// What a statement will do, decided ONCE when it is prepared.
+///
+/// pgwire's own `NoopQueryParser` sets `Statement = String`, so the server gets
+/// the raw SQL back on every Execute and has to work out the answer again --
+/// for a client-cached prepared statement that is the identical bytes, every
+/// time, forever. Measured on lab2x1: a `select 1` re-ran a failed CREATE TABLE
+/// parse, a failed DROP TABLE parse, a scan for FROM and a comma count on every
+/// single execution.
+///
+/// `QueryParser::parse_sql` is called once, at Parse. Everything that is a pure
+/// function of the SQL TEXT belongs there. What deliberately does NOT is the
+/// catalog lookup: a table can be created after a statement is prepared, so the
+/// metadata select keeps its parsed table/column names here and resolves them
+/// against the catalog at execution.
+#[derive(Debug, Clone)]
+pub enum PlanKind {
+    /// A SELECT naming a table: resolve against the catalog at execution.
+    SelectMeta {
+        table: Vec<String>,
+        columns: Vec<SelectColumn>,
+    },
+    /// A SELECT that names no table: hand back n stub columns.
+    SelectStub { columns: usize },
+    Insert,
+    Update,
+    Delete,
+    Begin,
+    Commit,
+    Rollback,
+    /// DDL, and the only kind that still touches the SQL text at execution,
+    /// because it mutates the catalog.
+    Ddl,
+    /// COPY and anything unrecognised: decided from the text as before. Rare,
+    /// and not on any benchmark's hot path.
+    FromText,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedPlan {
+    pub sql: String,
+    pub kind: PlanKind,
+}
+
+impl PreparedPlan {
+    fn build(sql: &str) -> Self {
+        let head = first_keyword(sql);
+
+        let kind = if head.eq_ignore_ascii_case("SELECT")
+            || head.eq_ignore_ascii_case("WITH")
+            || head.eq_ignore_ascii_case("TABLE")
+            || head.eq_ignore_ascii_case("VALUES")
+        {
+            match parse_metadata_select(sql) {
+                Some((table, columns)) => PlanKind::SelectMeta { table, columns },
+                None => PlanKind::SelectStub {
+                    columns: count_select_columns(sql),
+                },
+            }
+        } else if head.eq_ignore_ascii_case("INSERT") {
+            PlanKind::Insert
+        } else if head.eq_ignore_ascii_case("UPDATE") {
+            PlanKind::Update
+        } else if head.eq_ignore_ascii_case("DELETE") {
+            PlanKind::Delete
+        } else if head.eq_ignore_ascii_case("BEGIN") {
+            PlanKind::Begin
+        } else if head.eq_ignore_ascii_case("COMMIT") {
+            PlanKind::Commit
+        } else if head.eq_ignore_ascii_case("ROLLBACK") {
+            PlanKind::Rollback
+        } else if head.eq_ignore_ascii_case("CREATE") || head.eq_ignore_ascii_case("DROP") {
+            PlanKind::Ddl
+        } else {
+            PlanKind::FromText
+        };
+
+        PreparedPlan {
+            sql: sql.to_string(),
+            kind,
+        }
+    }
+
+    /// The fields a Describe should report, resolved now rather than at Parse
+    /// so a table created since preparation is still seen.
+    fn describe_fields(&self, handler: &NoopHandler) -> Option<Arc<Vec<FieldInfo>>> {
+        match &self.kind {
+            PlanKind::SelectMeta { table, columns } => Some(
+                handler
+                    .fields_for_parsed_select(table, columns)
+                    .unwrap_or_else(|| stub_fields(columns.len().max(1))),
+            ),
+            PlanKind::SelectStub { columns } => Some(stub_fields(*columns)),
+            _ => None,
+        }
+    }
+}
+
+/// Our parser: does the text work once, at Parse.
+pub struct PlanParser;
+
+#[async_trait]
+impl QueryParser for PlanParser {
+    type Statement = PreparedPlan;
+
+    async fn parse_sql<C>(
+        &self,
+        _client: &C,
+        sql: &str,
+        _types: &[Option<Type>],
+    ) -> PgWireResult<Self::Statement>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        Ok(PreparedPlan::build(sql))
+    }
+
+    /// A blackhole resolves no parameter types: it never looks at the values,
+    /// and claiming a type it did not derive would be a lie the client acts on.
+    fn get_parameter_types(&self, _stmt: &Self::Statement) -> PgWireResult<Vec<Type>> {
+        Ok(vec![])
+    }
+
+    /// The result schema IS known at Parse for a stub select, but not for one
+    /// naming a table -- that needs the catalog, which the parser does not hold.
+    /// The handler's own do_describe_* resolve it, so report nothing here rather
+    /// than report it wrongly.
+    fn get_result_schema(
+        &self,
+        _stmt: &Self::Statement,
+        _column_format: Option<&Format>,
+    ) -> PgWireResult<Vec<FieldInfo>> {
+        Ok(vec![])
+    }
+}
+
+/// Execute a prepared plan. No text scanning except for DDL and COPY.
+fn respond_to_plan(handler: &NoopHandler, plan: &PreparedPlan) -> Response {
+    match &plan.kind {
+        PlanKind::SelectMeta { table, columns } => {
+            match handler.fields_for_parsed_select(table, columns) {
+                Some(fields) => Response::Query(empty_query(&fields)),
+                None => {
+                    let fields = stub_fields(columns.len().max(1));
+                    Response::Query(stub_row(&fields))
+                }
+            }
+        }
+        PlanKind::SelectStub { columns } => {
+            let fields = stub_fields(*columns);
+            Response::Query(stub_row(&fields))
+        }
+        PlanKind::Insert => Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(1)),
+        PlanKind::Update => Response::Execution(Tag::new("UPDATE").with_rows(1)),
+        PlanKind::Delete => Response::Execution(Tag::new("DELETE").with_rows(1)),
+        PlanKind::Begin => Response::TransactionStart(Tag::new("BEGIN")),
+        PlanKind::Commit => Response::TransactionEnd(Tag::new("COMMIT")),
+        PlanKind::Rollback => Response::TransactionEnd(Tag::new("ROLLBACK")),
+        // The catalog is mutated here, not at Parse: a prepared DDL statement
+        // that is never executed must not change the schema.
+        PlanKind::Ddl => {
+            handler.apply_schema_change(&plan.sql);
+            classify_extended(handler, &plan.sql)
+        }
+        PlanKind::FromText => classify_extended(handler, &plan.sql),
+    }
+}
+
 fn classify_simple(handler: &NoopHandler, sql: &str) -> Vec<Response> {
     handler.apply_schema_change(sql);
 
@@ -910,8 +1089,8 @@ impl SimpleQueryHandler for NoopHandler {
 
 #[async_trait]
 impl ExtendedQueryHandler for NoopHandler {
-    type Statement = String;
-    type QueryParser = NoopQueryParser;
+    type Statement = PreparedPlan;
+    type QueryParser = PlanParser;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
         Arc::clone(&self.parser)
@@ -928,7 +1107,7 @@ impl ExtendedQueryHandler for NoopHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        Ok(classify_extended(self, &portal.statement.statement))
+        Ok(respond_to_plan(self, &portal.statement.statement))
     }
 
     async fn do_describe_statement<C>(
@@ -939,14 +1118,9 @@ impl ExtendedQueryHandler for NoopHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let head = first_keyword(&stmt.statement);
-        if head.eq_ignore_ascii_case("SELECT") || head.eq_ignore_ascii_case("WITH") {
-            let fields = self
-                .fields_for_metadata_select(&stmt.statement)
-                .unwrap_or_else(|| stub_fields(count_select_columns(&stmt.statement)));
-            Ok(DescribeStatementResponse::new(vec![], fields.to_vec()))
-        } else {
-            Ok(DescribeStatementResponse::no_data())
+        match stmt.statement.describe_fields(self) {
+            Some(fields) => Ok(DescribeStatementResponse::new(vec![], fields.to_vec())),
+            None => Ok(DescribeStatementResponse::no_data()),
         }
     }
 
@@ -958,14 +1132,9 @@ impl ExtendedQueryHandler for NoopHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let head = first_keyword(&portal.statement.statement);
-        if head.eq_ignore_ascii_case("SELECT") || head.eq_ignore_ascii_case("WITH") {
-            let fields = self
-                .fields_for_metadata_select(&portal.statement.statement)
-                .unwrap_or_else(|| stub_fields(count_select_columns(&portal.statement.statement)));
-            Ok(DescribePortalResponse::new(fields.to_vec()))
-        } else {
-            Ok(DescribePortalResponse::no_data())
+        match portal.statement.statement.describe_fields(self) {
+            Some(fields) => Ok(DescribePortalResponse::new(fields.to_vec())),
+            None => Ok(DescribePortalResponse::no_data()),
         }
     }
 }
