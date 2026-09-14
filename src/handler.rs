@@ -311,7 +311,7 @@ fn copy_is_binary(sql: &str) -> bool {
 }
 
 #[derive(Debug, Clone)]
-struct SelectColumn {
+pub struct SelectColumn {
     name: Option<String>,
     is_star: bool,
 }
@@ -820,6 +820,39 @@ fn empty_query(fields: &Arc<Vec<FieldInfo>>) -> QueryResponse {
     QueryResponse::new(Arc::clone(fields), stream::empty())
 }
 
+/// The schema, as the sans-io codec is allowed to see it.
+///
+/// Two methods, both of which the codec needs and neither of which involves a
+/// socket. It exists so `wire.rs` can stay pure: the codec is handed a view and
+/// never learns there is a lock behind it.
+#[derive(Clone)]
+pub struct CatalogView(pub Arc<NoopHandler>);
+
+impl CatalogView {
+    /// Apply a CREATE/DROP TABLE. Called at EXECUTION, never at Parse: a
+    /// prepared-but-never-executed DDL must not change the schema.
+    pub fn apply(&self, sql: &str) {
+        self.0.apply_schema_change(sql);
+    }
+
+    /// The (name, type oid) of each column a metadata select asked for, or None
+    /// when the table is unknown -- in which case the caller falls back to stubs.
+    pub fn columns_for(
+        &self,
+        table: &[String],
+        columns: &[SelectColumn],
+    ) -> Option<Vec<(String, u32)>> {
+        let fields = self.0.fields_for_parsed_select(table, columns)?;
+
+        Some(
+            fields
+                .iter()
+                .map(|f| (f.name().to_string(), f.datatype().oid()))
+                .collect(),
+        )
+    }
+}
+
 /// What a statement will do, decided ONCE when it is prepared.
 ///
 /// pgwire's own `NoopQueryParser` sets `Statement = String`, so the server gets
@@ -864,7 +897,7 @@ pub struct PreparedPlan {
 }
 
 impl PreparedPlan {
-    fn build(sql: &str) -> Self {
+    pub fn build(sql: &str) -> Self {
         let head = first_keyword(sql);
 
         let kind = if head.eq_ignore_ascii_case("SELECT")

@@ -1,5 +1,6 @@
 mod config;
 mod handler;
+mod wire;
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -7,41 +8,12 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use pgwire::api::auth::StartupHandler;
-use pgwire::api::copy::CopyHandler;
-use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
-use pgwire::api::PgWireServerHandlers;
-use pgwire::tokio::process_socket;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 use config::Config;
-use handler::NoopHandler;
-
-struct NoopFactory(Arc<NoopHandler>);
-
-impl NoopFactory {
-    fn new() -> Self {
-        NoopFactory(Arc::new(NoopHandler::new()))
-    }
-}
-
-impl PgWireServerHandlers for NoopFactory {
-    fn startup_handler(&self) -> Arc<impl StartupHandler> {
-        self.0.clone()
-    }
-
-    fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
-        self.0.clone()
-    }
-
-    fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
-        self.0.clone()
-    }
-
-    fn copy_handler(&self) -> Arc<impl CopyHandler> {
-        self.0.clone()
-    }
-}
+use handler::{CatalogView, NoopHandler};
+use wire::Conn;
 
 /// Pin the calling thread to one CPU, so a shard stays where its data is.
 ///
@@ -78,9 +50,53 @@ fn shard_listener(addr: SocketAddr, backlog: i32) -> std::io::Result<std::net::T
     Ok(socket.into())
 }
 
+/// One connection, read-process-write, with ONE write per read batch.
+///
+/// This is the half that sans-io buys. The codec only appends to `out`, so it
+/// cannot flush early; this loop decides when bytes leave, and it decides once
+/// per read no matter how many protocol messages arrived in it. A client that
+/// pipelines Bind/Execute/Sync -- pgx does, and so does `saturate --depth N` --
+/// gets one reply write instead of the three pgwire was making.
+async fn serve(mut socket: TcpStream, catalog: CatalogView) {
+    let mut conn = Conn::new();
+    let mut pending: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut out: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut chunk = vec![0u8; 64 * 1024];
+
+    loop {
+        let n = match socket.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+
+        out.clear();
+
+        // The common case is a whole batch in one read with nothing left over,
+        // so the copy into `pending` is avoided when there is nothing pending.
+        if pending.is_empty() {
+            let used = conn.advance(&chunk[..n], &mut out, &catalog);
+            if used < n {
+                pending.extend_from_slice(&chunk[used..n]);
+            }
+        } else {
+            pending.extend_from_slice(&chunk[..n]);
+            let used = conn.advance(&pending, &mut out, &catalog);
+            pending.drain(..used);
+        }
+
+        if !out.is_empty() && socket.write_all(&out).await.is_err() {
+            return;
+        }
+
+        if conn.is_closed() {
+            return;
+        }
+    }
+}
+
 /// One shard: a pinned thread, its own single-threaded reactor, its own
 /// listener, and every connection it accepts served to completion on it.
-fn run_shard(id: usize, addr: SocketAddr, pin: bool, factory: Arc<NoopFactory>) {
+fn run_shard(id: usize, addr: SocketAddr, pin: bool, catalog: CatalogView) {
     if pin && !pin_to_cpu(id) {
         eprintln!("pgnoop: shard {id} could not pin to cpu {id}; continuing unpinned");
     }
@@ -112,13 +128,11 @@ fn run_shard(id: usize, addr: SocketAddr, pin: bool, factory: Arc<NoopFactory>) 
                     // measures their latency.
                     let _ = socket.set_nodelay(true);
 
-                    let factory = factory.clone();
+                    let catalog = catalog.clone();
                     // spawn, not spawn_blocking: stays on THIS runtime, hence
                     // this thread, hence this core.
                     tokio::spawn(async move {
-                        if let Err(e) = process_socket(socket, None, factory).await {
-                            eprintln!("connection error: {e}");
-                        }
+                        serve(socket, catalog).await;
                     });
                 }
                 Err(e) => {
@@ -157,15 +171,15 @@ fn main() {
     // catalog has to be common. It is off the hot path -- an ordinary SELECT
     // returns from parse_metadata_select before the lock is reached -- so what
     // remains shared per query is the Arc refcount, not the catalog.
-    let factory = Arc::new(NoopFactory::new());
+    let catalog = CatalogView(Arc::new(NoopHandler::new()));
 
     let mut threads = Vec::with_capacity(shards);
     for id in 0..shards {
-        let factory = factory.clone();
+        let catalog = catalog.clone();
         threads.push(
             std::thread::Builder::new()
                 .name(format!("pgnoop-shard-{id}"))
-                .spawn(move || run_shard(id, addr, pin, factory))
+                .spawn(move || run_shard(id, addr, pin, catalog))
                 .expect("spawn shard"),
         );
     }
