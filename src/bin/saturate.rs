@@ -58,13 +58,20 @@ fn arg_str(name: &str, default: &str) -> String {
 struct Frames {
     carry: Vec<u8>,
     remaining: usize,
+    /// Set when a frame header is not well formed. The stream cannot be trusted
+    /// after that point, so the worker stops rather than measuring garbage.
+    bad: bool,
 }
+
+/// Largest frame the generator will accept from the server under test.
+const MAX_FRAME: i32 = 16 * 1024 * 1024;
 
 impl Frames {
     fn new() -> Self {
         Frames {
             carry: Vec::with_capacity(8),
             remaining: 0,
+            bad: false,
         }
     }
 
@@ -91,10 +98,23 @@ impl Frames {
 
             let tag = self.carry[0];
             let len = i32::from_be_bytes(self.carry[1..5].try_into().unwrap());
+
+            // Validate BEFORE updating state. A negative len cast to usize makes
+            // `remaining` enormous and the reader then discards real input and
+            // blocks; a Z frame with len < 4 would also be counted before it was
+            // known to be well formed. This is the same defect that existed in
+            // the server's own framing, written again in the code added to
+            // avoid it.
+            if !(4..=MAX_FRAME).contains(&len) {
+                self.bad = true;
+
+                return ready;
+            }
+
             if tag == b'Z' {
                 ready += 1;
             }
-            self.remaining = (len as usize).saturating_sub(4);
+            self.remaining = (len as usize) - 4;
             self.carry.clear();
         }
     }
@@ -117,10 +137,6 @@ fn msg(out: &mut Vec<u8>, tag: u8, body: impl FnOnce(&mut Vec<u8>)) {
 /// Startup, then Parse one statement and keep it for the whole run -- which is
 /// what a real driver does, and what makes the server's per-execute path the
 /// thing under test.
-fn frames_into(f: Frames) -> Frames {
-    f
-}
-
 fn handshake(sock: &mut TcpStream, sql: &str) -> std::io::Result<Frames> {
     let mut buf = Vec::new();
     let at = buf.len();
@@ -153,9 +169,24 @@ fn handshake(sock: &mut TcpStream, sql: &str) -> std::io::Result<Frames> {
             break;
         }
         seen += frames.count_ready(&chunk[..n]);
+        if frames.bad {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "malformed frame during handshake",
+            ));
+        }
     }
 
-    Ok(frames_into(frames))
+    // Returning Ok here would let a worker treat a truncated handshake as
+    // success and count a connection that never became usable.
+    if seen < 2 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "handshake ended before ReadyForQuery",
+        ));
+    }
+
+    Ok(frames)
 }
 
 fn main() {
@@ -196,6 +227,9 @@ fn main() {
     // clock starts: their queries land in the numerator while part of their
     // execution is outside the denominator.
     let ready_workers = Arc::new(AtomicUsize::new(0));
+    // Separate from ready_workers: a failed worker still has to arrive at the
+    // barrier, but it must not be reported as a connection that generated load.
+    let live_workers = Arc::new(AtomicUsize::new(0));
     let go = Arc::new(AtomicBool::new(false));
     // Per-batch round-trip times, nanoseconds. At --depth 1 a batch IS a query,
     // so these are query latencies; above that they are the time to answer a
@@ -211,6 +245,7 @@ fn main() {
         let (batch, done, total) = (batch.clone(), done.clone(), total.clone());
         let lat = lat.clone();
         let (ready_workers, go) = (ready_workers.clone(), go.clone());
+        let live_workers = live_workers.clone();
         let addr = addr.clone();
         let sql = sql.clone();
 
@@ -225,6 +260,7 @@ fn main() {
                 return;
             };
 
+            live_workers.fetch_add(1, Ordering::Relaxed);
             ready_workers.fetch_add(1, Ordering::Relaxed);
             while !go.load(Ordering::Acquire) {
                 std::hint::spin_loop();
@@ -247,7 +283,12 @@ fn main() {
                         // mid-run has still completed everything before this
                         // batch, and discarding it biases the result low.
                         Ok(0) | Err(_) => break 'work,
-                        Ok(n) => got += frames.count_ready(&chunk[..n]),
+                        Ok(n) => {
+                            got += frames.count_ready(&chunk[..n]);
+                            if frames.bad {
+                                break 'work;
+                            }
+                        }
                     }
                 }
                 if mine.len() < MAX_SAMPLES {
@@ -263,8 +304,25 @@ fn main() {
         }));
     }
 
+    // A peer can accept a connection and never finish the handshake, which
+    // would hold this loop forever.
+    let setup_deadline = Instant::now() + Duration::from_secs(30);
     while ready_workers.load(Ordering::Relaxed) < conns {
+        if Instant::now() > setup_deadline {
+            eprintln!(
+                "saturate: only {}/{} workers reached the barrier in 30s",
+                ready_workers.load(Ordering::Relaxed),
+                conns
+            );
+            std::process::exit(1);
+        }
         std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let live = live_workers.load(Ordering::Relaxed);
+    if live == 0 {
+        eprintln!("saturate: no worker connected");
+        std::process::exit(1);
     }
 
     // The clock starts BEFORE the release, not after. Reversed, a worker can
@@ -297,7 +355,7 @@ fn main() {
     let unit = if depth == 1 { "query" } else { "batch" };
     println!(
         "{} conns, depth {}, {:.1}s: {} queries, {:.0} q/s | {} ms p50 {:.3} p90 {:.3} p99 {:.3} p999 {:.3} max {:.3} (n={})",
-        conns,
+        live,
         depth,
         elapsed,
         q,

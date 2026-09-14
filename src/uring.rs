@@ -180,7 +180,11 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
                     // burns the shard's core and never recovers.
                     if res < 0 {
                         let err = -res;
-                        if err == libc::EMFILE || err == libc::ENFILE || err == libc::ENOMEM {
+                        if err == libc::EMFILE
+                            || err == libc::ENFILE
+                            || err == libc::ENOMEM
+                            || err == libc::ENOBUFS
+                        {
                             eprintln!(
                                 "pgnoop: accept failed with errno {err}; backing off 100ms"
                             );
