@@ -698,10 +698,12 @@ dependencies = [
  "async-trait",
  "clap",
  "futures",
+ "libc",
  "pgwire",
  "postgres-types",
  "serde",
  "serde_json",
+ "socket2",
  "tikv-jemallocator",
  "tokio",
 ]
