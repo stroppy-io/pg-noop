@@ -266,9 +266,15 @@ fn main() {
     while ready_workers.load(Ordering::Relaxed) < conns {
         std::thread::sleep(Duration::from_millis(1));
     }
+
+    // The clock starts BEFORE the release, not after. Reversed, a worker can
+    // complete batches between `go.store` and `Instant::now()`: those queries
+    // land in the numerator while their time is outside the denominator, and
+    // q/s is overstated. This ordering errs the other way -- the window
+    // strictly contains every worker's execution.
+    let start = Instant::now();
     go.store(true, Ordering::Release);
 
-    let start = Instant::now();
     std::thread::sleep(Duration::from_secs(secs));
     done.store(true, Ordering::Relaxed);
     for t in threads {
