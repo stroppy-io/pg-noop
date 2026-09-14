@@ -83,18 +83,18 @@ statement prepared once.
 
 | pipeline depth | before | after | ratio |
 |---|---|---|---|
-| 1 | 183,766 | **2,955,570** | **16.1** |
-| 8 | 778,586 | 18,948,021 | 24.3 |
-| 32 | 1,789,643 | 45,539,268 | 25.5 |
+| 1 | 784,108 | **3,312,542** | **4.2** |
+| 8 | 1,661,784 | 21,222,240 | 12.8 |
+| 32 | 1,800,415 | 51,762,729 | 28.8 |
 
-Depth 1 is one query per round trip. PostgreSQL 18.6, same host and client,
-answers 548,217 q/s at that depth.
+Medians of five runs; before-bands within 0.3%. Depth 1 is one query per round
+trip. PostgreSQL 18.6, same host and client, answers 548,217 q/s at that depth.
 
 ### Limit
 
 | depth | q/s | µs/query |
 |---|---|---|
-| 1 | 2,831,421 | 8.000 |
+| 1 | 3,312,542 | 8.000 |
 | 2 | 5,333,392 | 4.500 |
 | 4 | 10,651,482 | 2.000 |
 | 8 | 18,012,011 | 1.500 |
