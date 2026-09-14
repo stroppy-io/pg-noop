@@ -22,9 +22,13 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Latency samples retained per worker. Unbounded, a 5s run at 3M q/s keeps
+/// 15M samples per worker and the final clone doubles it.
+const MAX_SAMPLES: usize = 1 << 17;
 
 fn arg(name: &str, default: usize) -> usize {
     let mut it = std::env::args().skip(1);
@@ -46,6 +50,56 @@ fn arg_str(name: &str, default: &str) -> String {
     default.to_string()
 }
 
+/// Count ReadyForQuery messages by walking the frame headers.
+///
+/// Scanning for the byte b'Z' counts payload bytes too -- a ParameterStatus
+/// value or a column name containing 'Z' would end a batch early and corrupt
+/// the measurement. `carry` holds a header split across reads.
+struct Frames {
+    carry: Vec<u8>,
+    remaining: usize,
+}
+
+impl Frames {
+    fn new() -> Self {
+        Frames {
+            carry: Vec::with_capacity(8),
+            remaining: 0,
+        }
+    }
+
+    fn count_ready(&mut self, mut buf: &[u8]) -> usize {
+        let mut ready = 0;
+
+        loop {
+            if self.remaining > 0 {
+                let skip = self.remaining.min(buf.len());
+                self.remaining -= skip;
+                buf = &buf[skip..];
+            }
+            if buf.is_empty() {
+                return ready;
+            }
+
+            while self.carry.len() < 5 && !buf.is_empty() {
+                self.carry.push(buf[0]);
+                buf = &buf[1..];
+            }
+            if self.carry.len() < 5 {
+                return ready;
+            }
+
+            let tag = self.carry[0];
+            let len = i32::from_be_bytes(self.carry[1..5].try_into().unwrap());
+            if tag == b'Z' {
+                ready += 1;
+            }
+            self.remaining = (len as usize).saturating_sub(4);
+            self.carry.clear();
+        }
+    }
+}
+
 fn cstr(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
     out.push(0);
@@ -63,7 +117,11 @@ fn msg(out: &mut Vec<u8>, tag: u8, body: impl FnOnce(&mut Vec<u8>)) {
 /// Startup, then Parse one statement and keep it for the whole run -- which is
 /// what a real driver does, and what makes the server's per-execute path the
 /// thing under test.
-fn handshake(sock: &mut TcpStream, sql: &str) -> std::io::Result<()> {
+fn frames_into(f: Frames) -> Frames {
+    f
+}
+
+fn handshake(sock: &mut TcpStream, sql: &str) -> std::io::Result<Frames> {
     let mut buf = Vec::new();
     let at = buf.len();
     buf.extend_from_slice(&0i32.to_be_bytes());
@@ -84,7 +142,9 @@ fn handshake(sock: &mut TcpStream, sql: &str) -> std::io::Result<()> {
     msg(&mut buf, b'S', |_| {});
     sock.write_all(&buf)?;
 
-    // Drain until the second ReadyForQuery (startup's, then Parse's).
+    // Drain until the second ReadyForQuery (startup's, then Parse's), framed
+    // rather than scanned.
+    let mut frames = Frames::new();
     let mut seen = 0;
     let mut chunk = [0u8; 4096];
     while seen < 2 {
@@ -92,10 +152,10 @@ fn handshake(sock: &mut TcpStream, sql: &str) -> std::io::Result<()> {
         if n == 0 {
             break;
         }
-        seen += chunk[..n].iter().filter(|&&b| b == b'Z').count();
+        seen += frames.count_ready(&chunk[..n]);
     }
 
-    Ok(())
+    Ok(frames_into(frames))
 }
 
 fn main() {
@@ -104,6 +164,13 @@ fn main() {
     let depth = arg("--depth", 32);
     let secs = arg("--secs", 8) as u64;
     let sql = arg_str("--sql", "select 1");
+
+    // depth 0 leaves `batch` empty and makes `got < depth` false at once, so the
+    // worker spins pushing latency samples until memory runs out.
+    if depth == 0 {
+        eprintln!("saturate: --depth must be >= 1");
+        std::process::exit(2);
+    }
 
     // One pipelined batch, encoded once and reused forever.
     let mut batch = Vec::new();
@@ -125,6 +192,11 @@ fn main() {
 
     let done = Arc::new(AtomicBool::new(false));
     let total = Arc::new(AtomicU64::new(0));
+    // Workers that finish their handshake early would otherwise run before the
+    // clock starts: their queries land in the numerator while part of their
+    // execution is outside the denominator.
+    let ready_workers = Arc::new(AtomicUsize::new(0));
+    let go = Arc::new(AtomicBool::new(false));
     // Per-batch round-trip times, nanoseconds. At --depth 1 a batch IS a query,
     // so these are query latencies; above that they are the time to answer a
     // pipelined batch and the label says so.
@@ -138,36 +210,49 @@ fn main() {
     for _ in 0..conns {
         let (batch, done, total) = (batch.clone(), done.clone(), total.clone());
         let lat = lat.clone();
+        let (ready_workers, go) = (ready_workers.clone(), go.clone());
         let addr = addr.clone();
         let sql = sql.clone();
 
         threads.push(std::thread::spawn(move || {
             let Ok(mut sock) = TcpStream::connect(&addr) else {
+                ready_workers.fetch_add(1, Ordering::Relaxed);
                 return;
             };
             let _ = sock.set_nodelay(true);
-            if handshake(&mut sock, &sql).is_err() {
+            let Ok(mut frames) = handshake(&mut sock, &sql) else {
+                ready_workers.fetch_add(1, Ordering::Relaxed);
                 return;
+            };
+
+            ready_workers.fetch_add(1, Ordering::Relaxed);
+            while !go.load(Ordering::Acquire) {
+                std::hint::spin_loop();
             }
 
             let mut chunk = vec![0u8; 64 * 1024];
             let mut count: u64 = 0;
             let mut mine: Vec<u64> = Vec::with_capacity(1 << 16);
 
-            while !done.load(Ordering::Relaxed) {
+            'work: while !done.load(Ordering::Relaxed) {
                 let t0 = Instant::now();
                 if sock.write_all(&batch).is_err() {
                     break;
                 }
-                // One reply per Sync; count 'Z' until the batch is answered.
+                // One reply per Sync, counted by frame header.
                 let mut got = 0usize;
                 while got < depth {
                     match sock.read(&mut chunk) {
-                        Ok(0) | Err(_) => return,
-                        Ok(n) => got += chunk[..n].iter().filter(|&&b| b == b'Z').count(),
+                        // `break` and not `return`: a connection that dies
+                        // mid-run has still completed everything before this
+                        // batch, and discarding it biases the result low.
+                        Ok(0) | Err(_) => break 'work,
+                        Ok(n) => got += frames.count_ready(&chunk[..n]),
                     }
                 }
-                mine.push(t0.elapsed().as_nanos() as u64);
+                if mine.len() < MAX_SAMPLES {
+                    mine.push(t0.elapsed().as_nanos() as u64);
+                }
                 count += depth as u64;
             }
 
@@ -177,6 +262,11 @@ fn main() {
             }
         }));
     }
+
+    while ready_workers.load(Ordering::Relaxed) < conns {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    go.store(true, Ordering::Release);
 
     let start = Instant::now();
     std::thread::sleep(Duration::from_secs(secs));
@@ -200,7 +290,7 @@ fn main() {
 
     let unit = if depth == 1 { "query" } else { "batch" };
     println!(
-        "{} conns, depth {}, {:.1}s: {} queries, {:.0} q/s | {} ms p50 {:.3} p90 {:.3} p99 {:.3} p999 {:.3} max {:.3}",
+        "{} conns, depth {}, {:.1}s: {} queries, {:.0} q/s | {} ms p50 {:.3} p90 {:.3} p99 {:.3} p999 {:.3} max {:.3} (n={})",
         conns,
         depth,
         elapsed,
@@ -212,5 +302,6 @@ fn main() {
         pct(0.99),
         pct(0.999),
         pct(1.0),
+        all.len(),
     );
 }

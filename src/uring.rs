@@ -175,6 +175,21 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
 
             match op {
                 OP_ACCEPT => {
+                    // EMFILE/ENFILE do not clear by retrying immediately;
+                    // re-arming at once turns a fd exhaustion into a spin that
+                    // burns the shard's core and never recovers.
+                    if res < 0 {
+                        let err = -res;
+                        if err == libc::EMFILE || err == libc::ENFILE || err == libc::ENOMEM {
+                            eprintln!(
+                                "pgnoop: accept failed with errno {err}; backing off 100ms"
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        } else if err == libc::EBADF || err == libc::EINVAL {
+                            return Err(io::Error::from_raw_os_error(err));
+                        }
+                    }
+
                     if res >= 0 {
                         let fd = res as RawFd;
                         // Nagle off: replies are tens of bytes and latency is

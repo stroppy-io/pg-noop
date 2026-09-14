@@ -97,7 +97,7 @@ async fn serve(mut socket: TcpStream, catalog: CatalogView) {
 
 /// One shard: a pinned thread, its own single-threaded reactor, its own
 /// listener, and every connection it accepts served to completion on it.
-fn run_shard(id: usize, addr: SocketAddr, pin: bool, io: Io, catalog: CatalogView) {
+fn run_shard(id: usize, addr: SocketAddr, pin: bool, io: Io, catalog: CatalogView) -> bool {
     if pin && !pin_to_cpu(id) {
         eprintln!("pgnoop: shard {id} could not pin to cpu {id}; continuing unpinned");
     }
@@ -106,7 +106,7 @@ fn run_shard(id: usize, addr: SocketAddr, pin: bool, io: Io, catalog: CatalogVie
         Ok(l) => l,
         Err(e) => {
             eprintln!("pgnoop: shard {id} could not bind {addr}: {e}");
-            return;
+            return false;
         }
     };
 
@@ -116,8 +116,9 @@ fn run_shard(id: usize, addr: SocketAddr, pin: bool, io: Io, catalog: CatalogVie
     if io == Io::Uring {
         if let Err(e) = crate::uring::run(listener, catalog, 4096) {
             eprintln!("pgnoop: shard {id} io_uring loop ended: {e}");
+            return false;
         }
-        return;
+        return true;
     }
 
     // current_thread, not multi_thread: a shard IS one thread. There is no work
@@ -148,11 +149,11 @@ fn run_shard(id: usize, addr: SocketAddr, pin: bool, io: Io, catalog: CatalogVie
                 }
                 Err(e) => {
                     eprintln!("pgnoop: shard {id} accept failed: {e}");
-                    return;
+                    return false;
                 }
             }
         }
-    });
+    })
 }
 
 fn main() {
@@ -196,7 +197,18 @@ fn main() {
         );
     }
 
+    // A server whose every shard failed to bind must not exit 0. Discarding the
+    // join results means a fully dead process reports success to whatever
+    // supervises it.
+    let mut served = 0usize;
     for t in threads {
-        let _ = t.join();
+        if t.join().unwrap_or(false) {
+            served += 1;
+        }
+    }
+
+    if served == 0 {
+        eprintln!("pgnoop: no shard served; exiting nonzero");
+        std::process::exit(1);
     }
 }

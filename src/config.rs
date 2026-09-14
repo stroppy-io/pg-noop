@@ -51,10 +51,17 @@ pub enum Io {
 }
 
 impl Io {
+    /// Unknown values are rejected, not defaulted. Mapping everything unknown to
+    /// one backend means `--io epol` silently selects the other one and the
+    /// operator measures something they did not choose.
     fn parse(s: &str) -> Io {
         match s.trim().to_ascii_lowercase().as_str() {
             "epoll" | "tokio" => Io::Epoll,
-            _ => Io::Uring,
+            "uring" | "io_uring" | "io-uring" => Io::Uring,
+            other => {
+                eprintln!("pgnoop: unknown --io value {other:?}; expected `uring` or `epoll`");
+                std::process::exit(2);
+            }
         }
     }
 

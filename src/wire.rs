@@ -40,6 +40,11 @@ mod tag {
     pub const TERMINATE: u8 = b'X';
 }
 
+/// Largest message this server will frame. PostgreSQL's own limit is 1 GB; a
+/// blackhole has no reason to buffer anything near it, and an unbounded value is
+/// how a malformed length becomes an allocation.
+const MAX_MESSAGE: usize = 16 * 1024 * 1024;
+
 /// Where a connection is in its life. The startup exchange is unframed and has
 /// to be recognised by shape, not by a tag byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,13 +173,51 @@ impl Conn {
         }
 
         let t = input[0];
-        let len = i32::from_be_bytes(input[1..5].try_into().ok()?) as usize;
-        if len < 4 || input.len() < 1 + len {
+        let declared = i32::from_be_bytes(input[1..5].try_into().ok()?);
+
+        // The length is client-controlled. A negative i32 cast straight to usize
+        // becomes enormous, `input.len() < 1 + len` is then always true, and the
+        // connection stalls forever while the caller appends every later byte to
+        // its pending buffer -- an unbounded allocation from one malformed
+        // frame. Reject the frame instead.
+        if !(4..=MAX_MESSAGE as i32).contains(&declared) {
+            self.phase = Phase::Closed;
+
+            return Some(input.len());
+        }
+
+        let len = declared as usize;
+        if input.len() < 1 + len {
             return None;
         }
 
         let body = &input[5..1 + len];
         let total = 1 + len;
+
+        // Past this point the message is FRAMED: its bytes are all here, so the
+        // only correct outcomes are "handled" and "handled badly". Returning
+        // None would mean "incomplete, keep the bytes", which for a complete
+        // frame is a permanent stall. `handled` runs the body and its `?` are
+        // confined to it.
+        let handled = self.dispatch(t, body, out, catalog);
+        if handled.is_none() {
+            // Malformed body inside a well-framed message: answer an error and
+            // consume it, so the stream stays synchronised.
+            error_response(out, "08P01", "malformed message body");
+        }
+
+        return Some(total);
+    }
+
+    /// The body of one framed message. Every `?` here means "this body is
+    /// malformed", never "wait for more bytes".
+    fn dispatch(
+        &mut self,
+        t: u8,
+        body: &[u8],
+        out: &mut Vec<u8>,
+        catalog: &CatalogView,
+    ) -> Option<()> {
 
         match t {
             tag::TERMINATE => {
@@ -272,7 +315,7 @@ impl Conn {
             _ => {}
         }
 
-        Some(total)
+        Some(())
     }
 
     fn plan_for(&self, kind: u8, name: &str) -> Option<&PreparedPlan> {
@@ -367,6 +410,19 @@ fn push_u64(out: &mut Vec<u8>, mut n: u64) {
 fn cstr(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
     out.push(0);
+}
+
+/// A minimal ErrorResponse: severity, SQLSTATE, message, terminator.
+fn error_response(out: &mut Vec<u8>, code: &str, message: &str) {
+    msg(out, b'E', |b| {
+        b.push(b'S');
+        cstr(b, "ERROR");
+        b.push(b'C');
+        cstr(b, code);
+        b.push(b'M');
+        cstr(b, message);
+        b.push(0);
+    });
 }
 
 fn ready(out: &mut Vec<u8>) {
@@ -678,6 +734,54 @@ mod tests {
             !text.contains("?column?"),
             "a known table must not answer with stubs: {text:?}"
         );
+    }
+
+    /// A client-controlled negative length cast to usize becomes enormous, so
+    /// `input.len() < 1 + len` is permanently true: the codec consumes nothing,
+    /// the caller appends every later byte to its pending buffer, and one frame
+    /// becomes an unbounded allocation. Found in review, not by these tests --
+    /// which covered a message SPLIT across reads but never a malformed one.
+    #[test]
+    fn a_negative_length_is_rejected_rather_than_stalling() {
+        for bad in [-1i32, i32::MIN, 3, (MAX_MESSAGE as i32) + 1] {
+            let (mut c, v) = connected();
+            let mut input = vec![b'P'];
+            input.extend_from_slice(&bad.to_be_bytes());
+            input.extend_from_slice(b"junk");
+
+            let mut out = Vec::new();
+            let used = c.advance(&input, &mut out, &v);
+
+            assert!(used > 0, "len {bad} consumed nothing: the stall");
+            assert!(c.is_closed(), "len {bad} left the connection open");
+        }
+    }
+
+    /// Once a message is FRAMED its bytes are all present, so the only outcomes
+    /// are handled and handled-badly. Returning None would mean "incomplete,
+    /// keep the bytes", which for a complete frame is a permanent stall.
+    #[test]
+    fn a_malformed_body_is_answered_and_consumed() {
+        let (mut c, v) = connected();
+
+        // Parse with no NUL terminator anywhere in the body.
+        let mut input = Vec::new();
+        msg(&mut input, b'P', |b| b.extend_from_slice(b"no-nul-here"));
+        let framed = input.len();
+        input.extend(tagged(b'S', |_| {}));
+
+        let mut out = Vec::new();
+        let used = c.advance(&input, &mut out, &v);
+
+        assert_eq!(used, input.len(), "a framed message must always be consumed");
+        let t = tags(&out);
+        assert_eq!(t.first(), Some(&b'E'), "malformed body gets an error: {t:?}");
+        assert_eq!(
+            t.last(),
+            Some(&b'Z'),
+            "and the Sync after it is still answered, so the stream is in sync"
+        );
+        assert!(framed < input.len());
     }
 
     #[test]
