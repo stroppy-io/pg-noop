@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use async_trait::async_trait;
 use futures::Sink;
@@ -21,12 +21,18 @@ use pgwire::messages::PgWireBackendMessage;
 
 pub struct NoopHandler {
     catalog: RwLock<SchemaCatalog>,
+    /// One parser for the life of the server. `query_parser()` is called on the
+    /// extended-query path for EVERY statement, and it used to return
+    /// `Arc::new(NoopQueryParser)` -- a heap allocation per query to hand back a
+    /// zero-sized type.
+    parser: Arc<NoopQueryParser>,
 }
 
 impl NoopHandler {
     pub fn new() -> Self {
         Self {
             catalog: RwLock::new(SchemaCatalog::default()),
+            parser: Arc::new(NoopQueryParser),
         }
     }
 
@@ -160,7 +166,54 @@ impl NoopStartupHandler for NoopHandler {}
 /// noop driver which returns int64(1) for every column, giving workloads a
 /// non-null, non-zero value so null-row checks and counting guards execute
 /// without errors.
+/// True when `sql`, ignoring leading whitespace, begins with `kw` compared
+/// case-insensitively.
+///
+/// This exists to delete `sql.trim().to_ascii_uppercase()` from the hot path.
+/// That call allocated and copied the WHOLE statement so the next line could
+/// look at its first six bytes, and it happened at least twice per query --
+/// once in classify_*, once more in count_select_columns.
+fn starts_with_keyword(sql: &str, kw: &str) -> bool {
+    let bytes = sql.trim_start().as_bytes();
+    let kw_bytes = kw.as_bytes();
+
+    bytes.len() >= kw_bytes.len() && bytes[..kw_bytes.len()].eq_ignore_ascii_case(kw_bytes)
+}
+
+/// The leading alphabetic keyword of `sql`, as a slice into it -- no allocation.
+///
+/// The classify chains used to build an uppercase COPY of the whole statement
+/// and then ask it eleven `starts_with` questions. Matching the first word in
+/// place answers the same questions, and is strictly more precise: `starts_with`
+/// also accepted "SELECTED" as a SELECT.
+fn first_keyword(sql: &str) -> &str {
+    let rest = sql.trim_start();
+    let end = rest
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(rest.len());
+
+    &rest[..end]
+}
+
+/// Pre-built stub field vectors for the column counts a benchmark actually
+/// produces. `stub_fields` allocated an Arc, a Vec and a String per column on
+/// every SELECT that was not a metadata select -- which is every `select 1`.
+static STUB_FIELD_CACHE: OnceLock<Vec<Arc<Vec<FieldInfo>>>> = OnceLock::new();
+
+const STUB_FIELD_CACHE_MAX: usize = 16;
+
 fn stub_fields(n: usize) -> Arc<Vec<FieldInfo>> {
+    let cache =
+        STUB_FIELD_CACHE.get_or_init(|| (0..=STUB_FIELD_CACHE_MAX).map(build_stub_fields).collect());
+
+    match cache.get(n) {
+        Some(fields) => Arc::clone(fields),
+        // Wider than anything cached: build it, as before.
+        None => build_stub_fields(n),
+    }
+}
+
+fn build_stub_fields(n: usize) -> Arc<Vec<FieldInfo>> {
     Arc::new(
         (0..n)
             .map(|_| FieldInfo::new("?column?".into(), None, None, Type::INT8, FieldFormat::Text))
@@ -171,11 +224,13 @@ fn stub_fields(n: usize) -> Arc<Vec<FieldInfo>> {
 /// Counts SELECT columns at paren-depth 0 between SELECT and FROM.
 /// Works reliably for pgx's `select "c1", "c2" from "t"` pattern.
 fn count_select_columns(sql: &str) -> usize {
-    let upper = sql.trim().to_ascii_uppercase();
-    let body = match upper.strip_prefix("SELECT ") {
-        Some(rest) => rest,
-        None => return 1,
-    };
+    // No uppercase copy: the scan below only looks at ASCII punctuation and at
+    // the " FROM " keyword, which is matched case-insensitively in place.
+    let trimmed = sql.trim();
+    if !starts_with_keyword(trimmed, "SELECT ") {
+        return 1;
+    }
+    let body = &trimmed["SELECT ".len()..];
     // Find " FROM " outside parens
     let mut depth: u32 = 0;
     let bytes = body.as_bytes();
@@ -186,7 +241,9 @@ fn count_select_columns(sql: &str) -> usize {
             b'(' => depth += 1,
             b')' => depth = depth.saturating_sub(1),
             b' ' if depth == 0 => {
-                if body[i..].starts_with(" FROM ") {
+                if body.as_bytes()[i..].len() >= 6
+                    && body.as_bytes()[i..i + 6].eq_ignore_ascii_case(b" FROM ")
+                {
                     from_at = i;
                     break;
                 }
@@ -754,11 +811,11 @@ fn empty_query(fields: &Arc<Vec<FieldInfo>>) -> QueryResponse {
 fn classify_simple(handler: &NoopHandler, sql: &str) -> Vec<Response> {
     handler.apply_schema_change(sql);
 
-    let upper = sql.trim().to_ascii_uppercase();
-    if upper.starts_with("SELECT")
-        || upper.starts_with("WITH")
-        || upper.starts_with("TABLE")
-        || upper.starts_with("VALUES")
+    let head = first_keyword(sql);
+    if head.eq_ignore_ascii_case("SELECT")
+        || head.eq_ignore_ascii_case("WITH")
+        || head.eq_ignore_ascii_case("TABLE")
+        || head.eq_ignore_ascii_case("VALUES")
     {
         if let Some(fields) = handler.fields_for_metadata_select(sql) {
             vec![Response::Query(empty_query(&fields))]
@@ -767,21 +824,25 @@ fn classify_simple(handler: &NoopHandler, sql: &str) -> Vec<Response> {
             let fields = stub_fields(n);
             vec![Response::Query(stub_row(&fields))]
         }
-    } else if upper.starts_with("INSERT") {
+    } else if head.eq_ignore_ascii_case("INSERT") {
         vec![Response::Execution(
             Tag::new("INSERT").with_oid(0).with_rows(1),
         )]
-    } else if upper.starts_with("UPDATE") {
+    } else if head.eq_ignore_ascii_case("UPDATE") {
         vec![Response::Execution(Tag::new("UPDATE").with_rows(1))]
-    } else if upper.starts_with("DELETE") {
+    } else if head.eq_ignore_ascii_case("DELETE") {
         vec![Response::Execution(Tag::new("DELETE").with_rows(1))]
-    } else if upper.starts_with("BEGIN") {
+    } else if head.eq_ignore_ascii_case("BEGIN") {
         vec![Response::TransactionStart(Tag::new("BEGIN"))]
-    } else if upper.starts_with("COMMIT") {
+    } else if head.eq_ignore_ascii_case("COMMIT") {
         vec![Response::TransactionEnd(Tag::new("COMMIT"))]
-    } else if upper.starts_with("ROLLBACK") {
+    } else if head.eq_ignore_ascii_case("ROLLBACK") {
         vec![Response::TransactionEnd(Tag::new("ROLLBACK"))]
-    } else if upper.starts_with("COPY") {
+    } else if head.eq_ignore_ascii_case("COPY") {
+        // COPY is not on the per-query hot path, so it keeps the simple
+        // uppercase copy -- scoped to the branch that needs it rather than paid
+        // for by every SELECT.
+        let upper = sql.to_ascii_uppercase();
         if upper.contains("FROM STDIN") {
             let cols = count_copy_columns(sql);
             let fmt: i8 = if copy_is_binary(sql) { 1 } else { 0 };
@@ -805,11 +866,11 @@ fn classify_simple(handler: &NoopHandler, sql: &str) -> Vec<Response> {
 fn classify_extended(handler: &NoopHandler, sql: &str) -> Response {
     handler.apply_schema_change(sql);
 
-    let upper = sql.trim().to_ascii_uppercase();
-    if upper.starts_with("SELECT")
-        || upper.starts_with("WITH")
-        || upper.starts_with("TABLE")
-        || upper.starts_with("VALUES")
+    let head = first_keyword(sql);
+    if head.eq_ignore_ascii_case("SELECT")
+        || head.eq_ignore_ascii_case("WITH")
+        || head.eq_ignore_ascii_case("TABLE")
+        || head.eq_ignore_ascii_case("VALUES")
     {
         if let Some(fields) = handler.fields_for_metadata_select(sql) {
             Response::Query(empty_query(&fields))
@@ -818,17 +879,17 @@ fn classify_extended(handler: &NoopHandler, sql: &str) -> Response {
             let fields = stub_fields(n);
             Response::Query(stub_row(&fields))
         }
-    } else if upper.starts_with("INSERT") {
+    } else if head.eq_ignore_ascii_case("INSERT") {
         Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(1))
-    } else if upper.starts_with("UPDATE") {
+    } else if head.eq_ignore_ascii_case("UPDATE") {
         Response::Execution(Tag::new("UPDATE").with_rows(1))
-    } else if upper.starts_with("DELETE") {
+    } else if head.eq_ignore_ascii_case("DELETE") {
         Response::Execution(Tag::new("DELETE").with_rows(1))
-    } else if upper.starts_with("BEGIN") {
+    } else if head.eq_ignore_ascii_case("BEGIN") {
         Response::TransactionStart(Tag::new("BEGIN"))
-    } else if upper.starts_with("COMMIT") {
+    } else if head.eq_ignore_ascii_case("COMMIT") {
         Response::TransactionEnd(Tag::new("COMMIT"))
-    } else if upper.starts_with("ROLLBACK") {
+    } else if head.eq_ignore_ascii_case("ROLLBACK") {
         Response::TransactionEnd(Tag::new("ROLLBACK"))
     } else {
         Response::Execution(Tag::new("OK"))
@@ -853,7 +914,7 @@ impl ExtendedQueryHandler for NoopHandler {
     type QueryParser = NoopQueryParser;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
-        Arc::new(NoopQueryParser)
+        Arc::clone(&self.parser)
     }
 
     async fn do_query<C>(
@@ -878,8 +939,8 @@ impl ExtendedQueryHandler for NoopHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let upper = stmt.statement.trim().to_ascii_uppercase();
-        if upper.starts_with("SELECT") || upper.starts_with("WITH") {
+        let head = first_keyword(&stmt.statement);
+        if head.eq_ignore_ascii_case("SELECT") || head.eq_ignore_ascii_case("WITH") {
             let fields = self
                 .fields_for_metadata_select(&stmt.statement)
                 .unwrap_or_else(|| stub_fields(count_select_columns(&stmt.statement)));
@@ -897,8 +958,8 @@ impl ExtendedQueryHandler for NoopHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let upper = portal.statement.statement.trim().to_ascii_uppercase();
-        if upper.starts_with("SELECT") || upper.starts_with("WITH") {
+        let head = first_keyword(&portal.statement.statement);
+        if head.eq_ignore_ascii_case("SELECT") || head.eq_ignore_ascii_case("WITH") {
             let fields = self
                 .fields_for_metadata_select(&portal.statement.statement)
                 .unwrap_or_else(|| stub_fields(count_select_columns(&portal.statement.statement)));
