@@ -83,18 +83,22 @@ statement prepared once.
 
 | pipeline depth | before | after | ratio |
 |---|---|---|---|
-| 1 | 784,108 | **3,312,542** | **4.2** |
-| 8 | 1,661,784 | 21,222,240 | 12.8 |
-| 32 | 1,800,415 | 51,762,729 | 28.8 |
+| 1 | 783,639 | **3,318,093** | **4.2** |
+| 8 | 1,670,803 | 20,724,935 | 12.4 |
+| 32 | 1,811,259 | 49,544,744 | 27.4 |
 
-Medians of five runs; before-bands within 0.3%. Depth 1 is one query per round
+Medians of three runs on an otherwise idle host (99.5% idle before the run);
+before-bands within 0.6%. **Measure on a quiet machine**: the pre-change server
+uses unpinned work-stealing threads and loses 2.6× under CPU contention
+(787,075 → 307,343 q/s with 16 cores busy), while the shard-per-core version is
+largely unaffected. A contended host therefore exaggerates the difference. Depth 1 is one query per round
 trip. PostgreSQL 18.6, same host and client, answers 548,217 q/s at that depth.
 
 ### Limit
 
 | depth | q/s | µs/query |
 |---|---|---|
-| 1 | 3,312,542 | 8.000 |
+| 1 | 3,318,093 | 8.000 |
 | 2 | 5,333,392 | 4.500 |
 | 4 | 10,651,482 | 2.000 |
 | 8 | 18,012,011 | 1.500 |
