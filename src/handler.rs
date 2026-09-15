@@ -282,10 +282,23 @@ fn count_select_columns(sql: &str) -> usize {
 /// Counts columns in `COPY table (col1, col2) FROM STDIN` by finding the
 /// paren-group between the table name and FROM.
 pub(crate) fn count_copy_columns(sql: &str) -> usize {
-    let upper = sql.trim().to_ascii_uppercase();
+    // **One string, indexed and sliced.**
+    //
+    // This used to `find` in `sql.trim().to_ascii_uppercase()` and slice `sql`,
+    // so a byte offset from the trimmed string cut the untrimmed one short by
+    // exactly the leading whitespace: ` COPY t (a,b) FROM STDIN` lost its `)`,
+    // `rfind('(')` still matched, the closing paren did not, and the answer was
+    // 1. `CopyInResponse` then announced one format code for a two-column copy.
+    //
+    // Latent while only the pgwire path called this; reachable the moment
+    // `wire.rs` did. Uppercasing can also change byte length (ß, ﬁ), so deriving
+    // an index from one string and applying it to another is wrong twice over,
+    // not only under whitespace.
+    let sql = sql.trim();
+    let upper = sql.to_ascii_uppercase();
     // Take the part before " FROM "
     let before_from = match upper.find(" FROM ") {
-        Some(i) => &sql[..i],
+        Some(i) => &upper[..i],
         None => return 1,
     };
     // Find the last '(' — that's the column list
@@ -1258,5 +1271,41 @@ mod tests {
         assert_eq!(tables.len(), 9);
         assert_eq!(tables[0], vec!["order_line".to_string()]);
         assert_eq!(tables[8], vec!["item".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod copy_columns {
+    use super::count_copy_columns;
+
+    /// **The index came from the trimmed string and sliced the untrimmed one.**
+    ///
+    /// `upper.find(" FROM ")` counts bytes in `sql.trim().to_ascii_uppercase()`,
+    /// and `&sql[..i]` then cuts the ORIGINAL — short by exactly the leading
+    /// whitespace. ` COPY t (a,b) FROM STDIN` lost its `)`, `rfind('(')` still
+    /// matched, `after_open.find(')')` did not, and the function returned 1.
+    ///
+    /// `CopyInResponse` then announces one format code for a two-column copy,
+    /// which a client reads as a malformed message. Latent while this was only
+    /// called from the pgwire path; reachable the moment `wire.rs` started
+    /// calling it, which is what a reviewer noticed and these tests did not.
+    #[test]
+    fn leading_whitespace_does_not_shift_the_from_offset() {
+        for (sql, want) in [
+            ("COPY t (a,b) FROM STDIN", 2),
+            (" COPY t (a,b) FROM STDIN", 2),
+            ("\n\t  COPY t (a, b, c) FROM STDIN", 3),
+            ("   copy warehouse (w_id, w_name) from stdin", 2),
+        ] {
+            assert_eq!(count_copy_columns(sql), want, "{sql:?}");
+        }
+    }
+
+    /// No column list is one column, and that must survive the same shift.
+    #[test]
+    fn a_copy_without_a_column_list_is_one_column() {
+        for sql in ["COPY t FROM STDIN", "  COPY t FROM STDIN", "COPY t () FROM STDIN"] {
+            assert_eq!(count_copy_columns(sql), 1, "{sql:?}");
+        }
     }
 }
