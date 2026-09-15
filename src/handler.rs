@@ -1,19 +1,19 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use async_trait::async_trait;
 use futures::Sink;
 use futures::{future, stream};
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::copy::CopyHandler;
-use pgwire::api::portal::Portal;
+use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
     CopyResponse, DataRowEncoder, DescribePortalResponse, DescribeResponse,
     DescribeStatementResponse, FieldFormat, FieldInfo, QueryResponse, Response, Tag,
 };
-use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
+use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
@@ -21,19 +21,37 @@ use pgwire::messages::PgWireBackendMessage;
 
 pub struct NoopHandler {
     catalog: RwLock<SchemaCatalog>,
+    /// One parser for the life of the server. `query_parser()` is called on the
+    /// extended-query path for EVERY statement, and it used to return
+    /// `Arc::new(NoopQueryParser)` -- a heap allocation per query to hand back a
+    /// zero-sized type.
+    parser: Arc<PlanParser>,
 }
 
 impl NoopHandler {
     pub fn new() -> Self {
         Self {
             catalog: RwLock::new(SchemaCatalog::default()),
+            parser: Arc::new(PlanParser),
         }
     }
 
     fn fields_for_metadata_select(&self, sql: &str) -> Option<Arc<Vec<FieldInfo>>> {
         let (table_name, selected_columns) = parse_metadata_select(sql)?;
+
+        self.fields_for_parsed_select(&table_name, &selected_columns)
+    }
+
+    /// The catalog half, split out so a plan prepared once can reuse it without
+    /// re-parsing the statement on every execution.
+    fn fields_for_parsed_select(
+        &self,
+        table_name: &[String],
+        selected_columns: &[SelectColumn],
+    ) -> Option<Arc<Vec<FieldInfo>>> {
         let catalog = self.catalog.read().expect("schema catalog poisoned");
-        catalog.fields_for_select(&table_name, &selected_columns)
+
+        catalog.fields_for_select(table_name, selected_columns)
     }
 
     fn apply_schema_change(&self, sql: &str) {
@@ -160,7 +178,54 @@ impl NoopStartupHandler for NoopHandler {}
 /// noop driver which returns int64(1) for every column, giving workloads a
 /// non-null, non-zero value so null-row checks and counting guards execute
 /// without errors.
+/// True when `sql`, ignoring leading whitespace, begins with `kw` compared
+/// case-insensitively.
+///
+/// This exists to delete `sql.trim().to_ascii_uppercase()` from the hot path.
+/// That call allocated and copied the WHOLE statement so the next line could
+/// look at its first six bytes, and it happened at least twice per query --
+/// once in classify_*, once more in count_select_columns.
+fn starts_with_keyword(sql: &str, kw: &str) -> bool {
+    let bytes = sql.trim_start().as_bytes();
+    let kw_bytes = kw.as_bytes();
+
+    bytes.len() >= kw_bytes.len() && bytes[..kw_bytes.len()].eq_ignore_ascii_case(kw_bytes)
+}
+
+/// The leading alphabetic keyword of `sql`, as a slice into it -- no allocation.
+///
+/// The classify chains used to build an uppercase COPY of the whole statement
+/// and then ask it eleven `starts_with` questions. Matching the first word in
+/// place answers the same questions, and is strictly more precise: `starts_with`
+/// also accepted "SELECTED" as a SELECT.
+fn first_keyword(sql: &str) -> &str {
+    let rest = sql.trim_start();
+    let end = rest
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(rest.len());
+
+    &rest[..end]
+}
+
+/// Pre-built stub field vectors for the column counts a benchmark actually
+/// produces. `stub_fields` allocated an Arc, a Vec and a String per column on
+/// every SELECT that was not a metadata select -- which is every `select 1`.
+static STUB_FIELD_CACHE: OnceLock<Vec<Arc<Vec<FieldInfo>>>> = OnceLock::new();
+
+const STUB_FIELD_CACHE_MAX: usize = 16;
+
 fn stub_fields(n: usize) -> Arc<Vec<FieldInfo>> {
+    let cache =
+        STUB_FIELD_CACHE.get_or_init(|| (0..=STUB_FIELD_CACHE_MAX).map(build_stub_fields).collect());
+
+    match cache.get(n) {
+        Some(fields) => Arc::clone(fields),
+        // Wider than anything cached: build it, as before.
+        None => build_stub_fields(n),
+    }
+}
+
+fn build_stub_fields(n: usize) -> Arc<Vec<FieldInfo>> {
     Arc::new(
         (0..n)
             .map(|_| FieldInfo::new("?column?".into(), None, None, Type::INT8, FieldFormat::Text))
@@ -171,11 +236,13 @@ fn stub_fields(n: usize) -> Arc<Vec<FieldInfo>> {
 /// Counts SELECT columns at paren-depth 0 between SELECT and FROM.
 /// Works reliably for pgx's `select "c1", "c2" from "t"` pattern.
 fn count_select_columns(sql: &str) -> usize {
-    let upper = sql.trim().to_ascii_uppercase();
-    let body = match upper.strip_prefix("SELECT ") {
-        Some(rest) => rest,
-        None => return 1,
-    };
+    // No uppercase copy: the scan below only looks at ASCII punctuation and at
+    // the " FROM " keyword, which is matched case-insensitively in place.
+    let trimmed = sql.trim();
+    if !starts_with_keyword(trimmed, "SELECT ") {
+        return 1;
+    }
+    let body = &trimmed["SELECT ".len()..];
     // Find " FROM " outside parens
     let mut depth: u32 = 0;
     let bytes = body.as_bytes();
@@ -186,7 +253,9 @@ fn count_select_columns(sql: &str) -> usize {
             b'(' => depth += 1,
             b')' => depth = depth.saturating_sub(1),
             b' ' if depth == 0 => {
-                if body[i..].starts_with(" FROM ") {
+                if body.as_bytes()[i..].len() >= 6
+                    && body.as_bytes()[i..i + 6].eq_ignore_ascii_case(b" FROM ")
+                {
                     from_at = i;
                     break;
                 }
@@ -212,11 +281,24 @@ fn count_select_columns(sql: &str) -> usize {
 
 /// Counts columns in `COPY table (col1, col2) FROM STDIN` by finding the
 /// paren-group between the table name and FROM.
-fn count_copy_columns(sql: &str) -> usize {
-    let upper = sql.trim().to_ascii_uppercase();
+pub(crate) fn count_copy_columns(sql: &str) -> usize {
+    // **One string, indexed and sliced.**
+    //
+    // This used to `find` in `sql.trim().to_ascii_uppercase()` and slice `sql`,
+    // so a byte offset from the trimmed string cut the untrimmed one short by
+    // exactly the leading whitespace: ` COPY t (a,b) FROM STDIN` lost its `)`,
+    // `rfind('(')` still matched, the closing paren did not, and the answer was
+    // 1. `CopyInResponse` then announced one format code for a two-column copy.
+    //
+    // Latent while only the pgwire path called this; reachable the moment
+    // `wire.rs` did. Uppercasing can also change byte length (ß, ﬁ), so deriving
+    // an index from one string and applying it to another is wrong twice over,
+    // not only under whitespace.
+    let sql = sql.trim();
+    let upper = sql.to_ascii_uppercase();
     // Take the part before " FROM "
     let before_from = match upper.find(" FROM ") {
-        Some(i) => &sql[..i],
+        Some(i) => &upper[..i],
         None => return 1,
     };
     // Find the last '(' — that's the column list
@@ -241,8 +323,8 @@ fn copy_is_binary(sql: &str) -> bool {
     upper.contains("FORMAT BINARY") || upper.ends_with(" BINARY") || upper.ends_with(" BINARY;")
 }
 
-#[derive(Debug)]
-struct SelectColumn {
+#[derive(Debug, Clone)]
+pub struct SelectColumn {
     name: Option<String>,
     is_star: bool,
 }
@@ -751,14 +833,214 @@ fn empty_query(fields: &Arc<Vec<FieldInfo>>) -> QueryResponse {
     QueryResponse::new(Arc::clone(fields), stream::empty())
 }
 
+/// The schema, as the sans-io codec is allowed to see it.
+///
+/// Two methods, both of which the codec needs and neither of which involves a
+/// socket. It exists so `wire.rs` can stay pure: the codec is handed a view and
+/// never learns there is a lock behind it.
+#[derive(Clone)]
+pub struct CatalogView(pub Arc<NoopHandler>);
+
+impl CatalogView {
+    /// Apply a CREATE/DROP TABLE. Called at EXECUTION, never at Parse: a
+    /// prepared-but-never-executed DDL must not change the schema.
+    pub fn apply(&self, sql: &str) {
+        self.0.apply_schema_change(sql);
+    }
+
+    /// The (name, type oid) of each column a metadata select asked for, or None
+    /// when the table is unknown -- in which case the caller falls back to stubs.
+    pub fn columns_for(
+        &self,
+        table: &[String],
+        columns: &[SelectColumn],
+    ) -> Option<Vec<(String, u32)>> {
+        let fields = self.0.fields_for_parsed_select(table, columns)?;
+
+        Some(
+            fields
+                .iter()
+                .map(|f| (f.name().to_string(), f.datatype().oid()))
+                .collect(),
+        )
+    }
+}
+
+/// What a statement will do, decided ONCE when it is prepared.
+///
+/// pgwire's own `NoopQueryParser` sets `Statement = String`, so the server gets
+/// the raw SQL back on every Execute and has to work out the answer again --
+/// for a client-cached prepared statement that is the identical bytes, every
+/// time, forever. Measured: a `select 1` re-ran a failed CREATE TABLE
+/// parse, a failed DROP TABLE parse, a scan for FROM and a comma count on every
+/// single execution.
+///
+/// `QueryParser::parse_sql` is called once, at Parse. Everything that is a pure
+/// function of the SQL TEXT belongs there. What deliberately does NOT is the
+/// catalog lookup: a table can be created after a statement is prepared, so the
+/// metadata select keeps its parsed table/column names here and resolves them
+/// against the catalog at execution.
+#[derive(Debug, Clone)]
+pub enum PlanKind {
+    /// A SELECT naming a table: resolve against the catalog at execution.
+    SelectMeta {
+        table: Vec<String>,
+        columns: Vec<SelectColumn>,
+    },
+    /// A SELECT that names no table: hand back n stub columns.
+    SelectStub { columns: usize },
+    Insert,
+    Update,
+    Delete,
+    Begin,
+    Commit,
+    Rollback,
+    /// DDL, and the only kind that still touches the SQL text at execution,
+    /// because it mutates the catalog.
+    Ddl,
+    /// COPY and anything unrecognised: decided from the text as before. Rare,
+    /// and not on any benchmark's hot path.
+    FromText,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedPlan {
+    pub sql: String,
+    pub kind: PlanKind,
+}
+
+impl PreparedPlan {
+    pub fn build(sql: &str) -> Self {
+        let head = first_keyword(sql);
+
+        let kind = if head.eq_ignore_ascii_case("SELECT")
+            || head.eq_ignore_ascii_case("WITH")
+            || head.eq_ignore_ascii_case("TABLE")
+            || head.eq_ignore_ascii_case("VALUES")
+        {
+            match parse_metadata_select(sql) {
+                Some((table, columns)) => PlanKind::SelectMeta { table, columns },
+                None => PlanKind::SelectStub {
+                    columns: count_select_columns(sql),
+                },
+            }
+        } else if head.eq_ignore_ascii_case("INSERT") {
+            PlanKind::Insert
+        } else if head.eq_ignore_ascii_case("UPDATE") {
+            PlanKind::Update
+        } else if head.eq_ignore_ascii_case("DELETE") {
+            PlanKind::Delete
+        } else if head.eq_ignore_ascii_case("BEGIN") {
+            PlanKind::Begin
+        } else if head.eq_ignore_ascii_case("COMMIT") {
+            PlanKind::Commit
+        } else if head.eq_ignore_ascii_case("ROLLBACK") {
+            PlanKind::Rollback
+        } else if head.eq_ignore_ascii_case("CREATE") || head.eq_ignore_ascii_case("DROP") {
+            PlanKind::Ddl
+        } else {
+            PlanKind::FromText
+        };
+
+        PreparedPlan {
+            sql: sql.to_string(),
+            kind,
+        }
+    }
+
+    /// The fields a Describe should report, resolved now rather than at Parse
+    /// so a table created since preparation is still seen.
+    fn describe_fields(&self, handler: &NoopHandler) -> Option<Arc<Vec<FieldInfo>>> {
+        match &self.kind {
+            PlanKind::SelectMeta { table, columns } => Some(
+                handler
+                    .fields_for_parsed_select(table, columns)
+                    .unwrap_or_else(|| stub_fields(columns.len().max(1))),
+            ),
+            PlanKind::SelectStub { columns } => Some(stub_fields(*columns)),
+            _ => None,
+        }
+    }
+}
+
+/// Our parser: does the text work once, at Parse.
+pub struct PlanParser;
+
+#[async_trait]
+impl QueryParser for PlanParser {
+    type Statement = PreparedPlan;
+
+    async fn parse_sql<C>(
+        &self,
+        _client: &C,
+        sql: &str,
+        _types: &[Option<Type>],
+    ) -> PgWireResult<Self::Statement>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        Ok(PreparedPlan::build(sql))
+    }
+
+    /// A blackhole resolves no parameter types: it never looks at the values,
+    /// and claiming a type it did not derive would be a lie the client acts on.
+    fn get_parameter_types(&self, _stmt: &Self::Statement) -> PgWireResult<Vec<Type>> {
+        Ok(vec![])
+    }
+
+    /// The result schema IS known at Parse for a stub select, but not for one
+    /// naming a table -- that needs the catalog, which the parser does not hold.
+    /// The handler's own do_describe_* resolve it, so report nothing here rather
+    /// than report it wrongly.
+    fn get_result_schema(
+        &self,
+        _stmt: &Self::Statement,
+        _column_format: Option<&Format>,
+    ) -> PgWireResult<Vec<FieldInfo>> {
+        Ok(vec![])
+    }
+}
+
+/// Execute a prepared plan. No text scanning except for DDL and COPY.
+fn respond_to_plan(handler: &NoopHandler, plan: &PreparedPlan) -> Response {
+    match &plan.kind {
+        PlanKind::SelectMeta { table, columns } => {
+            match handler.fields_for_parsed_select(table, columns) {
+                Some(fields) => Response::Query(empty_query(&fields)),
+                None => {
+                    let fields = stub_fields(columns.len().max(1));
+                    Response::Query(stub_row(&fields))
+                }
+            }
+        }
+        PlanKind::SelectStub { columns } => {
+            let fields = stub_fields(*columns);
+            Response::Query(stub_row(&fields))
+        }
+        PlanKind::Insert => Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(1)),
+        PlanKind::Update => Response::Execution(Tag::new("UPDATE").with_rows(1)),
+        PlanKind::Delete => Response::Execution(Tag::new("DELETE").with_rows(1)),
+        PlanKind::Begin => Response::TransactionStart(Tag::new("BEGIN")),
+        PlanKind::Commit => Response::TransactionEnd(Tag::new("COMMIT")),
+        PlanKind::Rollback => Response::TransactionEnd(Tag::new("ROLLBACK")),
+        // The catalog is mutated here, not at Parse: a prepared DDL statement
+        // that is never executed must not change the schema.
+        PlanKind::Ddl => {
+            handler.apply_schema_change(&plan.sql);
+            classify_extended(handler, &plan.sql)
+        }
+        PlanKind::FromText => classify_extended(handler, &plan.sql),
+    }
+}
+
 fn classify_simple(handler: &NoopHandler, sql: &str) -> Vec<Response> {
     handler.apply_schema_change(sql);
 
-    let upper = sql.trim().to_ascii_uppercase();
-    if upper.starts_with("SELECT")
-        || upper.starts_with("WITH")
-        || upper.starts_with("TABLE")
-        || upper.starts_with("VALUES")
+    let head = first_keyword(sql);
+    if head.eq_ignore_ascii_case("SELECT")
+        || head.eq_ignore_ascii_case("WITH")
+        || head.eq_ignore_ascii_case("TABLE")
+        || head.eq_ignore_ascii_case("VALUES")
     {
         if let Some(fields) = handler.fields_for_metadata_select(sql) {
             vec![Response::Query(empty_query(&fields))]
@@ -767,21 +1049,25 @@ fn classify_simple(handler: &NoopHandler, sql: &str) -> Vec<Response> {
             let fields = stub_fields(n);
             vec![Response::Query(stub_row(&fields))]
         }
-    } else if upper.starts_with("INSERT") {
+    } else if head.eq_ignore_ascii_case("INSERT") {
         vec![Response::Execution(
             Tag::new("INSERT").with_oid(0).with_rows(1),
         )]
-    } else if upper.starts_with("UPDATE") {
+    } else if head.eq_ignore_ascii_case("UPDATE") {
         vec![Response::Execution(Tag::new("UPDATE").with_rows(1))]
-    } else if upper.starts_with("DELETE") {
+    } else if head.eq_ignore_ascii_case("DELETE") {
         vec![Response::Execution(Tag::new("DELETE").with_rows(1))]
-    } else if upper.starts_with("BEGIN") {
+    } else if head.eq_ignore_ascii_case("BEGIN") {
         vec![Response::TransactionStart(Tag::new("BEGIN"))]
-    } else if upper.starts_with("COMMIT") {
+    } else if head.eq_ignore_ascii_case("COMMIT") {
         vec![Response::TransactionEnd(Tag::new("COMMIT"))]
-    } else if upper.starts_with("ROLLBACK") {
+    } else if head.eq_ignore_ascii_case("ROLLBACK") {
         vec![Response::TransactionEnd(Tag::new("ROLLBACK"))]
-    } else if upper.starts_with("COPY") {
+    } else if head.eq_ignore_ascii_case("COPY") {
+        // COPY is not on the per-query hot path, so it keeps the simple
+        // uppercase copy -- scoped to the branch that needs it rather than paid
+        // for by every SELECT.
+        let upper = sql.to_ascii_uppercase();
         if upper.contains("FROM STDIN") {
             let cols = count_copy_columns(sql);
             let fmt: i8 = if copy_is_binary(sql) { 1 } else { 0 };
@@ -805,11 +1091,11 @@ fn classify_simple(handler: &NoopHandler, sql: &str) -> Vec<Response> {
 fn classify_extended(handler: &NoopHandler, sql: &str) -> Response {
     handler.apply_schema_change(sql);
 
-    let upper = sql.trim().to_ascii_uppercase();
-    if upper.starts_with("SELECT")
-        || upper.starts_with("WITH")
-        || upper.starts_with("TABLE")
-        || upper.starts_with("VALUES")
+    let head = first_keyword(sql);
+    if head.eq_ignore_ascii_case("SELECT")
+        || head.eq_ignore_ascii_case("WITH")
+        || head.eq_ignore_ascii_case("TABLE")
+        || head.eq_ignore_ascii_case("VALUES")
     {
         if let Some(fields) = handler.fields_for_metadata_select(sql) {
             Response::Query(empty_query(&fields))
@@ -818,17 +1104,17 @@ fn classify_extended(handler: &NoopHandler, sql: &str) -> Response {
             let fields = stub_fields(n);
             Response::Query(stub_row(&fields))
         }
-    } else if upper.starts_with("INSERT") {
+    } else if head.eq_ignore_ascii_case("INSERT") {
         Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(1))
-    } else if upper.starts_with("UPDATE") {
+    } else if head.eq_ignore_ascii_case("UPDATE") {
         Response::Execution(Tag::new("UPDATE").with_rows(1))
-    } else if upper.starts_with("DELETE") {
+    } else if head.eq_ignore_ascii_case("DELETE") {
         Response::Execution(Tag::new("DELETE").with_rows(1))
-    } else if upper.starts_with("BEGIN") {
+    } else if head.eq_ignore_ascii_case("BEGIN") {
         Response::TransactionStart(Tag::new("BEGIN"))
-    } else if upper.starts_with("COMMIT") {
+    } else if head.eq_ignore_ascii_case("COMMIT") {
         Response::TransactionEnd(Tag::new("COMMIT"))
-    } else if upper.starts_with("ROLLBACK") {
+    } else if head.eq_ignore_ascii_case("ROLLBACK") {
         Response::TransactionEnd(Tag::new("ROLLBACK"))
     } else {
         Response::Execution(Tag::new("OK"))
@@ -849,11 +1135,11 @@ impl SimpleQueryHandler for NoopHandler {
 
 #[async_trait]
 impl ExtendedQueryHandler for NoopHandler {
-    type Statement = String;
-    type QueryParser = NoopQueryParser;
+    type Statement = PreparedPlan;
+    type QueryParser = PlanParser;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
-        Arc::new(NoopQueryParser)
+        Arc::clone(&self.parser)
     }
 
     async fn do_query<C>(
@@ -867,7 +1153,7 @@ impl ExtendedQueryHandler for NoopHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        Ok(classify_extended(self, &portal.statement.statement))
+        Ok(respond_to_plan(self, &portal.statement.statement))
     }
 
     async fn do_describe_statement<C>(
@@ -878,14 +1164,9 @@ impl ExtendedQueryHandler for NoopHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let upper = stmt.statement.trim().to_ascii_uppercase();
-        if upper.starts_with("SELECT") || upper.starts_with("WITH") {
-            let fields = self
-                .fields_for_metadata_select(&stmt.statement)
-                .unwrap_or_else(|| stub_fields(count_select_columns(&stmt.statement)));
-            Ok(DescribeStatementResponse::new(vec![], fields.to_vec()))
-        } else {
-            Ok(DescribeStatementResponse::no_data())
+        match stmt.statement.describe_fields(self) {
+            Some(fields) => Ok(DescribeStatementResponse::new(vec![], fields.to_vec())),
+            None => Ok(DescribeStatementResponse::no_data()),
         }
     }
 
@@ -897,14 +1178,9 @@ impl ExtendedQueryHandler for NoopHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let upper = portal.statement.statement.trim().to_ascii_uppercase();
-        if upper.starts_with("SELECT") || upper.starts_with("WITH") {
-            let fields = self
-                .fields_for_metadata_select(&portal.statement.statement)
-                .unwrap_or_else(|| stub_fields(count_select_columns(&portal.statement.statement)));
-            Ok(DescribePortalResponse::new(fields.to_vec()))
-        } else {
-            Ok(DescribePortalResponse::no_data())
+        match portal.statement.statement.describe_fields(self) {
+            Some(fields) => Ok(DescribePortalResponse::new(fields.to_vec())),
+            None => Ok(DescribePortalResponse::no_data()),
         }
     }
 }
@@ -995,5 +1271,41 @@ mod tests {
         assert_eq!(tables.len(), 9);
         assert_eq!(tables[0], vec!["order_line".to_string()]);
         assert_eq!(tables[8], vec!["item".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod copy_columns {
+    use super::count_copy_columns;
+
+    /// **The index came from the trimmed string and sliced the untrimmed one.**
+    ///
+    /// `upper.find(" FROM ")` counts bytes in `sql.trim().to_ascii_uppercase()`,
+    /// and `&sql[..i]` then cuts the ORIGINAL — short by exactly the leading
+    /// whitespace. ` COPY t (a,b) FROM STDIN` lost its `)`, `rfind('(')` still
+    /// matched, `after_open.find(')')` did not, and the function returned 1.
+    ///
+    /// `CopyInResponse` then announces one format code for a two-column copy,
+    /// which a client reads as a malformed message. Latent while this was only
+    /// called from the pgwire path; reachable the moment `wire.rs` started
+    /// calling it, which is what a reviewer noticed and these tests did not.
+    #[test]
+    fn leading_whitespace_does_not_shift_the_from_offset() {
+        for (sql, want) in [
+            ("COPY t (a,b) FROM STDIN", 2),
+            (" COPY t (a,b) FROM STDIN", 2),
+            ("\n\t  COPY t (a, b, c) FROM STDIN", 3),
+            ("   copy warehouse (w_id, w_name) from stdin", 2),
+        ] {
+            assert_eq!(count_copy_columns(sql), want, "{sql:?}");
+        }
+    }
+
+    /// No column list is one column, and that must survive the same shift.
+    #[test]
+    fn a_copy_without_a_column_list_is_one_column() {
+        for sql in ["COPY t FROM STDIN", "  COPY t FROM STDIN", "COPY t () FROM STDIN"] {
+            assert_eq!(count_copy_columns(sql), 1, "{sql:?}");
+        }
     }
 }
