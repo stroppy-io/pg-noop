@@ -281,7 +281,7 @@ fn count_select_columns(sql: &str) -> usize {
 
 /// Counts columns in `COPY table (col1, col2) FROM STDIN` by finding the
 /// paren-group between the table name and FROM.
-fn count_copy_columns(sql: &str) -> usize {
+pub(crate) fn count_copy_columns(sql: &str) -> usize {
     let upper = sql.trim().to_ascii_uppercase();
     // Take the part before " FROM "
     let before_from = match upper.find(" FROM ") {

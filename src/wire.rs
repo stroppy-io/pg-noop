@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 
-use crate::handler::{CatalogView, PlanKind, PreparedPlan};
+use crate::handler::{CatalogView, PlanKind, PreparedPlan, count_copy_columns};
 
 /// Frontend messages the blackhole understands. Anything else is consumed and
 /// answered as though it succeeded, which is the whole contract.
@@ -38,6 +38,11 @@ mod tag {
     pub const FLUSH: u8 = b'H';
     pub const CLOSE: u8 = b'C';
     pub const TERMINATE: u8 = b'X';
+    /// Frontend COPY messages. Only reachable once the backend has sent
+    /// `CopyInResponse`, which is what puts the connection into `Phase::CopyIn`.
+    pub const COPY_DATA: u8 = b'd';
+    pub const COPY_DONE: u8 = b'c';
+    pub const COPY_FAIL: u8 = b'f';
 }
 
 /// Largest message this server will frame. PostgreSQL's own limit is 1 GB; a
@@ -45,12 +50,25 @@ mod tag {
 /// how a malformed length becomes an allocation.
 const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 
+/// The longest StartupMessage accepted, matching PostgreSQL's own
+/// `PQ_MAX_STARTUP_PACKET_LENGTH`. A startup packet carries parameters, not a
+/// query, so it needs nothing like `MAX_MESSAGE`.
+const MAX_STARTUP: usize = 10000;
+
 /// Where a connection is in its life. The startup exchange is unframed and has
 /// to be recognised by shape, not by a tag byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Startup,
     Query,
+    /// Between `CopyInResponse` and `CopyDone`/`CopyFail`. The client is
+    /// streaming rows and the only messages that mean anything are `d`, `c` and
+    /// `f`; a query arriving here is a client that ignored the protocol.
+    ///
+    /// The row count travels because `CommandComplete` must report it: PostgreSQL
+    /// answers `COPY n`, and a client that loads 10000 rows and is told `COPY 0`
+    /// has been lied to in a way it can see.
+    CopyIn { rows: u64 },
     Closed,
 }
 
@@ -99,7 +117,10 @@ impl Conn {
 
             let consumed = match self.phase {
                 Phase::Startup => self.startup(rest, out),
-                Phase::Query => self.message(rest, out, catalog),
+                // A COPY in flight is framed the same way a query is; which
+                // messages MEAN anything is `dispatch`'s business, not the
+                // framer's.
+                Phase::Query | Phase::CopyIn { .. } => self.message(rest, out, catalog),
                 Phase::Closed => return pos,
             };
 
@@ -117,8 +138,26 @@ impl Conn {
             return None;
         }
 
-        let len = i32::from_be_bytes(input[0..4].try_into().ok()?) as usize;
-        if len < 8 || input.len() < len {
+        // The same guard the framed path carries at `dispatch`, and it was missing
+        // here. A negative i32 cast straight to usize becomes enormous, so
+        // `input.len() < len` is always true, this returns "incomplete", and the
+        // caller keeps every later byte in its pending buffer waiting for a frame
+        // that can never arrive -- unbounded memory from one malformed startup
+        // packet, before any authentication.
+        //
+        // `MAX_STARTUP` rather than `MAX_MESSAGE`: a StartupMessage carries a
+        // parameter list, not a query, and PostgreSQL itself refuses one over
+        // 10000 bytes (`PQ_MAX_STARTUP_PACKET_LENGTH` in backend/libpq/pqcomm.c).
+        // Matching that is a tighter bound than 16 MiB and is the documented one.
+        let declared = i32::from_be_bytes(input[0..4].try_into().ok()?);
+        if !(8..=MAX_STARTUP as i32).contains(&declared) {
+            self.phase = Phase::Closed;
+
+            return Some(input.len());
+        }
+
+        let len = declared as usize;
+        if input.len() < len {
             return None;
         }
 
@@ -227,7 +266,69 @@ impl Conn {
             tag::QUERY => {
                 let sql = cstr_read(body).unwrap_or("");
                 let plan = PreparedPlan::build(sql);
+
+                // **COPY ... FROM STDIN is a conversation, not an answer.**
+                //
+                // The client sends the statement and then WAITS for
+                // `CopyInResponse` before streaming rows. This path used to fall
+                // into `PlanKind::FromText` and reply `CommandComplete("SELECT
+                // 0")` -- so the client believed the statement had finished and
+                // then wrote `CopyData` into a connection that had moved on. The
+                // stream desynchronises and every later reply is read against the
+                // wrong message.
+                //
+                // The pgwire handler this codec replaced DID implement it
+                // (`handler.rs`, `Response::CopyIn` / `on_copy_data` /
+                // `on_copy_done`), so this was a regression introduced by the
+                // rewrite rather than a gap that was always there. Found in
+                // review.
+                if copy_from_stdin(&plan) {
+                    let cols = count_copy_columns(&plan.sql);
+                    copy_in_response(out, cols);
+                    self.phase = Phase::CopyIn { rows: 0 };
+
+                    return Some(());
+                }
+
                 answer(&plan, out, catalog, true);
+                ready(out);
+            }
+
+            // In flight: count rows, and end on done or fail.
+            tag::COPY_DATA if matches!(self.phase, Phase::CopyIn { .. }) => {
+                if let Phase::CopyIn { rows } = &mut self.phase {
+                    // One CopyData message is one or more rows of text, newline
+                    // separated. Counting newlines is what PostgreSQL reports and
+                    // is right even when a driver batches many rows per message —
+                    // counting MESSAGES would report the driver's batching.
+                    *rows += body.iter().filter(|&&b| b == b'\n').count() as u64;
+                }
+            }
+
+            tag::COPY_DONE if matches!(self.phase, Phase::CopyIn { .. }) => {
+                let rows = match self.phase {
+                    Phase::CopyIn { rows } => rows,
+                    _ => 0,
+                };
+                self.phase = Phase::Query;
+                complete_raw(out, &format!("COPY {rows}"));
+                ready(out);
+            }
+
+            tag::COPY_FAIL if matches!(self.phase, Phase::CopyIn { .. }) => {
+                // The client is abandoning its own COPY. That is an error by the
+                // protocol's own definition, and answering it as success would
+                // tell a loader its data landed.
+                self.phase = Phase::Query;
+                error_response(out, "57014", "COPY from stdin failed");
+                ready(out);
+            }
+
+            tag::COPY_DATA | tag::COPY_DONE | tag::COPY_FAIL => {
+                // A COPY message outside a COPY is the client desynchronised, not
+                // something to absorb quietly: absorbing it is what lets the two
+                // sides disagree for the rest of the connection.
+                error_response(out, "08P01", "COPY message outside a COPY operation");
                 ready(out);
             }
 
@@ -413,6 +514,31 @@ fn cstr(out: &mut Vec<u8>, s: &str) {
 }
 
 /// A minimal ErrorResponse: severity, SQLSTATE, message, terminator.
+/// `COPY ... FROM STDIN`, the only COPY shape that streams from the client.
+///
+/// `COPY ... TO STDOUT` sends rows the other way and a blackhole has none, so it
+/// keeps answering as it did. `COPY ... FROM '/file'` is the server reading a
+/// path and involves no protocol conversation at all.
+fn copy_from_stdin(plan: &PreparedPlan) -> bool {
+    let u = plan.sql.trim_start();
+    if !u.get(..4).is_some_and(|h| h.eq_ignore_ascii_case("COPY")) {
+        return false;
+    }
+    let upper = u.to_ascii_uppercase();
+    upper.contains(" FROM STDIN") || upper.contains(" FROM  STDIN")
+}
+
+/// `CopyInResponse`: text format, one format code per column.
+fn copy_in_response(out: &mut Vec<u8>, cols: usize) {
+    msg(out, b'G', |b| {
+        b.push(0); // overall format: text
+        b.extend_from_slice(&(cols as i16).to_be_bytes());
+        for _ in 0..cols {
+            b.extend_from_slice(&0i16.to_be_bytes()); // per-column: text
+        }
+    });
+}
+
 fn error_response(out: &mut Vec<u8>, code: &str, message: &str) {
     msg(out, b'E', |b| {
         b.push(b'S');
@@ -755,6 +881,111 @@ mod tests {
             assert!(used > 0, "len {bad} consumed nothing: the stall");
             assert!(c.is_closed(), "len {bad} left the connection open");
         }
+    }
+
+    /// **COPY FROM STDIN is a conversation**, and answering it with
+    /// `CommandComplete` desynchronises the stream: the client believes the
+    /// statement finished and then writes rows into a connection that moved on.
+    ///
+    /// The pgwire handler this codec replaced implemented it; the rewrite dropped
+    /// it and answered `SELECT 0`. A reviewer found that, not these tests.
+    #[test]
+    fn copy_from_stdin_gets_its_response_and_row_count() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+
+        c.advance(
+            &tagged(b'Q', |b| cstr(b, "COPY warehouse (w_id, w_name) FROM STDIN")),
+            &mut out,
+            &v,
+        );
+        assert_eq!(out[0], b'G', "a COPY must be answered with CopyInResponse");
+        // Text format overall, then one text format code per column.
+        assert_eq!(out[5], 0, "overall format must be text");
+        assert_eq!(i16::from_be_bytes([out[6], out[7]]), 2, "two columns");
+        assert!(
+            !out.windows(1).any(|w| w == b"Z"),
+            "ReadyForQuery must NOT follow: the client speaks next"
+        );
+
+        // Three rows across two messages: the count must follow the ROWS, not the
+        // client's batching.
+        out.clear();
+        c.advance(&tagged(b'd', |b| b.extend_from_slice(b"1\tone\n2\ttwo\n")), &mut out, &v);
+        c.advance(&tagged(b'd', |b| b.extend_from_slice(b"3\tthree\n")), &mut out, &v);
+        assert!(out.is_empty(), "CopyData is absorbed silently, as the protocol says");
+
+        c.advance(&tagged(b'c', |_| {}), &mut out, &v);
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("COPY 3"), "row count must be reported: {text}");
+        assert!(out.ends_with(&[b'I']), "and ReadyForQuery(idle) must close it");
+    }
+
+    /// A client that abandons its own COPY is told it failed. Answering success
+    /// would tell a loader its data landed.
+    #[test]
+    fn copy_fail_is_an_error_not_a_success() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        c.advance(&tagged(b'Q', |b| cstr(b, "COPY t FROM STDIN")), &mut out, &v);
+
+        out.clear();
+        c.advance(&tagged(b'f', |b| cstr(b, "client gave up")), &mut out, &v);
+        assert_eq!(out[0], b'E', "CopyFail must produce ErrorResponse");
+        assert!(!c.is_closed(), "and the connection survives it");
+    }
+
+    /// COPY TO STDOUT and COPY FROM a file are not conversations, so they keep
+    /// answering as before. A guard that fired on every COPY would break them.
+    #[test]
+    fn only_copy_from_stdin_enters_the_copy_phase() {
+        for sql in ["COPY t TO STDOUT", "COPY t FROM '/tmp/x.csv'", "SELECT 1"] {
+            let (mut c, v) = connected();
+            let mut out = Vec::new();
+            c.advance(&tagged(b'Q', |b| cstr(b, sql)), &mut out, &v);
+            assert_ne!(out[0], b'G', "{sql} must not get CopyInResponse");
+            assert!(out.ends_with(&[b'I']), "{sql} must be answered and ready");
+        }
+    }
+
+    /// The same stall, one packet earlier: the STARTUP length is client-controlled
+    /// too, and it is read before any authentication. The framed path was guarded
+    /// in the first review round and this one was not, which is what a reviewer
+    /// found and these tests did not -- they covered the framed path only.
+    #[test]
+    fn a_negative_startup_length_is_rejected_rather_than_stalling() {
+        for bad in [-1i32, i32::MIN, 7, (MAX_STARTUP as i32) + 1] {
+            let mut c = Conn::new();
+            let v = view();
+            let mut input = bad.to_be_bytes().to_vec();
+            input.extend_from_slice(&196608i32.to_be_bytes()); // protocol 3.0
+            input.extend_from_slice(b"user\0bench\0\0");
+
+            let mut out = Vec::new();
+            let used = c.advance(&input, &mut out, &v);
+
+            assert!(used > 0, "startup len {bad} consumed nothing: the stall");
+            assert!(c.is_closed(), "startup len {bad} left the connection open");
+        }
+    }
+
+    /// And the honest packet still works, so the bound is not simply refusing
+    /// everything -- the failure a too-tight guard would produce.
+    #[test]
+    fn an_ordinary_startup_still_completes() {
+        let mut c = Conn::new();
+        let v = view();
+        let mut body = 196608i32.to_be_bytes().to_vec();
+        body.extend_from_slice(b"user\0bench\0database\0bench\0\0");
+        let mut input = ((body.len() + 4) as i32).to_be_bytes().to_vec();
+        input.extend_from_slice(&body);
+
+        let mut out = Vec::new();
+        let used = c.advance(&input, &mut out, &v);
+
+        assert_eq!(used, input.len(), "a valid startup must be consumed whole");
+        assert!(!c.is_closed(), "a valid startup must not close the connection");
+        assert!(!out.is_empty(), "and must be answered");
     }
 
     /// Once a message is FRAMED its bytes are all present, so the only outcomes

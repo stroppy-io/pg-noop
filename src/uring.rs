@@ -30,7 +30,7 @@ use std::io;
 use std::net::TcpListener;
 use std::os::fd::{AsRawFd, RawFd};
 
-use io_uring::{opcode, types, IoUring};
+use io_uring::{opcode, squeue, types, IoUring};
 
 use crate::handler::CatalogView;
 use crate::wire::Conn;
@@ -139,8 +139,7 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
     let mut accept_addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let mut accept_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_storage>() as _;
 
-    // SAFETY: the address scratch outlives the loop and only the kernel writes it.
-    let mut push_accept = |ring: &mut IoUring| unsafe {
+    let mut push_accept = |ring: &mut IoUring| -> io::Result<()> {
         let e = opcode::Accept::new(
             types::Fd(listen_fd),
             &mut accept_addr as *mut _ as *mut libc::sockaddr,
@@ -148,12 +147,16 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
         )
         .build()
         .user_data(tag(0, OP_ACCEPT));
-        while ring.submission().push(&e).is_err() {
-            let _ = ring.submit();
-        }
+        // SAFETY: the address scratch outlives the loop and only the kernel
+        // writes it.
+        unsafe { push_or_submit(ring, &e) }
     };
 
-    push_accept(&mut ring);
+    // When accept may be re-armed again. `None` means now. Set on the errnos
+    // that do not clear by retrying, and read where accept is re-armed.
+    let mut accept_paused_until: Option<std::time::Instant> = None;
+
+    push_accept(&mut ring)?;
     ring.submit()?;
 
     loop {
@@ -185,10 +188,27 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
                             || err == libc::ENOMEM
                             || err == libc::ENOBUFS
                         {
-                            eprintln!(
-                                "pgnoop: accept failed with errno {err}; backing off 100ms"
+                            // **Back off the ACCEPT, not the shard.**
+                            //
+                            // This used to `thread::sleep(100ms)` right here, in
+                            // the middle of draining completions. Every receive
+                            // and send that had ALREADY completed waited those
+                            // 100 ms with it, and a run of accept failures --
+                            // which is what fd exhaustion is -- stopped the
+                            // shard doing the work it still had. The connections
+                            // already open are exactly the ones that should keep
+                            // running while new ones cannot be taken.
+                            //
+                            // So: record a deadline, skip re-arming accept until
+                            // it passes, and carry on with this batch.
+                            accept_paused_until = Some(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_millis(100),
                             );
-                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            eprintln!(
+                                "pgnoop: accept failed with errno {err}; \
+                                 not re-arming accept for 100ms (other work continues)"
+                            );
                         } else if err == libc::EBADF || err == libc::EINVAL {
                             return Err(io::Error::from_raw_os_error(err));
                         }
@@ -219,9 +239,18 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
                                 slots.len() - 1
                             }
                         };
-                        submit_recv(&mut ring, &mut slots, i);
+                        submit_recv(&mut ring, &mut slots, i)?;
                     }
-                    push_accept(&mut ring);
+                    // Only re-arm when the pause has expired. While it has
+                    // not, no accept is in flight and the loop keeps serving
+                    // whatever is already connected.
+                    match accept_paused_until {
+                        Some(t) if std::time::Instant::now() < t => {}
+                        _ => {
+                            accept_paused_until = None;
+                            push_accept(&mut ring)?;
+                        }
+                    }
                 }
 
                 OP_RECV => {
@@ -269,10 +298,10 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
                             slot.closing = true;
                             reap(&mut slots, &mut free, idx);
                         } else {
-                            submit_recv(&mut ring, &mut slots, idx);
+                            submit_recv(&mut ring, &mut slots, idx)?;
                         }
                     } else {
-                        submit_send(&mut ring, &mut slots, idx);
+                        submit_send(&mut ring, &mut slots, idx)?;
                     }
                 }
 
@@ -292,12 +321,12 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
 
                     if slot.sent < slot.send.len() {
                         // A short write is normal under pressure; finish it.
-                        submit_send(&mut ring, &mut slots, idx);
+                        submit_send(&mut ring, &mut slots, idx)?;
                     } else if slot.conn.is_closed() {
                         slot.closing = true;
                         reap(&mut slots, &mut free, idx);
                     } else {
-                        submit_recv(&mut ring, &mut slots, idx);
+                        submit_recv(&mut ring, &mut slots, idx)?;
                     }
                 }
 
@@ -307,9 +336,9 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
     }
 }
 
-fn submit_recv(ring: &mut IoUring, slots: &mut [Option<Slot>], idx: usize) {
+fn submit_recv(ring: &mut IoUring, slots: &mut [Option<Slot>], idx: usize) -> io::Result<()> {
     let Some(slot) = slots.get_mut(idx).and_then(|s| s.as_mut()) else {
-        return;
+        return Ok(());
     };
     let e = opcode::Recv::new(
         types::Fd(slot.fd),
@@ -322,16 +351,36 @@ fn submit_recv(ring: &mut IoUring, slots: &mut [Option<Slot>], idx: usize) {
     slot.in_flight += 1;
     // SAFETY: `slot.recv`'s allocation outlives the operation; the slot is not
     // freed while in_flight > 0.
-    unsafe {
-        while ring.submission().push(&e).is_err() {
-            let _ = ring.submit();
+    unsafe { push_or_submit(ring, &e) }
+}
+
+/// Push one entry, making room by submitting when the queue is full.
+///
+/// **The error is returned, not discarded.** All three call sites used to spin
+/// `while push().is_err() { let _ = ring.submit(); }`, which is correct only while
+/// `submit` can still succeed: a persistent failure -- a closed ring, EBADF on the
+/// ring fd, ENOMEM that does not clear -- leaves the shard spinning on a full queue
+/// with no way out and no message. A shard that cannot submit is finished, and
+/// saying so is the difference between one dead shard and a core at 100% forever.
+///
+/// # Safety
+///
+/// The caller must keep every buffer the entry points at alive until its
+/// completion is reaped.
+unsafe fn push_or_submit(ring: &mut IoUring, e: &squeue::Entry) -> io::Result<()> {
+    loop {
+        // SAFETY: the caller's contract, forwarded.
+        if unsafe { ring.submission().push(e) }.is_ok() {
+            return Ok(());
         }
+        // Full: make room. If THAT fails there is nothing left to try.
+        ring.submit()?;
     }
 }
 
-fn submit_send(ring: &mut IoUring, slots: &mut [Option<Slot>], idx: usize) {
+fn submit_send(ring: &mut IoUring, slots: &mut [Option<Slot>], idx: usize) -> io::Result<()> {
     let Some(slot) = slots.get_mut(idx).and_then(|s| s.as_mut()) else {
-        return;
+        return Ok(());
     };
     let e = opcode::Send::new(
         types::Fd(slot.fd),
@@ -343,11 +392,7 @@ fn submit_send(ring: &mut IoUring, slots: &mut [Option<Slot>], idx: usize) {
 
     slot.in_flight += 1;
     // SAFETY: as above; `send` is not touched again until this completes.
-    unsafe {
-        while ring.submission().push(&e).is_err() {
-            let _ = ring.submit();
-        }
-    }
+    unsafe { push_or_submit(ring, &e) }
 }
 
 /// Close and free a slot, but only once nothing is still pointing at its

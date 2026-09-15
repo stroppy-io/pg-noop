@@ -260,6 +260,30 @@ fn main() {
                 return;
             };
 
+            // **Finite deadlines for the measurement phase.**
+            //
+            // `write_all` and `read` are blocking, and `done` is only checked
+            // BETWEEN batches. A server that stalls mid-batch parks the worker
+            // inside a syscall where no flag can reach it, `join` never returns,
+            // and the harness hangs rather than reporting a bad run. Found in
+            // review.
+            //
+            // Derived from the run rather than picked: a batch that has not been
+            // answered in the time the whole run was meant to take is not slow,
+            // it is a stall, and the `Err(_) => break 'work` arm already keeps
+            // whatever the worker completed before it. The `.max(5)` is for very
+            // short runs, where a per-batch bound below a few seconds would start
+            // reporting scheduler noise as a failure.
+            let stall = Duration::from_secs(secs.max(5));
+            if sock.set_read_timeout(Some(stall)).is_err()
+                || sock.set_write_timeout(Some(stall)).is_err()
+            {
+                // A worker that cannot be bounded is not one to run: it is the
+                // exact thread that would hang the join.
+                ready_workers.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+
             live_workers.fetch_add(1, Ordering::Relaxed);
             ready_workers.fetch_add(1, Ordering::Relaxed);
             while !go.load(Ordering::Acquire) {
