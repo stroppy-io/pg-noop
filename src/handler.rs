@@ -104,7 +104,7 @@ impl SchemaCatalog {
                 .iter()
                 .map(|column| {
                     FieldInfo::new(
-                        column.name.clone().into(),
+                        column.name.clone(),
                         None,
                         None,
                         column.typ.clone(),
@@ -127,8 +127,7 @@ impl SchemaCatalog {
                     FieldInfo::new(
                         column
                             .map(|column| column.name.clone())
-                            .unwrap_or_else(|| selected_name.to_string())
-                            .into(),
+                            .unwrap_or_else(|| selected_name.to_string()),
                         None,
                         None,
                         column
@@ -185,11 +184,9 @@ fn count_select_columns(sql: &str) -> usize {
         match bytes[i] {
             b'(' => depth += 1,
             b')' => depth = depth.saturating_sub(1),
-            b' ' if depth == 0 => {
-                if body[i..].starts_with(" FROM ") {
-                    from_at = i;
-                    break;
-                }
+            b' ' if depth == 0 && body[i..].starts_with(" FROM ") => {
+                from_at = i;
+                break;
             }
             _ => {}
         }
