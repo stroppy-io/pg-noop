@@ -1,5 +1,6 @@
 mod config;
 mod handler;
+#[cfg(target_os = "linux")]
 mod uring;
 mod wire;
 
@@ -20,6 +21,12 @@ use wire::Conn;
 ///
 /// Best effort: a failure here costs locality, not correctness, and a container
 /// with a restricted cpuset is a normal reason to fail.
+///
+/// Linux only. `sched_setaffinity` and `cpu_set_t` do not exist on Apple
+/// platforms, and there is no equivalent that can be dropped in -- Darwin
+/// threads are placed by the scheduler's own affinity hints, not by a mask the
+/// process sets. Pinning is therefore compiled out rather than faked.
+#[cfg(target_os = "linux")]
 fn pin_to_cpu(cpu: usize) -> bool {
     // SAFETY: cpu_set_t is a plain bitmask; we zero it, set one bit within
     // range, and hand it to sched_setaffinity with its own size.
@@ -31,6 +38,11 @@ fn pin_to_cpu(cpu: usize) -> bool {
         libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
     }
 }
+
+/// Whether this platform can pin at all. Asked once, so a platform without
+/// pinning never prints a per-shard "could not pin" line for something it never
+/// attempted.
+const PINNING_SUPPORTED: bool = cfg!(target_os = "linux");
 
 /// One listener per shard on the SAME port, via SO_REUSEPORT.
 ///
@@ -98,9 +110,15 @@ async fn serve(mut socket: TcpStream, catalog: CatalogView) {
 /// One shard: a pinned thread, its own single-threaded reactor, its own
 /// listener, and every connection it accepts served to completion on it.
 fn run_shard(id: usize, addr: SocketAddr, pin: bool, io: Io, catalog: CatalogView) -> bool {
+    // Only ever true on Linux, where the call and the constant both exist.
+    #[cfg(target_os = "linux")]
     if pin && !pin_to_cpu(id) {
         eprintln!("pgnoop: shard {id} could not pin to cpu {id}; continuing unpinned");
     }
+
+    // Unused where the enum has a single variant; the loop below is the same.
+    #[cfg(not(target_os = "linux"))]
+    let _ = io;
 
     let listener = match shard_listener(addr, 1024) {
         Ok(l) => l,
@@ -113,6 +131,7 @@ fn run_shard(id: usize, addr: SocketAddr, pin: bool, io: Io, catalog: CatalogVie
     // io_uring needs no runtime at all: the codec is sans-io, so a shard is a
     // loop that submits reads, runs the codec, and submits writes. epoll keeps
     // tokio because that is what tokio is for.
+    #[cfg(target_os = "linux")]
     if io == Io::Uring {
         if let Err(e) = crate::uring::run(listener, catalog, 4096) {
             eprintln!("pgnoop: shard {id} io_uring loop ended: {e}");
@@ -169,8 +188,10 @@ fn main() {
         .parse()
         .expect("host:port");
 
-    // Pinning only makes sense while shards fit on distinct CPUs.
-    let pin = shards <= std::thread::available_parallelism().map_or(1, |n| n.get());
+    // Pinning only makes sense while shards fit on distinct CPUs -- and only
+    // where the platform can pin at all; elsewhere this stays false and no shard
+    // tries.
+    let pin = PINNING_SUPPORTED && shards <= std::thread::available_parallelism().map_or(1, |n| n.get());
 
     eprintln!(
         "pgnoop listening on {}:{} ({} shards, {}, SO_REUSEPORT, pinned={})",
