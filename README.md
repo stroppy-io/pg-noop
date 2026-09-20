@@ -166,4 +166,4 @@ point the figure describes the client.
 
 Both **simple query** (psql) and **extended query** (pgx, psycopg3, JDBC, etc.) protocols are supported. No authentication — all connections are accepted.
 
-PostgreSQL wire-protocol framing and encoding use the custom sans-I/O `wire::Conn` codec (`Conn::advance` consumes bytes and yields responses without touching a socket); [`pgwire`](https://github.com/sunng87/pgwire), a Rust implementation of the PostgreSQL frontend/backend protocol ([crates.io](https://crates.io/crates/pgwire) · [docs.rs](https://docs.rs/pgwire)), provides the handler APIs the codec dispatches to.
+PostgreSQL wire-protocol framing and encoding use the custom sans-I/O `wire::Conn` codec (`Conn::advance` consumes bytes, dispatches queries and appends responses without touching a socket); [`pgwire`](https://github.com/sunng87/pgwire), a Rust implementation of the PostgreSQL frontend/backend protocol ([crates.io](https://crates.io/crates/pgwire) · [docs.rs](https://docs.rs/pgwire)), provides the handler APIs used by the separate handler implementation.
