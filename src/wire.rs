@@ -73,7 +73,10 @@ enum Phase {
     /// ends at a newline, so newlines are the rows; in binary format there are no
     /// newlines at all -- `pgx.CopyFrom` encodes field lengths and payload bytes,
     /// and `0x0a` appears wherever a value happens to contain it.
-    CopyIn { rows: u64, binary: bool },
+    CopyIn {
+        rows: u64,
+        binary: bool,
+    },
     Closed,
 }
 
@@ -455,7 +458,7 @@ impl Conn {
             self.error(out, "08P01", "malformed message body");
         }
 
-        return Some(total);
+        Some(total)
     }
 
     /// The body of one framed message. Every `?` here means "this body is
@@ -467,7 +470,6 @@ impl Conn {
         out: &mut Vec<u8>,
         catalog: &CatalogView,
     ) -> Option<()> {
-
         match t {
             tag::TERMINATE => {
                 self.phase = Phase::Closed;
@@ -718,12 +720,9 @@ impl Conn {
         if kind == b'S' {
             self.statements.get(name)
         } else {
-            self.portals
-                .get(name)
-                .and_then(|s| self.statements.get(s))
+            self.portals.get(name).and_then(|s| self.statements.get(s))
         }
     }
-
 }
 
 /// The rows and the completion tag for one plan. A FREE function, not a method:
@@ -1289,7 +1288,10 @@ mod tests {
         );
 
         let text = String::from_utf8_lossy(&out);
-        assert!(text.contains("id"), "the client's own column name: {text:?}");
+        assert!(
+            text.contains("id"),
+            "the client's own column name: {text:?}"
+        );
         assert!(text.contains("label"), "and the second: {text:?}");
         assert!(
             !text.contains("?column?"),
@@ -1330,7 +1332,9 @@ mod tests {
         let mut out = Vec::new();
 
         c.advance(
-            &tagged(b'Q', |b| cstr(b, "COPY warehouse (w_id, w_name) FROM STDIN")),
+            &tagged(b'Q', |b| {
+                cstr(b, "COPY warehouse (w_id, w_name) FROM STDIN")
+            }),
             &mut out,
             &v,
         );
@@ -1346,14 +1350,28 @@ mod tests {
         // Three rows across two messages: the count must follow the ROWS, not the
         // client's batching.
         out.clear();
-        c.advance(&tagged(b'd', |b| b.extend_from_slice(b"1\tone\n2\ttwo\n")), &mut out, &v);
-        c.advance(&tagged(b'd', |b| b.extend_from_slice(b"3\tthree\n")), &mut out, &v);
-        assert!(out.is_empty(), "CopyData is absorbed silently, as the protocol says");
+        c.advance(
+            &tagged(b'd', |b| b.extend_from_slice(b"1\tone\n2\ttwo\n")),
+            &mut out,
+            &v,
+        );
+        c.advance(
+            &tagged(b'd', |b| b.extend_from_slice(b"3\tthree\n")),
+            &mut out,
+            &v,
+        );
+        assert!(
+            out.is_empty(),
+            "CopyData is absorbed silently, as the protocol says"
+        );
 
         c.advance(&tagged(b'c', |_| {}), &mut out, &v);
         let text = String::from_utf8_lossy(&out);
-        assert!(text.contains("COPY 3"), "row count must be reported: {text}");
-        assert!(out.ends_with(&[b'I']), "and ReadyForQuery(idle) must close it");
+        assert!(
+            text.contains("COPY 3"),
+            "row count must be reported: {text}"
+        );
+        assert!(out.ends_with(b"I"), "and ReadyForQuery(idle) must close it");
     }
 
     /// A client that abandons its own COPY is told it failed. Answering success
@@ -1362,7 +1380,11 @@ mod tests {
     fn copy_fail_is_an_error_not_a_success() {
         let (mut c, v) = connected();
         let mut out = Vec::new();
-        c.advance(&tagged(b'Q', |b| cstr(b, "COPY t FROM STDIN")), &mut out, &v);
+        c.advance(
+            &tagged(b'Q', |b| cstr(b, "COPY t FROM STDIN")),
+            &mut out,
+            &v,
+        );
 
         out.clear();
         c.advance(&tagged(b'f', |b| cstr(b, "client gave up")), &mut out, &v);
@@ -1385,7 +1407,7 @@ mod tests {
             let mut out = Vec::new();
             c.advance(&tagged(b'Q', |b| cstr(b, sql)), &mut out, &v);
             assert_ne!(out[0], b'G', "{sql} must not get CopyInResponse");
-            assert!(out.ends_with(&[b'I']), "{sql} must be answered and ready");
+            assert!(out.ends_with(b"I"), "{sql} must be answered and ready");
         }
     }
 
@@ -1396,7 +1418,11 @@ mod tests {
         let (mut c, v) = connected();
         let mut out = Vec::new();
 
-        c.advance(&tagged(b'Q', |b| cstr(b, "COPY warehouse TO STDOUT")), &mut out, &v);
+        c.advance(
+            &tagged(b'Q', |b| cstr(b, "COPY warehouse TO STDOUT")),
+            &mut out,
+            &v,
+        );
 
         assert_eq!(out[0], b'H', "CopyOutResponse");
         let text = String::from_utf8_lossy(&out);
@@ -1405,7 +1431,7 @@ mod tests {
         // CopyOutResponse is `H` + length + (format, columns) = 8 bytes, then the
         // server's own CopyDone, then the tag, then ReadyForQuery.
         assert_eq!(out[8], b'c', "CopyDone before the tag");
-        assert!(out.ends_with(&[b'I']), "and ready");
+        assert!(out.ends_with(b"I"), "and ready");
     }
 
     /// A file the server reads is the same non-conversation, and the same tag.
@@ -1453,7 +1479,10 @@ mod tests {
             c.advance(&tagged(b'd', |b| b.extend_from_slice(b"1\n")), &mut out, &v);
             c.advance(&tagged(b'c', |_| {}), &mut out, &v);
             let text = String::from_utf8_lossy(&out);
-            assert!(text.contains("COPY 1"), "{sql:?} must count its row: {text}");
+            assert!(
+                text.contains("COPY 1"),
+                "{sql:?} must count its row: {text}"
+            );
         }
     }
 
@@ -1508,7 +1537,11 @@ mod tests {
         assert_eq!(out[0], b'G', "CopyInResponse");
         assert_eq!(out[5], 1, "binary overall format");
         assert_eq!(i16::from_be_bytes([out[6], out[7]]), 2, "two columns");
-        assert_eq!(i16::from_be_bytes([out[8], out[9]]), 1, "binary, per column");
+        assert_eq!(
+            i16::from_be_bytes([out[8], out[9]]),
+            1,
+            "binary, per column"
+        );
         out.clear();
 
         // Header, then three tuples. The second field of the first row contains
@@ -1532,9 +1565,17 @@ mod tests {
         // stream, not a row.
         let split = stream.len() - 12;
 
-        c.advance(&tagged(b'd', |b| b.extend_from_slice(&stream[..split])), &mut out, &v);
+        c.advance(
+            &tagged(b'd', |b| b.extend_from_slice(&stream[..split])),
+            &mut out,
+            &v,
+        );
         assert!(out.is_empty(), "CopyData is absorbed silently");
-        c.advance(&tagged(b'd', |b| b.extend_from_slice(&stream[split..])), &mut out, &v);
+        c.advance(
+            &tagged(b'd', |b| b.extend_from_slice(&stream[split..])),
+            &mut out,
+            &v,
+        );
 
         c.advance(&tagged(b'c', |_| {}), &mut out, &v);
         let text = String::from_utf8_lossy(&out);
@@ -1548,7 +1589,11 @@ mod tests {
         let (mut c, v) = connected();
         let mut out = Vec::new();
 
-        c.advance(&tagged(b'Q', |b| cstr(b, "COPY t FROM STDIN BINARY")), &mut out, &v);
+        c.advance(
+            &tagged(b'Q', |b| cstr(b, "COPY t FROM STDIN BINARY")),
+            &mut out,
+            &v,
+        );
         out.clear();
 
         let mut stream = Vec::new();
@@ -1562,11 +1607,18 @@ mod tests {
         stream.extend_from_slice(&(-1i32).to_be_bytes());
         stream.extend_from_slice(&(-1i16).to_be_bytes());
 
-        c.advance(&tagged(b'd', |b| b.extend_from_slice(&stream)), &mut out, &v);
+        c.advance(
+            &tagged(b'd', |b| b.extend_from_slice(&stream)),
+            &mut out,
+            &v,
+        );
         c.advance(&tagged(b'c', |_| {}), &mut out, &v);
 
         let text = String::from_utf8_lossy(&out);
-        assert!(text.contains("COPY 1"), "one row, trailer not counted: {text}");
+        assert!(
+            text.contains("COPY 1"),
+            "one row, trailer not counted: {text}"
+        );
     }
 
     /// A client that never completes a tuple must not grow the carry buffer
@@ -1577,7 +1629,11 @@ mod tests {
         let (mut c, v) = connected();
         let mut out = Vec::new();
 
-        c.advance(&tagged(b'Q', |b| cstr(b, "COPY t FROM STDIN BINARY")), &mut out, &v);
+        c.advance(
+            &tagged(b'Q', |b| cstr(b, "COPY t FROM STDIN BINARY")),
+            &mut out,
+            &v,
+        );
 
         // A field header promising far more bytes than will ever arrive, sent
         // until the carry exceeds its ceiling.
@@ -1597,7 +1653,10 @@ mod tests {
             }
         }
 
-        assert!(c.is_closed(), "an unterminated tuple must not be held forever");
+        assert!(
+            c.is_closed(),
+            "an unterminated tuple must not be held forever"
+        );
     }
 
     /// The same stall, one packet earlier: the STARTUP length is client-controlled
@@ -1636,7 +1695,10 @@ mod tests {
         let used = c.advance(&input, &mut out, &v);
 
         assert_eq!(used, input.len(), "a valid startup must be consumed whole");
-        assert!(!c.is_closed(), "a valid startup must not close the connection");
+        assert!(
+            !c.is_closed(),
+            "a valid startup must not close the connection"
+        );
         assert!(!out.is_empty(), "and must be answered");
     }
 
@@ -1656,9 +1718,17 @@ mod tests {
         let mut out = Vec::new();
         let used = c.advance(&input, &mut out, &v);
 
-        assert_eq!(used, input.len(), "a framed message must always be consumed");
+        assert_eq!(
+            used,
+            input.len(),
+            "a framed message must always be consumed"
+        );
         let t = tags(&out);
-        assert_eq!(t.first(), Some(&b'E'), "malformed body gets an error: {t:?}");
+        assert_eq!(
+            t.first(),
+            Some(&b'E'),
+            "malformed body gets an error: {t:?}"
+        );
         assert_eq!(
             t.last(),
             Some(&b'Z'),

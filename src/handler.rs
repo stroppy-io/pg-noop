@@ -122,7 +122,7 @@ impl SchemaCatalog {
                 .iter()
                 .map(|column| {
                     FieldInfo::new(
-                        column.name.clone().into(),
+                        column.name.clone(),
                         None,
                         None,
                         column.typ.clone(),
@@ -145,8 +145,7 @@ impl SchemaCatalog {
                     FieldInfo::new(
                         column
                             .map(|column| column.name.clone())
-                            .unwrap_or_else(|| selected_name.to_string())
-                            .into(),
+                            .unwrap_or_else(|| selected_name.to_string()),
                         None,
                         None,
                         column
@@ -215,8 +214,8 @@ static STUB_FIELD_CACHE: OnceLock<Vec<Arc<Vec<FieldInfo>>>> = OnceLock::new();
 const STUB_FIELD_CACHE_MAX: usize = 16;
 
 fn stub_fields(n: usize) -> Arc<Vec<FieldInfo>> {
-    let cache =
-        STUB_FIELD_CACHE.get_or_init(|| (0..=STUB_FIELD_CACHE_MAX).map(build_stub_fields).collect());
+    let cache = STUB_FIELD_CACHE
+        .get_or_init(|| (0..=STUB_FIELD_CACHE_MAX).map(build_stub_fields).collect());
 
     match cache.get(n) {
         Some(fields) => Arc::clone(fields),
@@ -252,13 +251,12 @@ fn count_select_columns(sql: &str) -> usize {
         match bytes[i] {
             b'(' => depth += 1,
             b')' => depth = depth.saturating_sub(1),
-            b' ' if depth == 0 => {
-                if body.as_bytes()[i..].len() >= 6
-                    && body.as_bytes()[i..i + 6].eq_ignore_ascii_case(b" FROM ")
-                {
-                    from_at = i;
-                    break;
-                }
+            b' ' if depth == 0
+                && body.as_bytes()[i..].len() >= 6
+                && body.as_bytes()[i..i + 6].eq_ignore_ascii_case(b" FROM ") =>
+            {
+                from_at = i;
+                break;
             }
             _ => {}
         }
@@ -311,9 +309,7 @@ pub(crate) fn copy_direction(sql: &str) -> Option<CopyDirection> {
     // Skip the table name and any column list, then read the direction.
     // `COPY table (a, b) FROM STDIN` and `COPY table TO STDOUT` both land here.
     loop {
-        let Some(word) = words.next() else {
-            return None;
-        };
+        let word = words.next()?;
 
         if word.eq_ignore_ascii_case("FROM") {
             // `FROM STDIN` is a stream; `FROM 'file'` is a path. A path arrives
@@ -396,7 +392,9 @@ impl<'a> SqlWords<'a> {
     }
 
     fn next(&mut self) -> Option<&'a str> {
-        self.rest = self.rest.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ';');
+        self.rest = self
+            .rest
+            .trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ';');
 
         let mut chars = self.rest.char_indices();
 
@@ -1089,7 +1087,9 @@ pub enum PlanKind {
         columns: Vec<SelectColumn>,
     },
     /// A SELECT that names no table: hand back n stub columns.
-    SelectStub { columns: usize },
+    SelectStub {
+        columns: usize,
+    },
     Insert,
     Update,
     Delete,
@@ -1259,13 +1259,11 @@ fn respond_to_plan(handler: &NoopHandler, plan: &PreparedPlan) -> Response {
             columns,
             binary,
         } => match direction {
-            CopyDirection::FromStdin => {
-                Response::CopyIn(CopyResponse::new(
-                    i8::from(*binary),
-                    *columns,
-                    stream::empty::<PgWireResult<CopyData>>(),
-                ))
-            }
+            CopyDirection::FromStdin => Response::CopyIn(CopyResponse::new(
+                i8::from(*binary),
+                *columns,
+                stream::empty::<PgWireResult<CopyData>>(),
+            )),
             CopyDirection::ToStdout => Response::CopyOut(CopyResponse::new(
                 0,
                 0,
@@ -1559,7 +1557,11 @@ mod copy_columns {
     /// No column list is one column, and that must survive the same shift.
     #[test]
     fn a_copy_without_a_column_list_is_one_column() {
-        for sql in ["COPY t FROM STDIN", "  COPY t FROM STDIN", "COPY t () FROM STDIN"] {
+        for sql in [
+            "COPY t FROM STDIN",
+            "  COPY t FROM STDIN",
+            "COPY t () FROM STDIN",
+        ] {
             assert_eq!(count_copy_columns(sql), 1, "{sql:?}");
         }
     }
@@ -1590,7 +1592,7 @@ mod copy_columns {
 
 #[cfg(test)]
 mod copy_direction_tests {
-    use super::{CopyDirection, copy_direction, copy_is_binary};
+    use super::{copy_direction, copy_is_binary, CopyDirection};
 
     /// **The reviewer's case.** `COPY t FROM    STDIN` used to answer `SELECT 0`
     /// because the match allowed one or two spaces, and the following `CopyData`
@@ -1607,19 +1609,35 @@ mod copy_direction_tests {
             "  COPY t (a, b) FROM\t\tSTDIN  ",
             "copy warehouse (w_id, w_name) from   stdin",
         ] {
-            assert_eq!(copy_direction(sql), Some(CopyDirection::FromStdin), "{sql:?}");
+            assert_eq!(
+                copy_direction(sql),
+                Some(CopyDirection::FromStdin),
+                "{sql:?}"
+            );
         }
     }
 
     /// The other two directions, which used to be the same case.
     #[test]
     fn direction_is_read_from_the_statement() {
-        for sql in ["COPY t TO STDOUT", "COPY t TO  STDOUT", "COPY t (a) TO\nSTDOUT"] {
-            assert_eq!(copy_direction(sql), Some(CopyDirection::ToStdout), "{sql:?}");
+        for sql in [
+            "COPY t TO STDOUT",
+            "COPY t TO  STDOUT",
+            "COPY t (a) TO\nSTDOUT",
+        ] {
+            assert_eq!(
+                copy_direction(sql),
+                Some(CopyDirection::ToStdout),
+                "{sql:?}"
+            );
         }
 
         for sql in ["COPY t FROM '/tmp/x.csv'", "COPY t TO '/tmp/x.csv'"] {
-            assert_eq!(copy_direction(sql), Some(CopyDirection::FromFile), "{sql:?}");
+            assert_eq!(
+                copy_direction(sql),
+                Some(CopyDirection::FromFile),
+                "{sql:?}"
+            );
         }
 
         assert_eq!(copy_direction("SELECT 1"), None);
@@ -1630,8 +1648,14 @@ mod copy_direction_tests {
     /// keyword is only read after the table name and any column list.
     #[test]
     fn a_table_name_is_not_a_direction() {
-        assert_eq!(copy_direction(r#"COPY "stdin" (a) FROM STDIN"#), Some(CopyDirection::FromStdin));
-        assert_eq!(copy_direction("COPY stdout FROM STDIN"), Some(CopyDirection::FromStdin));
+        assert_eq!(
+            copy_direction(r#"COPY "stdin" (a) FROM STDIN"#),
+            Some(CopyDirection::FromStdin)
+        );
+        assert_eq!(
+            copy_direction("COPY stdout FROM STDIN"),
+            Some(CopyDirection::FromStdin)
+        );
     }
 
     /// Both spellings of the binary request, because they come from different

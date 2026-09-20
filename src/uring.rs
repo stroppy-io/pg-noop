@@ -102,7 +102,7 @@ impl Slot {
 /// their own fallbacks inside `run`, and a ring that cannot be created is the
 /// only failure that is not worth retrying.
 pub fn probe() -> io::Result<()> {
-    IoUring::new(8).map(|ring| drop(ring))
+    IoUring::new(8).map(drop)
 }
 
 /// Run one shard's loop until the listener fails. Never returns in normal use.
@@ -147,9 +147,7 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
             .setup_coop_taskrun()
             .build(entries)
             .or_else(|e| {
-                eprintln!(
-                    "pgnoop: SINGLE_ISSUER/DEFER_TASKRUN unavailable ({e}); plain io_uring"
-                );
+                eprintln!("pgnoop: SINGLE_ISSUER/DEFER_TASKRUN unavailable ({e}); plain io_uring");
                 IoUring::new(entries)
             })?,
         (None, false) => IoUring::new(entries)?,
@@ -279,8 +277,7 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
                             // anything -- read only here, it could never be
                             // reached again, because no accept is in flight to
                             // complete.
-                            accept_paused_until =
-                                Some(std::time::Instant::now() + ACCEPT_BACKOFF);
+                            accept_paused_until = Some(std::time::Instant::now() + ACCEPT_BACKOFF);
                             eprintln!(
                                 "pgnoop: accept failed with errno {err}; \
                                  not re-arming accept for {}ms (other work continues)",
@@ -306,8 +303,7 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
                             );
                         }
 
-                        let admitted = startup_timeout
-                            .map(|t| std::time::Instant::now() + t);
+                        let admitted = startup_timeout.map(|t| std::time::Instant::now() + t);
 
                         let i = match free.pop() {
                             Some(i) => {
@@ -322,8 +318,7 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
                         submit_recv(&mut ring, &mut slots, i)?;
 
                         if let Some(at) = admitted {
-                            earliest_startup =
-                                Some(earliest_startup.map_or(at, |e| e.min(at)));
+                            earliest_startup = Some(earliest_startup.map_or(at, |e| e.min(at)));
                         }
                     }
                     // Only re-arm when the pause has expired. While it has

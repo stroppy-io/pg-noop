@@ -53,15 +53,12 @@ fn pin_to_cpu(cpu: usize) -> bool {
 fn resolve_bind_addr(host: &str, port: u16) -> std::io::Result<SocketAddr> {
     use std::net::ToSocketAddrs;
 
-    (host, port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("{host}:{port} resolved to no addresses"),
-            )
-        })
+    (host, port).to_socket_addrs()?.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{host}:{port} resolved to no addresses"),
+        )
+    })
 }
 
 /// Whether this platform can pin at all. Asked once, so a platform without
@@ -139,8 +136,7 @@ async fn serve(mut socket: TcpStream, catalog: CatalogView) {
     // The deadline is on the *connection*, not on each read: it is the startup
     // handshake that has to finish, and a client that dribbles its startup
     // packet out one byte at a time would otherwise extend it indefinitely.
-    let startup_deadline =
-        config::startup_timeout().map(|t| tokio::time::Instant::now() + t);
+    let startup_deadline = config::startup_timeout().map(|t| tokio::time::Instant::now() + t);
 
     loop {
         // A client that has not completed startup may legitimately have sent
@@ -150,16 +146,16 @@ async fn serve(mut socket: TcpStream, catalog: CatalogView) {
         // the unbounded one it always was.
         let n = if conn.awaiting_startup() {
             match startup_deadline {
-                Some(deadline) => match tokio::time::timeout_at(deadline, socket.read(&mut chunk)).await {
+                Some(deadline) => match tokio::time::timeout_at(deadline, socket.read(&mut chunk))
+                    .await
+                {
                     Ok(Ok(n)) if n > 0 => n,
                     // Timed out, closed, or failed: all three end the connection,
                     // and the caller has what it needs to tell them apart in the
                     // log line below.
                     Ok(Ok(_)) | Ok(Err(_)) => return,
                     Err(_elapsed) => {
-                        eprintln!(
-                            "pgnoop: connection did not complete startup in time; closing"
-                        );
+                        eprintln!("pgnoop: connection did not complete startup in time; closing");
                         return;
                     }
                 },
@@ -276,7 +272,10 @@ fn run_shard(id: usize, addr: SocketAddr, pin: bool, io: Io, catalog: CatalogVie
                     // ring path gets by recording a deadline instead of sleeping.
                     let err = e.raw_os_error().unwrap_or(0);
 
-                    if matches!(err, libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOBUFS) {
+                    if matches!(
+                        err,
+                        libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOBUFS
+                    ) {
                         eprintln!(
                             "pgnoop: shard {id} accept failed: {e}; \
                              not accepting for {}ms (open connections continue)",
@@ -322,11 +321,16 @@ fn main() {
     // Pinning only makes sense while shards fit on distinct CPUs -- and only
     // where the platform can pin at all; elsewhere this stays false and no shard
     // tries.
-    let pin = PINNING_SUPPORTED && shards <= std::thread::available_parallelism().map_or(1, |n| n.get());
+    let pin =
+        PINNING_SUPPORTED && shards <= std::thread::available_parallelism().map_or(1, |n| n.get());
 
     eprintln!(
         "pgnoop listening on {}:{} ({} shards, {}, SO_REUSEPORT, pinned={})",
-        config.host, config.port, shards, io.as_str(), pin
+        config.host,
+        config.port,
+        shards,
+        io.as_str(),
+        pin
     );
 
     // One handler, shared by every shard. This is NOT full share-nothing and the
@@ -404,7 +408,10 @@ mod tests {
     fn an_explicit_epoll_is_never_replaced_by_the_ring() {
         assert_eq!(io_to_serve(Io::Epoll, Ok(())), Io::Epoll);
         assert_eq!(
-            io_to_serve(Io::Epoll, Err(std::io::Error::from_raw_os_error(libc::EPERM))),
+            io_to_serve(
+                Io::Epoll,
+                Err(std::io::Error::from_raw_os_error(libc::EPERM))
+            ),
             Io::Epoll
         );
     }
@@ -469,6 +476,9 @@ mod tests {
 
         // Reported, not unwound. The message comes from the resolver, so what is
         // asserted is that there IS one and that it is not a panic.
-        assert!(!err.to_string().is_empty(), "the error must say something: {err}");
+        assert!(
+            !err.to_string().is_empty(),
+            "the error must say something: {err}"
+        );
     }
 }

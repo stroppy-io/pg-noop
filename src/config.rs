@@ -4,7 +4,10 @@ use clap::Parser;
 use serde::Deserialize;
 
 #[derive(Parser, Debug)]
-#[command(name = "pgnoop", about = "NoOp PostgreSQL blackhole server for benchmarking")]
+#[command(
+    name = "pgnoop",
+    about = "NoOp PostgreSQL blackhole server for benchmarking"
+)]
 struct CliArgs {
     /// Path to JSON config file
     #[arg(long, env = "PGNOOP_CONFIG", default_value = "./pgnoop.json")]
@@ -157,7 +160,10 @@ impl Config {
             .unwrap_or(4);
 
         Config {
-            host: cli.host.or(file.host).unwrap_or_else(|| "0.0.0.0".to_string()),
+            host: cli
+                .host
+                .or(file.host)
+                .unwrap_or_else(|| "0.0.0.0".to_string()),
             port: cli.port.or(file.port).unwrap_or(5432),
             workers: cli.workers.or(file.workers).unwrap_or(default_workers),
             io: cli
