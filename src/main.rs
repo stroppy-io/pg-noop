@@ -39,6 +39,31 @@ fn pin_to_cpu(cpu: usize) -> bool {
     }
 }
 
+/// Resolve `host:port` into a socket address to bind.
+///
+/// **Names, not just literals.** This parsed `SocketAddr` directly, which
+/// accepts `127.0.0.1:5432` and rejects `localhost:5432` -- a panic, not an
+/// error, because the parse was `.expect`ed. `TcpListener::bind` had resolved
+/// names all along, so the regression was introduced by resolving earlier and
+/// doing less. The README documents `--host` as a bind address; a name is a bind
+/// address.
+///
+/// The first resolved address is bound, which is what `bind` does too. A name
+/// that resolves to nothing is an error the caller reports, not a panic.
+fn resolve_bind_addr(host: &str, port: u16) -> std::io::Result<SocketAddr> {
+    use std::net::ToSocketAddrs;
+
+    (host, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{host}:{port} resolved to no addresses"),
+            )
+        })
+}
+
 /// Whether this platform can pin at all. Asked once, so a platform without
 /// pinning never prints a per-shard "could not pin" line for something it never
 /// attempted.
@@ -286,9 +311,13 @@ fn main() {
         config.workers
     };
 
-    let addr: SocketAddr = format!("{}:{}", config.host, config.port)
-        .parse()
-        .expect("host:port");
+    let addr = match resolve_bind_addr(&config.host, config.port) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("pgnoop: cannot bind {}:{}: {e}", config.host, config.port);
+            std::process::exit(2);
+        }
+    };
 
     // Pinning only makes sense while shards fit on distinct CPUs -- and only
     // where the platform can pin at all; elsewhere this stays false and no shard
@@ -393,5 +422,53 @@ mod tests {
                 assert_eq!(resolve_io(Io::Uring), Io::Epoll);
             }
         }
+    }
+
+    /// **A hostname is a bind address.** `--host localhost` used to panic with
+    /// `AddrParseError` because the address was parsed as a literal; `bind`
+    /// resolved names before, so this was a regression in name support rather
+    /// than a decision.
+    #[test]
+    fn a_hostname_resolves() {
+        let addr = resolve_bind_addr("localhost", 5432).expect("localhost resolves");
+
+        assert_eq!(addr.port(), 5432);
+        assert!(
+            addr.ip().is_loopback(),
+            "localhost must resolve to a loopback address, got {addr}"
+        );
+    }
+
+    /// A literal is still a literal, and IPv6 in brackets still works -- this is
+    /// the address form the release builds are tested with.
+    #[test]
+    fn a_literal_resolves_to_itself() {
+        assert_eq!(
+            resolve_bind_addr("127.0.0.1", 15432).unwrap(),
+            "127.0.0.1:15432".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            resolve_bind_addr("0.0.0.0", 5432).unwrap(),
+            "0.0.0.0:5432".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            resolve_bind_addr("::1", 5432).unwrap(),
+            "[::1]:5432".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    /// A name that does not resolve is an ERROR, not a panic: the caller prints
+    /// it and exits 2. This is the half of the old behaviour that was worse than
+    /// the missing feature.
+    #[test]
+    fn a_name_that_does_not_resolve_is_an_error() {
+        let err = match resolve_bind_addr("no-such-host.invalid", 5432) {
+            Ok(a) => panic!("an invalid host resolved to {a}"),
+            Err(e) => e,
+        };
+
+        // Reported, not unwound. The message comes from the resolver, so what is
+        // asserted is that there IS one and that it is not a panic.
+        assert!(!err.to_string().is_empty(), "the error must say something: {err}");
     }
 }
