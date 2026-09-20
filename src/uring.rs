@@ -42,6 +42,11 @@ const OP_ACCEPT: u64 = 0;
 const OP_RECV: u64 = 1;
 const OP_SEND: u64 = 2;
 
+/// How long a paused accept stays paused after `EMFILE`/`ENFILE`/`ENOMEM`/
+/// `ENOBUFS`. Long enough for a closed connection to release its fd, short
+/// enough that a transient shortage costs a fraction of a second.
+const ACCEPT_BACKOFF: std::time::Duration = crate::config::ACCEPT_BACKOFF;
+
 fn tag(idx: usize, op: u64) -> u64 {
     ((idx as u64) << 2) | op
 }
@@ -171,16 +176,49 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
     };
 
     // When accept may be re-armed again. `None` means now. Set on the errnos
-    // that do not clear by retrying, and read where accept is re-armed.
+    // that do not clear by retrying, cleared when the wait has expired.
     let mut accept_paused_until: Option<std::time::Instant> = None;
 
     push_accept(&mut ring)?;
     ring.submit()?;
 
     loop {
-        // One enter, however many completions are ready. This is the property
-        // epoll cannot give: a batch of ready connections is one syscall.
-        ring.submit_and_wait(1)?;
+        // **Wait for a completion, or for the accept deadline.**
+        //
+        // A paused accept is invisible to a completion: it is reached only by
+        // the code below, and `submit_and_wait` never returns to it -- so a
+        // 100 ms backoff became a shard that never accepted again, while every
+        // later connect sat in the backlog, including the one that would have
+        // made room. Bounding the wait is the whole mechanism: when the
+        // deadline passes, `io_uring_enter` returns ETIME and this loop keeps
+        // running.
+        //
+        // With no deadline pending -- the steady state, and every state but fd
+        // exhaustion -- this is the plain blocking wait it always was.
+        let expired = match accept_paused_until {
+            None => {
+                ring.submit_and_wait(1)?;
+
+                false
+            }
+            Some(at) => {
+                let wait = at.saturating_duration_since(std::time::Instant::now());
+                let ts = types::Timespec::new()
+                    .sec(wait.as_secs())
+                    .nsec(wait.subsec_nanos());
+
+                // ETIME is the deadline arriving, which is the point; anything
+                // else is the ring failing and belongs to the caller.
+                match ring
+                    .submitter()
+                    .submit_with_args(1, &types::SubmitArgs::new().timespec(&ts))
+                {
+                    Ok(_) => false,
+                    Err(e) if e.raw_os_error() == Some(libc::ETIME) => true,
+                    Err(e) => return Err(e),
+                }
+            }
+        };
 
         let mut completions: Vec<(u64, i32)> = Vec::new();
         {
@@ -218,14 +256,17 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
                             // running while new ones cannot be taken.
                             //
                             // So: record a deadline, skip re-arming accept until
-                            // it passes, and carry on with this batch.
-                            accept_paused_until = Some(
-                                std::time::Instant::now()
-                                    + std::time::Duration::from_millis(100),
-                            );
+                            // it passes, and carry on with this batch. The wait at
+                            // the top of the loop is what makes the deadline mean
+                            // anything -- read only here, it could never be
+                            // reached again, because no accept is in flight to
+                            // complete.
+                            accept_paused_until =
+                                Some(std::time::Instant::now() + ACCEPT_BACKOFF);
                             eprintln!(
                                 "pgnoop: accept failed with errno {err}; \
-                                 not re-arming accept for 100ms (other work continues)"
+                                 not re-arming accept for {}ms (other work continues)",
+                                ACCEPT_BACKOFF.as_millis()
                             );
                         } else if err == libc::EBADF || err == libc::EINVAL {
                             return Err(io::Error::from_raw_os_error(err));
@@ -349,6 +390,21 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
                 }
 
                 _ => {}
+            }
+        }
+
+        // **The paused accept, once the wait has come back.** Only reached when
+        // one was pending; otherwise `expired` is false and this is a branch on
+        // a bool.
+        if expired {
+            // Checked against the clock rather than assumed, because the wait
+            // can return for other reasons too and this must not re-arm accept
+            // early.
+            if let Some(t) = accept_paused_until {
+                if std::time::Instant::now() >= t {
+                    accept_paused_until = None;
+                    push_accept(&mut ring)?;
+                }
             }
         }
     }

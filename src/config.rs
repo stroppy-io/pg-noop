@@ -109,6 +109,14 @@ impl Io {
     }
 }
 
+/// How long a paused accept stays paused after `EMFILE`/`ENFILE`/`ENOMEM`/
+/// `ENOBUFS`. Long enough for a closed connection to release its fd, short
+/// enough that a transient shortage costs a fraction of a second.
+///
+/// Shared by both backends: "do not accept for 100 ms" has to mean the same
+/// thing whichever one is moving the bytes.
+pub const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
 impl Config {
     pub fn load() -> Self {
         let cli = CliArgs::parse();

@@ -202,6 +202,33 @@ fn run_shard(id: usize, addr: SocketAddr, pin: bool, io: Io, catalog: CatalogVie
                     });
                 }
                 Err(e) => {
+                    // **A transient fd shortage must not stop the shard.** This
+                    // used to return false, which ends the shard thread and, with
+                    // every shard hitting it, the process: a burst of connections
+                    // against a lowered fd limit turned into `no shard served` and
+                    // a refused port, while the connections already accepted were
+                    // dropped with it. `EMFILE`/`ENFILE`/`ENOMEM`/`ENOBUFS` are
+                    // the shortage to wait out; anything else is the listener
+                    // failing and belongs to the caller.
+                    //
+                    // `sleep` here does not block the shard the way it did in the
+                    // io_uring loop: this accepts from a task on a current-thread
+                    // runtime, so awaiting the timer parks the ACCEPT and lets the
+                    // connection tasks keep running. That is the same property the
+                    // ring path gets by recording a deadline instead of sleeping.
+                    let err = e.raw_os_error().unwrap_or(0);
+
+                    if matches!(err, libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOBUFS) {
+                        eprintln!(
+                            "pgnoop: shard {id} accept failed: {e}; \
+                             not accepting for {}ms (open connections continue)",
+                            config::ACCEPT_BACKOFF.as_millis()
+                        );
+                        tokio::time::sleep(config::ACCEPT_BACKOFF).await;
+
+                        continue;
+                    }
+
                     eprintln!("pgnoop: shard {id} accept failed: {e}");
                     return false;
                 }
