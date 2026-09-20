@@ -78,6 +78,24 @@ impl Slot {
     }
 }
 
+/// Can this process create an io_uring ring at all?
+///
+/// Asked once, before any shard starts, because the answer is a property of the
+/// process's environment and not of a shard: the ring is created by the
+/// `io_uring_setup` syscall, and under Docker's default seccomp profile that
+/// syscall returns `EPERM`. Without this probe each shard discovers the same
+/// fact independently, fails, and the process reports `no shard served` -- a
+/// container denies the ring and the server has no other way to move bytes.
+///
+/// The probe builds a ring and drops it. It is the smallest thing that can
+/// fail for the same reason the real setup would, and it does not carry the
+/// per-shard tuning (`SINGLE_ISSUER`, `DEFER_TASKRUN`, SQPOLL): those have
+/// their own fallbacks inside `run`, and a ring that cannot be created is the
+/// only failure that is not worth retrying.
+pub fn probe() -> io::Result<()> {
+    IoUring::new(8).map(|ring| drop(ring))
+}
+
 /// Run one shard's loop until the listener fails. Never returns in normal use.
 pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Result<()> {
     // SQPOLL: a kernel thread drains the submission queue, so a submit becomes a

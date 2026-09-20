@@ -44,6 +44,41 @@ fn pin_to_cpu(cpu: usize) -> bool {
 /// attempted.
 const PINNING_SUPPORTED: bool = cfg!(target_os = "linux");
 
+/// The backend to actually serve with, decided once before any shard starts.
+///
+/// A backend being *available* is not the same as it being *usable*: under
+/// Docker's default seccomp profile `io_uring_setup` returns `EPERM`, so every
+/// shard fails to build its ring, every shard returns false, and the process
+/// exits nonzero having served nothing -- with a bind that succeeded and a port
+/// that looks free to the client. Falling back to epoll turns that into a
+/// slower server instead of no server.
+///
+/// Only the ring is probed. epoll is a plain syscall every platform carries,
+/// and if it cannot be had the failure belongs to whoever supervises the
+/// process, not to a silent substitution.
+#[cfg(target_os = "linux")]
+fn resolve_io(requested: Io) -> Io {
+    io_to_serve(requested, crate::uring::probe())
+}
+
+/// The decision itself, separate from the probe so both branches are testable
+/// on a box where the ring works and one where it does not.
+#[cfg(target_os = "linux")]
+fn io_to_serve(requested: Io, probe: std::io::Result<()>) -> Io {
+    match (requested, probe) {
+        (Io::Uring, Ok(())) => Io::Uring,
+        (Io::Uring, Err(e)) => {
+            eprintln!(
+                "pgnoop: io_uring unavailable ({e}); serving with epoll. \
+                 Under Docker this is the default seccomp profile denying \
+                 io_uring_setup; --io epoll makes the choice explicit."
+            );
+            Io::Epoll
+        }
+        (Io::Epoll, _) => Io::Epoll,
+    }
+}
+
 /// One listener per shard on the SAME port, via SO_REUSEPORT.
 ///
 /// This is the half that makes share-nothing possible. With a single shared
@@ -178,6 +213,13 @@ fn run_shard(id: usize, addr: SocketAddr, pin: bool, io: Io, catalog: CatalogVie
 fn main() {
     let config = Config::load();
 
+    // Before any shard exists: the ring is either usable in this process or it
+    // is not, and the answer does not change per shard.
+    #[cfg(target_os = "linux")]
+    let io = resolve_io(config.io);
+    #[cfg(not(target_os = "linux"))]
+    let io = config.io;
+
     let shards = if config.workers == 0 {
         std::thread::available_parallelism().map_or(1, |n| n.get())
     } else {
@@ -195,7 +237,7 @@ fn main() {
 
     eprintln!(
         "pgnoop listening on {}:{} ({} shards, {}, SO_REUSEPORT, pinned={})",
-        config.host, config.port, shards, config.io.as_str(), pin
+        config.host, config.port, shards, io.as_str(), pin
     );
 
     // One handler, shared by every shard. This is NOT full share-nothing and the
@@ -206,7 +248,6 @@ fn main() {
     // remains shared per query is the Arc refcount, not the catalog.
     let catalog = CatalogView(Arc::new(NoopHandler::new()));
 
-    let io = config.io;
     let mut threads = Vec::with_capacity(shards);
     for id in 0..shards {
         let catalog = catalog.clone();
@@ -231,5 +272,66 @@ fn main() {
     if served == 0 {
         eprintln!("pgnoop: no shard served; exiting nonzero");
         std::process::exit(1);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// The reason this function exists: a container that denies the ring must
+    /// still get a server. `EPERM` is what Docker's default seccomp profile
+    /// returns from `io_uring_setup`, and it is the case Cianidos reproduced.
+    #[test]
+    fn a_denied_ring_falls_back_to_epoll() {
+        let eperm = std::io::Error::from_raw_os_error(libc::EPERM);
+
+        assert_eq!(io_to_serve(Io::Uring, Err(eperm)), Io::Epoll);
+    }
+
+    /// Any ring failure falls back, not only the one that was reported. A
+    /// kernel without io_uring answers `ENOSYS`, and an older one answers
+    /// `EINVAL` on the flags this server sets; both mean "no ring here".
+    #[test]
+    fn other_ring_failures_fall_back_too() {
+        for errno in [libc::ENOSYS, libc::EINVAL, libc::EACCES] {
+            let e = std::io::Error::from_raw_os_error(errno);
+
+            assert_eq!(io_to_serve(Io::Uring, Err(e)), Io::Epoll, "errno {errno}");
+        }
+    }
+
+    /// A working ring is kept, which is the path this box takes -- and the one
+    /// the measurements in the README were taken on.
+    #[test]
+    fn a_working_ring_is_kept() {
+        assert_eq!(io_to_serve(Io::Uring, Ok(())), Io::Uring);
+    }
+
+    /// Asking for epoll is never overridden by what the probe found. The
+    /// operator may want epoll precisely because it is the fallback they are
+    /// about to measure against the ring.
+    #[test]
+    fn an_explicit_epoll_is_never_replaced_by_the_ring() {
+        assert_eq!(io_to_serve(Io::Epoll, Ok(())), Io::Epoll);
+        assert_eq!(
+            io_to_serve(Io::Epoll, Err(std::io::Error::from_raw_os_error(libc::EPERM))),
+            Io::Epoll
+        );
+    }
+
+    /// The probe's verdict on this box, recorded so the fallback path is not
+    /// mistaken for dead code: on a host with io_uring it is `Ok`, and the CI
+    /// container that denies it is the case the tests above pin down.
+    #[test]
+    fn probe_reports_what_this_box_can_do() {
+        match crate::uring::probe() {
+            Ok(()) => assert_eq!(resolve_io(Io::Uring), Io::Uring),
+            Err(e) => {
+                eprintln!("this box cannot create a ring: {e}");
+
+                assert_eq!(resolve_io(Io::Uring), Io::Epoll);
+            }
+        }
     }
 }
