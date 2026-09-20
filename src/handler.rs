@@ -251,6 +251,9 @@ fn count_select_columns(sql: &str) -> usize {
         match bytes[i] {
             b'(' => depth += 1,
             b')' => depth = depth.saturating_sub(1),
+            // Case-insensitive in place: this branch removed the uppercase
+            // copy of the whole statement, so the keyword has to be matched
+            // here rather than in an uppercased buffer.
             b' ' if depth == 0
                 && body.as_bytes()[i..].len() >= 6
                 && body.as_bytes()[i..i + 6].eq_ignore_ascii_case(b" FROM ") =>
