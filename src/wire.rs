@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 
-use crate::handler::{CatalogView, PlanKind, PreparedPlan, count_copy_columns};
+use crate::handler::{CatalogView, CopyDirection, PlanKind, PreparedPlan};
 
 /// Frontend messages the blackhole understands. Anything else is consumed and
 /// answered as though it succeeded, which is the whole contract.
@@ -68,7 +68,12 @@ enum Phase {
     /// The row count travels because `CommandComplete` must report it: PostgreSQL
     /// answers `COPY n`, and a client that loads 10000 rows and is told `COPY 0`
     /// has been lied to in a way it can see.
-    CopyIn { rows: u64 },
+    ///
+    /// `binary` travels because the count depends on it. In text format a row
+    /// ends at a newline, so newlines are the rows; in binary format there are no
+    /// newlines at all -- `pgx.CopyFrom` encodes field lengths and payload bytes,
+    /// and `0x0a` appears wherever a value happens to contain it.
+    CopyIn { rows: u64, binary: bool },
     Closed,
 }
 
@@ -79,6 +84,15 @@ pub struct Conn {
     statements: HashMap<String, PreparedPlan>,
     /// Portal name -> statement name.
     portals: HashMap<String, String>,
+    /// Bytes of a binary COPY stream that did not yet form a whole tuple.
+    ///
+    /// A `CopyData` message is a slice of the stream, not a row: pgx fills a
+    /// 64 KiB buffer and sends whatever fits, so a tuple can straddle two
+    /// messages and a message can end mid-field. Counting therefore has to carry
+    /// state, which is what this is.
+    copy_carry: Vec<u8>,
+    /// Whether the 19-byte binary COPY header has been consumed.
+    copy_header_seen: bool,
 }
 
 impl Default for Conn {
@@ -93,6 +107,8 @@ impl Conn {
             phase: Phase::Startup,
             statements: HashMap::new(),
             portals: HashMap::new(),
+            copy_carry: Vec::new(),
+            copy_header_seen: false,
         }
     }
 
@@ -108,6 +124,126 @@ impl Conn {
     /// Callers use this to bound how long that state may last.
     pub fn awaiting_startup(&self) -> bool {
         self.phase == Phase::Startup
+    }
+
+    /// Answer a `COPY ... FROM STDIN` and wait for rows.
+    fn enter_copy_in(&mut self, columns: usize, binary: bool, out: &mut Vec<u8>) {
+        copy_in_response(out, columns, binary);
+        self.copy_carry.clear();
+        self.copy_header_seen = false;
+        self.phase = Phase::CopyIn { rows: 0, binary };
+    }
+
+    /// Back to ordinary statements, with the framing state dropped.
+    fn leave_copy_in(&mut self) {
+        self.copy_carry.clear();
+        self.copy_header_seen = false;
+        self.phase = Phase::Query;
+    }
+
+    /// Count complete tuples in a binary COPY stream, carrying the tail.
+    ///
+    /// The framing is PostgreSQL's: an 11-byte signature, two int32s, then per
+    /// tuple an int16 field count followed by each field's int32 length (-1 for
+    /// NULL) and its bytes, ending with an int16 -1 trailer. A field's length is
+    /// what makes this countable at all -- newline bytes inside a payload are
+    /// just bytes, which is exactly why counting them reported 2 for a 3-row
+    /// load.
+    fn count_binary_copy_rows(&mut self, body: &[u8]) {
+        /// The signature, its flags and the header-extension length.
+        const HEADER: usize = 19;
+
+        /// How much unparsed stream to hold before calling it a violation. A
+        /// whole tuple has to fit for any progress to be possible; past this the
+        /// client is not sending tuples and the buffer would grow without bound.
+        const MAX_CARRY: usize = 1 << 20;
+
+        self.copy_carry.extend_from_slice(body);
+
+        let mut buf = std::mem::take(&mut self.copy_carry);
+        let n = buf.len();
+        let mut pos = 0usize;
+        let mut rows = 0u64;
+
+        if !self.copy_header_seen {
+            if n < HEADER {
+                self.copy_carry = buf;
+
+                return;
+            }
+
+            pos = HEADER;
+            self.copy_header_seen = true;
+        }
+
+        loop {
+            if n - pos < 2 {
+                break;
+            }
+
+            let fields = i16::from_be_bytes([buf[pos], buf[pos + 1]]);
+
+            // The trailer: an int16 -1 ends the stream. Not a row.
+            if fields < 0 {
+                pos += 2;
+
+                break;
+            }
+
+            let mut p = pos + 2;
+            let mut whole = true;
+
+            for _ in 0..fields {
+                if n - p < 4 {
+                    whole = false;
+
+                    break;
+                }
+
+                let len = i32::from_be_bytes([buf[p], buf[p + 1], buf[p + 2], buf[p + 3]]);
+
+                p += 4;
+
+                // -1 is NULL: a length with no bytes after it.
+                if len >= 0 {
+                    if (n - p) < len as usize {
+                        whole = false;
+
+                        break;
+                    }
+
+                    p += len as usize;
+                }
+            }
+
+            if !whole {
+                break;
+            }
+
+            pos = p;
+            rows += 1;
+        }
+
+        if let Phase::CopyIn { rows: counted, .. } = &mut self.phase {
+            *counted += rows;
+        }
+
+        if pos < n {
+            buf.drain(..pos);
+
+            if buf.len() > MAX_CARRY {
+                // A client that has sent a megabyte without completing a tuple
+                // is not sending tuples. Answering an error and closing is the
+                // only ending that does not end in the shard's own allocation.
+                self.phase = Phase::Closed;
+                buf.clear();
+            }
+
+            self.copy_carry = buf;
+        } else {
+            buf.clear();
+            self.copy_carry = buf;
+        }
     }
 
     /// Consume every COMPLETE message in `input`, appending replies to `out`.
@@ -277,25 +413,57 @@ impl Conn {
                 let sql = cstr_read(body).unwrap_or("");
                 let plan = PreparedPlan::build(sql);
 
-                // **COPY ... FROM STDIN is a conversation, not an answer.**
+                // **COPY is decided by its direction, once, in the plan.**
                 //
-                // The client sends the statement and then WAITS for
-                // `CopyInResponse` before streaming rows. This path used to fall
-                // into `PlanKind::FromText` and reply `CommandComplete("SELECT
-                // 0")` -- so the client believed the statement had finished and
-                // then wrote `CopyData` into a connection that had moved on. The
+                // `COPY ... FROM STDIN` is a conversation, not an answer: the
+                // client sends the statement and then WAITS for `CopyInResponse`
+                // before streaming rows. This path used to fall into
+                // `PlanKind::FromText` and reply `CommandComplete("SELECT 0")` --
+                // so the client believed the statement had finished and then
+                // wrote `CopyData` into a connection that had moved on. The
                 // stream desynchronises and every later reply is read against the
                 // wrong message.
                 //
-                // The pgwire handler this codec replaced DID implement it
-                // (`handler.rs`, `Response::CopyIn` / `on_copy_data` /
-                // `on_copy_done`), so this was a regression introduced by the
-                // rewrite rather than a gap that was always there. Found in
-                // review.
-                if copy_from_stdin(&plan) {
-                    let cols = count_copy_columns(&plan.sql);
-                    copy_in_response(out, cols);
-                    self.phase = Phase::CopyIn { rows: 0 };
+                // `COPY ... TO STDOUT` and `COPY ... FROM '/path'` do not talk
+                // back, but they are COPY statements and the tag a client checks
+                // is `COPY n`. `SELECT 0` for a COPY is a reply no client can
+                // accept: pgx's `CopyTo` reads the tag and reports it, and
+                // stroppy's load path counts rows from `CopyFrom`'s.
+                //
+                // The pgwire handler this codec replaced implemented the
+                // FROM STDIN half (`handler.rs`, `Response::CopyIn` /
+                // `on_copy_data` / `on_copy_done`), so that was a regression
+                // introduced by the rewrite rather than a gap that was always
+                // there. Found in review.
+                if let PlanKind::Copy {
+                    direction,
+                    columns,
+                    binary,
+                } = plan.kind
+                {
+                    match direction {
+                        CopyDirection::FromStdin => {
+                            self.enter_copy_in(columns, binary, out);
+
+                            return Some(());
+                        }
+                        CopyDirection::ToStdout => {
+                            // The server would stream rows here. A blackhole has
+                            // none, so it says so in the protocol's own words:
+                            // `CopyOutResponse`, then `CopyDone` with no DataRow
+                            // in between, then `COPY 0`.
+                            copy_out_response(out);
+                            copy_done(out);
+                            complete(out, "COPY", Some(0));
+                        }
+                        CopyDirection::FromFile => {
+                            // No conversation: the server reads a path. It read
+                            // nothing, so it copied nothing.
+                            complete(out, "COPY", Some(0));
+                        }
+                    }
+
+                    ready(out);
 
                     return Some(());
                 }
@@ -306,21 +474,31 @@ impl Conn {
 
             // In flight: count rows, and end on done or fail.
             tag::COPY_DATA if matches!(self.phase, Phase::CopyIn { .. }) => {
-                if let Phase::CopyIn { rows } = &mut self.phase {
+                let binary = matches!(self.phase, Phase::CopyIn { binary: true, .. });
+
+                if binary {
+                    self.count_binary_copy_rows(body);
+
+                    if self.is_closed() {
+                        return Some(());
+                    }
+                } else if let Phase::CopyIn { rows, .. } = &mut self.phase {
                     // One CopyData message is one or more rows of text, newline
                     // separated. Counting newlines is what PostgreSQL reports and
-                    // is right even when a driver batches many rows per message —
-                    // counting MESSAGES would report the driver's batching.
+                    // is right even when a driver batches many rows per message
+                    // and even when a row straddles two: every newline the client
+                    // sends is counted exactly once, in whichever message carried
+                    // it.
                     *rows += body.iter().filter(|&&b| b == b'\n').count() as u64;
                 }
             }
 
             tag::COPY_DONE if matches!(self.phase, Phase::CopyIn { .. }) => {
-                let rows = match self.phase {
-                    Phase::CopyIn { rows } => rows,
+                let rows = match &self.phase {
+                    Phase::CopyIn { rows, .. } => *rows,
                     _ => 0,
                 };
-                self.phase = Phase::Query;
+                self.leave_copy_in();
                 complete_raw(out, &format!("COPY {rows}"));
                 ready(out);
             }
@@ -329,7 +507,7 @@ impl Conn {
                 // The client is abandoning its own COPY. That is an error by the
                 // protocol's own definition, and answering it as success would
                 // tell a loader its data landed.
-                self.phase = Phase::Query;
+                self.leave_copy_in();
                 error_response(out, "57014", "COPY from stdin failed");
                 ready(out);
             }
@@ -399,7 +577,29 @@ impl Conn {
                     .and_then(|s| self.statements.get(s))
                 {
                     // Execute does NOT re-send RowDescription; Describe did.
-                    Some(p) => answer(p, out, catalog, false),
+                    Some(p) => {
+                        // A COPY that streams from the client needs the
+                        // connection to change phase, which is not something a
+                        // free function writing into `out` can do. Read what it
+                        // is first, answer, then enter the phase.
+                        let streams_rows = match &p.kind {
+                            PlanKind::Copy {
+                                direction: CopyDirection::FromStdin,
+                                columns,
+                                binary,
+                            } => Some((*columns, *binary)),
+                            _ => None,
+                        };
+
+                        answer(p, out, catalog, false);
+
+                        if let Some((columns, binary)) = streams_rows {
+                            let _ = columns;
+                            self.phase = Phase::CopyIn { rows: 0, binary };
+                            self.copy_carry.clear();
+                            self.copy_header_seen = false;
+                        }
+                    }
                     None => complete(out, "SELECT", Some(0)),
                 }
             }
@@ -470,6 +670,22 @@ fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, describ
             catalog.apply(&plan.sql);
             complete_raw(out, ddl_tag(&plan.sql));
         }
+        // Reached by the extended protocol's Execute. The caller sets
+        // `Phase::CopyIn` for the FROM STDIN half, because the phase belongs to
+        // the connection and not to the reply.
+        PlanKind::Copy {
+            direction,
+            columns,
+            binary,
+        } => match direction {
+            CopyDirection::FromStdin => copy_in_response(out, *columns, *binary),
+            CopyDirection::ToStdout => {
+                copy_out_response(out);
+                copy_done(out);
+                complete(out, "COPY", Some(0));
+            }
+            CopyDirection::FromFile => complete(out, "COPY", Some(0)),
+        },
         PlanKind::FromText => complete(out, "SELECT", Some(0)),
     }
 }
@@ -523,32 +739,40 @@ fn cstr(out: &mut Vec<u8>, s: &str) {
     out.push(0);
 }
 
-/// A minimal ErrorResponse: severity, SQLSTATE, message, terminator.
-/// `COPY ... FROM STDIN`, the only COPY shape that streams from the client.
+/// `COPY ... FROM STDIN` puts the connection into a conversation: the client
+/// sends `CopyData` and ends it with `CopyDone` or `CopyFail`.
 ///
-/// `COPY ... TO STDOUT` sends rows the other way and a blackhole has none, so it
-/// keeps answering as it did. `COPY ... FROM '/file'` is the server reading a
-/// path and involves no protocol conversation at all.
-fn copy_from_stdin(plan: &PreparedPlan) -> bool {
-    let u = plan.sql.trim_start();
-    if !u.get(..4).is_some_and(|h| h.eq_ignore_ascii_case("COPY")) {
-        return false;
-    }
-    let upper = u.to_ascii_uppercase();
-    upper.contains(" FROM STDIN") || upper.contains(" FROM  STDIN")
-}
+/// `CopyInResponse`: the overall format, then one format code per column.
+fn copy_in_response(out: &mut Vec<u8>, columns: usize, binary: bool) {
+    // PostgreSQL's format codes: 0 text, 1 binary.
+    let code: i16 = i16::from(binary);
 
-/// `CopyInResponse`: text format, one format code per column.
-fn copy_in_response(out: &mut Vec<u8>, cols: usize) {
     msg(out, b'G', |b| {
-        b.push(0); // overall format: text
-        b.extend_from_slice(&(cols as i16).to_be_bytes());
-        for _ in 0..cols {
-            b.extend_from_slice(&0i16.to_be_bytes()); // per-column: text
+        b.push(if binary { 1 } else { 0 }); // overall format
+        b.extend_from_slice(&(columns as i16).to_be_bytes());
+        for _ in 0..columns {
+            b.extend_from_slice(&code.to_be_bytes());
         }
     });
 }
 
+/// `CopyOutResponse` for `COPY ... TO STDOUT`.
+///
+/// Text format, zero columns: an empty stream has none, and a driver that reads
+/// rows until `CopyDone` does not need a header per column to read none of them.
+fn copy_out_response(out: &mut Vec<u8>) {
+    msg(out, b'H', |b| {
+        b.push(0); // overall format: text
+        b.extend_from_slice(&0i16.to_be_bytes()); // no columns
+    });
+}
+
+/// `CopyDone` as the SERVER sends it: the stream it is writing is over.
+fn copy_done(out: &mut Vec<u8>) {
+    msg(out, b'c', |_| {});
+}
+
+/// A minimal ErrorResponse: severity, SQLSTATE, message, terminator.
 fn error_response(out: &mut Vec<u8>, code: &str, message: &str) {
     msg(out, b'E', |b| {
         b.push(b'S');
@@ -945,8 +1169,14 @@ mod tests {
         assert!(!c.is_closed(), "and the connection survives it");
     }
 
-    /// COPY TO STDOUT and COPY FROM a file are not conversations, so they keep
-    /// answering as before. A guard that fired on every COPY would break them.
+    /// COPY TO STDOUT and COPY FROM a file are not conversations, so they must
+    /// not enter the copy phase -- but they are COPY statements, and the tag a
+    /// client checks is `COPY n`.
+    ///
+    /// This test used to assert only "not CopyInResponse" and "answered and
+    /// ready", which a `SELECT 0` satisfied: it accepted the wrong answer for
+    /// `COPY t TO STDOUT` because it never looked at what came back. pgx's
+    /// `CopyTo` reads the tag, and stroppy's load path reads the row count.
     #[test]
     fn only_copy_from_stdin_enters_the_copy_phase() {
         for sql in ["COPY t TO STDOUT", "COPY t FROM '/tmp/x.csv'", "SELECT 1"] {
@@ -956,6 +1186,217 @@ mod tests {
             assert_ne!(out[0], b'G', "{sql} must not get CopyInResponse");
             assert!(out.ends_with(&[b'I']), "{sql} must be answered and ready");
         }
+    }
+
+    /// `COPY t TO STDOUT` is a `CopyOutResponse`, an empty stream and `COPY 0`.
+    /// It used to fall through to `CommandComplete("SELECT 0")`.
+    #[test]
+    fn copy_to_stdout_answers_copy_out_and_a_copy_tag() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+
+        c.advance(&tagged(b'Q', |b| cstr(b, "COPY warehouse TO STDOUT")), &mut out, &v);
+
+        assert_eq!(out[0], b'H', "CopyOutResponse");
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("COPY 0"), "the tag must be COPY 0: {text}");
+        assert!(!text.contains("SELECT"), "not a SELECT: {text}");
+        // CopyOutResponse is `H` + length + (format, columns) = 8 bytes, then the
+        // server's own CopyDone, then the tag, then ReadyForQuery.
+        assert_eq!(out[8], b'c', "CopyDone before the tag");
+        assert!(out.ends_with(&[b'I']), "and ready");
+    }
+
+    /// A file the server reads is the same non-conversation, and the same tag.
+    #[test]
+    fn copy_from_a_file_answers_a_copy_tag() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+
+        c.advance(
+            &tagged(b'Q', |b| cstr(b, "COPY warehouse FROM '/tmp/x.csv'")),
+            &mut out,
+            &v,
+        );
+
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("COPY 0"), "the tag must be COPY 0: {text}");
+    }
+
+    /// **The reviewer's case.** SQL whitespace is not one space: three spaces, a
+    /// tab and a newline are all the same statement, and all three have to be
+    /// recognised as the conversation FROM STDIN is.
+    ///
+    /// `COPY t FROM    STDIN` used to answer `SELECT 0` (the two-spelling match
+    /// missed it by one space), after which the client's `CopyData` arrived
+    /// outside a COPY and every later reply was read against the wrong message.
+    #[test]
+    fn copy_from_stdin_survives_any_whitespace() {
+        for sql in [
+            "COPY t FROM STDIN",
+            "COPY t FROM  STDIN",
+            "COPY t FROM    STDIN",
+            "COPY t FROM\tSTDIN",
+            "COPY t FROM\nSTDIN",
+            "COPY t (a, b) FROM    STDIN",
+            "  COPY t FROM\t STDIN  ",
+        ] {
+            let (mut c, v) = connected();
+            let mut out = Vec::new();
+            c.advance(&tagged(b'Q', |b| cstr(b, sql)), &mut out, &v);
+
+            assert_eq!(out[0], b'G', "{sql:?} must get CopyInResponse");
+
+            // And the conversation completes rather than desynchronising.
+            out.clear();
+            c.advance(&tagged(b'd', |b| b.extend_from_slice(b"1\n")), &mut out, &v);
+            c.advance(&tagged(b'c', |_| {}), &mut out, &v);
+            let text = String::from_utf8_lossy(&out);
+            assert!(text.contains("COPY 1"), "{sql:?} must count its row: {text}");
+        }
+    }
+
+    /// The column count announced to the client has to match the client's own
+    /// column list, whatever whitespace separates them.
+    #[test]
+    fn copy_in_announces_the_column_count_under_any_whitespace() {
+        for (sql, want) in [
+            ("COPY t (a, b) FROM STDIN", 2),
+            ("COPY t (a,b,c) FROM\tSTDIN", 3),
+            ("\n\tCOPY t ( a , b ) FROM    STDIN", 2),
+            ("COPY t FROM STDIN", 1),
+        ] {
+            let (mut c, v) = connected();
+            let mut out = Vec::new();
+            c.advance(&tagged(b'Q', |b| cstr(b, sql)), &mut out, &v);
+
+            assert_eq!(out[0], b'G', "{sql:?}");
+            assert_eq!(
+                i16::from_be_bytes([out[6], out[7]]),
+                want,
+                "{sql:?} announced the wrong column count"
+            );
+        }
+    }
+
+    /// **Binary COPY counts tuples, not newlines.**
+    ///
+    /// pgx's `CopyFrom` sends PostgreSQL's binary framing, where `0x0a` is just
+    /// a byte in a payload. Counting newline bytes reported `COPY 2` for three
+    /// rows -- which stroppy then reported as `confirmed_rows=2` of 3 -- and the
+    /// count is the only thing a loader can check.
+    #[test]
+    fn binary_copy_counts_tuples() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+
+        // A schema, so the columns are real and the format is the client's.
+        c.advance(
+            &tagged(b'Q', |b| cstr(b, "CREATE TABLE t (a int8, b text)")),
+            &mut out,
+            &v,
+        );
+        out.clear();
+
+        // pgx spells it exactly like this.
+        c.advance(
+            &tagged(b'Q', |b| cstr(b, "copy t ( a, b ) from stdin binary;")),
+            &mut out,
+            &v,
+        );
+        assert_eq!(out[0], b'G', "CopyInResponse");
+        assert_eq!(out[5], 1, "binary overall format");
+        assert_eq!(i16::from_be_bytes([out[6], out[7]]), 2, "two columns");
+        assert_eq!(i16::from_be_bytes([out[8], out[9]]), 1, "binary, per column");
+        out.clear();
+
+        // Header, then three tuples. The second field of the first row contains
+        // a newline byte, and the third row is split across two messages.
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+        stream.extend_from_slice(&0i32.to_be_bytes()); // flags
+        stream.extend_from_slice(&0i32.to_be_bytes()); // header extension
+
+        for (n, text) in [(1i64, "one\nwith newline"), (2, "two"), (3, "three")] {
+            stream.extend_from_slice(&2i16.to_be_bytes()); // two fields
+            stream.extend_from_slice(&8i32.to_be_bytes());
+            stream.extend_from_slice(&n.to_be_bytes());
+            stream.extend_from_slice(&(text.len() as i32).to_be_bytes());
+            stream.extend_from_slice(text.as_bytes());
+        }
+
+        stream.extend_from_slice(&(-1i16).to_be_bytes()); // trailer
+
+        // Split it mid-tuple on purpose: a CopyData message is a slice of the
+        // stream, not a row.
+        let split = stream.len() - 12;
+
+        c.advance(&tagged(b'd', |b| b.extend_from_slice(&stream[..split])), &mut out, &v);
+        assert!(out.is_empty(), "CopyData is absorbed silently");
+        c.advance(&tagged(b'd', |b| b.extend_from_slice(&stream[split..])), &mut out, &v);
+
+        c.advance(&tagged(b'c', |_| {}), &mut out, &v);
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("COPY 3"), "three tuples: {text}");
+    }
+
+    /// A NULL field is a length of -1 with no bytes after it, and it must not
+    /// throw the frame walk off by four.
+    #[test]
+    fn binary_copy_counts_nulls_and_knows_when_the_stream_is_over() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+
+        c.advance(&tagged(b'Q', |b| cstr(b, "COPY t FROM STDIN BINARY")), &mut out, &v);
+        out.clear();
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+        stream.extend_from_slice(&0i32.to_be_bytes());
+        stream.extend_from_slice(&0i32.to_be_bytes());
+
+        // One row of two NULLs, then the trailer -- which is not a row.
+        stream.extend_from_slice(&2i16.to_be_bytes());
+        stream.extend_from_slice(&(-1i32).to_be_bytes());
+        stream.extend_from_slice(&(-1i32).to_be_bytes());
+        stream.extend_from_slice(&(-1i16).to_be_bytes());
+
+        c.advance(&tagged(b'd', |b| b.extend_from_slice(&stream)), &mut out, &v);
+        c.advance(&tagged(b'c', |_| {}), &mut out, &v);
+
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("COPY 1"), "one row, trailer not counted: {text}");
+    }
+
+    /// A client that never completes a tuple must not grow the carry buffer
+    /// without bound. A megabyte of unterminated stream is a violation, and the
+    /// connection is closed rather than held.
+    #[test]
+    fn binary_copy_closes_a_client_that_never_completes_a_tuple() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+
+        c.advance(&tagged(b'Q', |b| cstr(b, "COPY t FROM STDIN BINARY")), &mut out, &v);
+
+        // A field header promising far more bytes than will ever arrive, sent
+        // until the carry exceeds its ceiling.
+        let mut stuck = Vec::new();
+        stuck.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+        stuck.extend_from_slice(&0i32.to_be_bytes());
+        stuck.extend_from_slice(&0i32.to_be_bytes());
+        stuck.extend_from_slice(&1i16.to_be_bytes());
+        stuck.extend_from_slice(&(1i32 << 30).to_be_bytes());
+
+        // 1 MiB / 25 bytes per message, and a little past it.
+        for _ in 0..50_000 {
+            c.advance(&tagged(b'd', |b| b.extend_from_slice(&stuck)), &mut out, &v);
+
+            if c.is_closed() {
+                break;
+            }
+        }
+
+        assert!(c.is_closed(), "an unterminated tuple must not be held forever");
     }
 
     /// The same stall, one packet earlier: the STARTUP length is client-controlled

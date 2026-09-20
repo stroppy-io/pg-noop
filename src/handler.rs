@@ -279,48 +279,249 @@ fn count_select_columns(sql: &str) -> usize {
     cols
 }
 
-/// Counts columns in `COPY table (col1, col2) FROM STDIN` by finding the
-/// paren-group between the table name and FROM.
-pub(crate) fn count_copy_columns(sql: &str) -> usize {
-    // **One string, indexed and sliced.**
-    //
-    // This used to `find` in `sql.trim().to_ascii_uppercase()` and slice `sql`,
-    // so a byte offset from the trimmed string cut the untrimmed one short by
-    // exactly the leading whitespace: ` COPY t (a,b) FROM STDIN` lost its `)`,
-    // `rfind('(')` still matched, the closing paren did not, and the answer was
-    // 1. `CopyInResponse` then announced one format code for a two-column copy.
-    //
-    // Latent while only the pgwire path called this; reachable the moment
-    // `wire.rs` did. Uppercasing can also change byte length (ß, ﬁ), so deriving
-    // an index from one string and applying it to another is wrong twice over,
-    // not only under whitespace.
-    let sql = sql.trim();
-    let upper = sql.to_ascii_uppercase();
-    // Take the part before " FROM "
-    let before_from = match upper.find(" FROM ") {
-        Some(i) => &upper[..i],
-        None => return 1,
-    };
-    // Find the last '(' — that's the column list
-    let open = match before_from.rfind('(') {
-        Some(i) => i,
-        None => return 1, // no explicit column list
-    };
-    let after_open = &before_from[open + 1..];
-    let close = match after_open.find(')') {
-        Some(i) => i,
-        None => return 1,
-    };
-    let cols_str = after_open[..close].trim();
-    if cols_str.is_empty() {
-        return 1;
-    }
-    cols_str.bytes().filter(|&b| b == b',').count() + 1
+/// Which way a COPY moves rows, decided from the statement text.
+///
+/// One matcher, used by every caller that needs to know. The alternative was
+/// what the code did: `wire.rs` matched one or two spaces and `handler.rs`
+/// matched exactly one, so `COPY t FROM  STDIN` was two different statements
+/// depending on which path asked -- a conversation on one and a finished
+/// statement on the other, which desynchronises the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyDirection {
+    /// `COPY ... FROM STDIN`: the client streams rows next. A conversation.
+    FromStdin,
+    /// `COPY ... TO STDOUT`: the server would stream rows. A blackhole has none.
+    ToStdout,
+    /// `COPY ... FROM '/path'`: the server reads a file. No conversation.
+    FromFile,
 }
 
-fn copy_is_binary(sql: &str) -> bool {
-    let upper = sql.to_ascii_uppercase();
-    upper.contains("FORMAT BINARY") || upper.ends_with(" BINARY") || upper.ends_with(" BINARY;")
+/// The direction of a COPY statement, or `None` if it is not a COPY.
+///
+/// SQL whitespace between the keywords is whatever the client sent: spaces,
+/// tabs, newlines, any number. Matching literal spellings is what made tabs and
+/// three spaces behave differently from one space.
+pub(crate) fn copy_direction(sql: &str) -> Option<CopyDirection> {
+    let mut words = SqlWords::new(sql);
+
+    if !words.next_is("COPY") {
+        return None;
+    }
+
+    // Skip the table name and any column list, then read the direction.
+    // `COPY table (a, b) FROM STDIN` and `COPY table TO STDOUT` both land here.
+    loop {
+        let Some(word) = words.next() else {
+            return None;
+        };
+
+        if word.eq_ignore_ascii_case("FROM") {
+            // `FROM STDIN` is a stream; `FROM 'file'` is a path. A path arrives
+            // as a quoted literal, which `next` reports as one word.
+            return match words.next() {
+                Some(target) if target.eq_ignore_ascii_case("STDIN") => {
+                    Some(CopyDirection::FromStdin)
+                }
+                Some(_) => Some(CopyDirection::FromFile),
+                None => None,
+            };
+        }
+
+        if word.eq_ignore_ascii_case("TO") {
+            return match words.next() {
+                Some(target) if target.eq_ignore_ascii_case("STDOUT") => {
+                    Some(CopyDirection::ToStdout)
+                }
+                // `TO '/path'` writes a file, which is the same non-conversation
+                // as `FROM '/path'` from a client's point of view.
+                Some(_) => Some(CopyDirection::FromFile),
+                None => None,
+            };
+        }
+
+        // The table name, a schema-qualified name, a column list: keep walking.
+        // A quoted identifier or literal is one word, so a comma inside it does
+        // not split it.
+    }
+}
+
+/// Whether the statement asks for the binary COPY format.
+///
+/// pgx sends `copy t ( a ) from stdin binary`; libpq sends `... WITH (FORMAT
+/// binary)`. Both are the same request, and the format decides how the rows are
+/// framed -- which is the difference between counting rows and counting
+/// newlines.
+pub(crate) fn copy_is_binary(sql: &str) -> bool {
+    fn contains_binary(sql: &str) -> bool {
+        let mut words = SqlWords::new(sql);
+
+        while let Some(word) = words.next() {
+            if word.eq_ignore_ascii_case("BINARY") {
+                return true;
+            }
+
+            // A parenthesised group is walked in turn: libpq's spelling is
+            // `WITH (FORMAT binary)`, which arrives here as one word.
+            if let Some(inner) = word.strip_prefix('(') {
+                let inner = inner.strip_suffix(')').unwrap_or(inner);
+                if contains_binary(inner) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    contains_binary(sql)
+}
+
+/// Walks a SQL statement and yields one word at a time.
+///
+/// Handles what a COPY statement actually contains: whitespace of any kind,
+/// quoted identifiers (`"my table"`), string literals (`'/tmp/x.csv'`, doubled
+/// quotes inside) and parenthesised column lists, which are skipped rather than
+/// split. Enough to find the keywords without pretending to be a parser.
+struct SqlWords<'a> {
+    rest: &'a str,
+}
+
+impl<'a> SqlWords<'a> {
+    fn new(sql: &'a str) -> Self {
+        SqlWords { rest: sql }
+    }
+
+    fn next_is(&mut self, word: &str) -> bool {
+        matches!(self.next(), Some(w) if w.eq_ignore_ascii_case(word))
+    }
+
+    fn next(&mut self) -> Option<&'a str> {
+        self.rest = self.rest.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ';');
+
+        let mut chars = self.rest.char_indices();
+
+        let (_, first) = chars.next()?;
+
+        // A quoted identifier or string: one word, up to its closing quote.
+        if first == '"' || first == '\'' {
+            let mut end = None;
+            let mut i = 1;
+
+            while i < self.rest.len() {
+                if self.rest.as_bytes()[i] == first as u8 {
+                    // A doubled quote is an escaped one, not the end.
+                    if self.rest.as_bytes().get(i + 1) == Some(&(first as u8)) {
+                        i += 2;
+
+                        continue;
+                    }
+
+                    end = Some(i + 1);
+
+                    break;
+                }
+
+                i += 1;
+            }
+
+            let end = end.unwrap_or(self.rest.len());
+            let word = &self.rest[..end];
+            self.rest = &self.rest[end..];
+
+            return Some(word);
+        }
+
+        // A parenthesised group: skipped whole, so a comma inside does not
+        // become a word and a newline inside does not end the search.
+        if first == '(' {
+            let end = self.rest.find(')').map_or(self.rest.len(), |i| i + 1);
+            let word = &self.rest[..end];
+            self.rest = &self.rest[end..];
+
+            return Some(word);
+        }
+
+        let end = self
+            .rest
+            .find(|c: char| c.is_ascii_whitespace() || c == '(' || c == ';')
+            .unwrap_or(self.rest.len());
+
+        let word = &self.rest[..end];
+        self.rest = &self.rest[end..];
+
+        Some(word)
+    }
+}
+
+/// Counts columns in `COPY table (col1, col2) FROM STDIN` by finding the
+/// paren-group between the table name and the direction keyword.
+pub(crate) fn count_copy_columns(sql: &str) -> usize {
+    // **One string, walked once.**
+    //
+    // Two bugs lived here. The first: this `find`-ed in
+    // `sql.trim().to_ascii_uppercase()` and sliced `sql`, so a byte offset from
+    // the trimmed string cut the untrimmed one short by exactly the leading
+    // whitespace -- ` COPY t (a,b) FROM STDIN` lost its `)`, `rfind('(')` still
+    // matched, the closing paren did not, and the answer was 1, so
+    // `CopyInResponse` announced one format code for a two-column copy.
+    //
+    // The second was the match itself: `" FROM "` is one spelling of the
+    // separator, and SQL allows tabs, newlines and any number of spaces. The
+    // walker below takes the separator as *any* whitespace, which is the only
+    // version of this that is true for what clients actually send.
+    let mut words = SqlWords::new(sql);
+
+    if !words.next_is("COPY") {
+        return 1;
+    }
+
+    loop {
+        let Some(word) = words.next() else {
+            return 1;
+        };
+
+        // The column list arrives as one word, parentheses included.
+        if let Some(inner) = word.strip_prefix('(') {
+            let inner = inner.strip_suffix(')').unwrap_or(inner);
+            if inner.trim().is_empty() {
+                return 1;
+            }
+
+            return count_top_level_commas(inner) + 1;
+        }
+
+        // The direction keyword, with no column list between the table and it.
+        if word.eq_ignore_ascii_case("FROM") || word.eq_ignore_ascii_case("TO") {
+            return 1;
+        }
+    }
+}
+
+/// Commas that separate items, not commas inside a nested group or a quoted
+/// name.
+fn count_top_level_commas(s: &str) -> usize {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut commas = 0usize;
+
+    for c in s.chars() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => commas += 1,
+                _ => {}
+            },
+        }
+    }
+
+    commas
 }
 
 #[derive(Debug, Clone)]
@@ -898,8 +1099,26 @@ pub enum PlanKind {
     /// DDL, and the only kind that still touches the SQL text at execution,
     /// because it mutates the catalog.
     Ddl,
-    /// COPY and anything unrecognised: decided from the text as before. Rare,
-    /// and not on any benchmark's hot path.
+    /// A COPY, with the direction its text declared.
+    ///
+    /// The direction is the whole reason this is a `PlanKind` rather than part
+    /// of `FromText`: `FROM STDIN` is a conversation that must be answered with
+    /// `CopyInResponse` before the client speaks, `TO STDOUT` is a
+    /// `CopyOutResponse` followed by no rows at all, and `FROM '/path'` is a
+    /// file the server reads with no conversation. All three used to answer
+    /// `CommandComplete("SELECT 0")`, which is not a thing a client can be told
+    /// for any of them.
+    Copy {
+        direction: CopyDirection,
+        /// Columns announced in `CopyInResponse`; the format code count has to
+        /// match the client's.
+        columns: usize,
+        /// Whether the rows arrive in PostgreSQL's binary COPY framing, which
+        /// is what decides how they are counted.
+        binary: bool,
+    },
+    /// Anything unrecognised: decided from the text as before. Rare, and not on
+    /// any benchmark's hot path.
     FromText,
 }
 
@@ -938,6 +1157,12 @@ impl PreparedPlan {
             PlanKind::Rollback
         } else if head.eq_ignore_ascii_case("CREATE") || head.eq_ignore_ascii_case("DROP") {
             PlanKind::Ddl
+        } else if let Some(direction) = copy_direction(sql) {
+            PlanKind::Copy {
+                direction,
+                columns: count_copy_columns(sql),
+                binary: copy_is_binary(sql),
+            }
         } else {
             PlanKind::FromText
         };
@@ -1029,6 +1254,25 @@ fn respond_to_plan(handler: &NoopHandler, plan: &PreparedPlan) -> Response {
             handler.apply_schema_change(&plan.sql);
             classify_extended(handler, &plan.sql)
         }
+        PlanKind::Copy {
+            direction,
+            columns,
+            binary,
+        } => match direction {
+            CopyDirection::FromStdin => {
+                Response::CopyIn(CopyResponse::new(
+                    i8::from(*binary),
+                    *columns,
+                    stream::empty::<PgWireResult<CopyData>>(),
+                ))
+            }
+            CopyDirection::ToStdout => Response::CopyOut(CopyResponse::new(
+                0,
+                0,
+                stream::empty::<PgWireResult<CopyData>>(),
+            )),
+            CopyDirection::FromFile => Response::Execution(Tag::new("COPY").with_rows(0)),
+        },
         PlanKind::FromText => classify_extended(handler, &plan.sql),
     }
 }
@@ -1064,27 +1308,38 @@ fn classify_simple(handler: &NoopHandler, sql: &str) -> Vec<Response> {
     } else if head.eq_ignore_ascii_case("ROLLBACK") {
         vec![Response::TransactionEnd(Tag::new("ROLLBACK"))]
     } else if head.eq_ignore_ascii_case("COPY") {
-        // COPY is not on the per-query hot path, so it keeps the simple
-        // uppercase copy -- scoped to the branch that needs it rather than paid
-        // for by every SELECT.
-        let upper = sql.to_ascii_uppercase();
-        if upper.contains("FROM STDIN") {
-            let cols = count_copy_columns(sql);
-            let fmt: i8 = if copy_is_binary(sql) { 1 } else { 0 };
-            vec![Response::CopyIn(CopyResponse::new(
-                fmt,
-                cols,
-                stream::empty::<PgWireResult<CopyData>>(),
-            ))]
-        } else {
-            vec![Response::CopyOut(CopyResponse::new(
-                0,
-                0,
-                stream::empty::<PgWireResult<CopyData>>(),
-            ))]
-        }
+        // The direction comes from the shared matcher, not from a literal
+        // spelling: `FROM STDIN` with a tab or three spaces is the same
+        // statement, and answering it as `CopyOut` desynchronised the stream.
+        vector_for_copy(sql)
     } else {
         vec![Response::Execution(Tag::new("OK"))]
+    }
+}
+
+/// The pgwire-handler replies for a COPY, by direction. Used by the handler
+/// path; the codec path builds its own bytes from the same direction.
+fn vector_for_copy(sql: &str) -> Vec<Response> {
+    let columns = count_copy_columns(sql);
+    let binary = copy_is_binary(sql);
+
+    match copy_direction(sql) {
+        Some(CopyDirection::FromStdin) => vec![Response::CopyIn(CopyResponse::new(
+            i8::from(binary),
+            columns,
+            stream::empty::<PgWireResult<CopyData>>(),
+        ))],
+        // `TO STDOUT` streams rows out; a blackhole streams none.
+        Some(CopyDirection::ToStdout) => vec![Response::CopyOut(CopyResponse::new(
+            0,
+            0,
+            stream::empty::<PgWireResult<CopyData>>(),
+        ))],
+        // `FROM '/path'`: the server reads a file and copied nothing from it.
+        Some(CopyDirection::FromFile) => {
+            vec![Response::Execution(Tag::new("COPY").with_rows(0))]
+        }
+        None => vec![Response::Execution(Tag::new("OK"))],
     }
 }
 
@@ -1306,6 +1561,94 @@ mod copy_columns {
     fn a_copy_without_a_column_list_is_one_column() {
         for sql in ["COPY t FROM STDIN", "  COPY t FROM STDIN", "COPY t () FROM STDIN"] {
             assert_eq!(count_copy_columns(sql), 1, "{sql:?}");
+        }
+    }
+
+    /// SQL whitespace is not one space. The column list is found by walking the
+    /// statement, so tabs, newlines and any number of spaces all land the same.
+    #[test]
+    fn any_whitespace_finds_the_column_list() {
+        for (sql, want) in [
+            ("COPY t (a, b) FROM    STDIN", 2),
+            ("COPY t (a,b,c) FROM\tSTDIN", 3),
+            ("COPY t ( a , b ) FROM\nSTDIN", 2),
+            ("copy\tt\t(a, b)\tfrom\tstdin", 2),
+            ("COPY t (a, b) TO STDOUT", 2),
+        ] {
+            assert_eq!(count_copy_columns(sql), want, "{sql:?}");
+        }
+    }
+
+    /// A quoted name is one thing, even with a comma in it -- otherwise a table
+    /// called `"a,b"` would look like a two-column list.
+    #[test]
+    fn commas_inside_a_quoted_name_do_not_count() {
+        assert_eq!(count_copy_columns(r#"COPY "a,b" (x) FROM STDIN"#), 1);
+        assert_eq!(count_copy_columns(r#"COPY t (x, "y,z") FROM STDIN"#), 2);
+    }
+}
+
+#[cfg(test)]
+mod copy_direction_tests {
+    use super::{CopyDirection, copy_direction, copy_is_binary};
+
+    /// **The reviewer's case.** `COPY t FROM    STDIN` used to answer `SELECT 0`
+    /// because the match allowed one or two spaces, and the following `CopyData`
+    /// then arrived outside a COPY -- every later reply read against the wrong
+    /// message. Three spaces, a tab and a newline are the same statement.
+    #[test]
+    fn from_stdin_survives_any_whitespace() {
+        for sql in [
+            "COPY t FROM STDIN",
+            "COPY t FROM  STDIN",
+            "COPY t FROM    STDIN",
+            "COPY t FROM\tSTDIN",
+            "COPY t FROM\n STDIN",
+            "  COPY t (a, b) FROM\t\tSTDIN  ",
+            "copy warehouse (w_id, w_name) from   stdin",
+        ] {
+            assert_eq!(copy_direction(sql), Some(CopyDirection::FromStdin), "{sql:?}");
+        }
+    }
+
+    /// The other two directions, which used to be the same case.
+    #[test]
+    fn direction_is_read_from_the_statement() {
+        for sql in ["COPY t TO STDOUT", "COPY t TO  STDOUT", "COPY t (a) TO\nSTDOUT"] {
+            assert_eq!(copy_direction(sql), Some(CopyDirection::ToStdout), "{sql:?}");
+        }
+
+        for sql in ["COPY t FROM '/tmp/x.csv'", "COPY t TO '/tmp/x.csv'"] {
+            assert_eq!(copy_direction(sql), Some(CopyDirection::FromFile), "{sql:?}");
+        }
+
+        assert_eq!(copy_direction("SELECT 1"), None);
+        assert_eq!(copy_direction("COPY"), None);
+    }
+
+    /// A table name containing the word STDOUT or STDIN is not a direction: the
+    /// keyword is only read after the table name and any column list.
+    #[test]
+    fn a_table_name_is_not_a_direction() {
+        assert_eq!(copy_direction(r#"COPY "stdin" (a) FROM STDIN"#), Some(CopyDirection::FromStdin));
+        assert_eq!(copy_direction("COPY stdout FROM STDIN"), Some(CopyDirection::FromStdin));
+    }
+
+    /// Both spellings of the binary request, because they come from different
+    /// clients: pgx appends `binary`, libpq wraps it in a WITH clause.
+    #[test]
+    fn binary_is_recognised_in_both_spellings() {
+        for sql in [
+            "copy t ( a, b ) from stdin binary;",
+            "COPY t FROM STDIN BINARY",
+            "COPY t FROM STDIN WITH (FORMAT binary)",
+            "COPY t FROM STDIN WITH (FORMAT BINARY)",
+        ] {
+            assert!(copy_is_binary(sql), "{sql:?}");
+        }
+
+        for sql in ["COPY t FROM STDIN", "COPY t FROM STDIN WITH (FORMAT csv)"] {
+            assert!(!copy_is_binary(sql), "{sql:?}");
         }
     }
 }
