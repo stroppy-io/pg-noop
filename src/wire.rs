@@ -77,6 +77,28 @@ enum Phase {
     Closed,
 }
 
+/// The transaction state `ReadyForQuery` advertises, one byte on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxStatus {
+    /// `I`: no transaction open.
+    Idle,
+    /// `T`: a transaction block is open.
+    InTransaction,
+    /// `E`: a transaction block is open and a statement in it failed. PostgreSQL
+    /// stays here until `ROLLBACK`, refusing everything else.
+    Failed,
+}
+
+impl TxStatus {
+    fn byte(self) -> u8 {
+        match self {
+            TxStatus::Idle => b'I',
+            TxStatus::InTransaction => b'T',
+            TxStatus::Failed => b'E',
+        }
+    }
+}
+
 pub struct Conn {
     phase: Phase,
     /// Prepared statements by name. "" is the unnamed statement, which clients
@@ -93,6 +115,14 @@ pub struct Conn {
     copy_carry: Vec<u8>,
     /// Whether the 19-byte binary COPY header has been consumed.
     copy_header_seen: bool,
+    /// The state `ReadyForQuery` reports, which is not a constant.
+    ///
+    /// pgxpool reads it: a connection that reports idle while a transaction is
+    /// open is one the pool will hand to another query with the transaction
+    /// still running underneath it, and PostgreSQL's own clients use the byte to
+    /// decide whether a failed statement can be retried in place. This server
+    /// answers `I` always, which is where that behaviour came from.
+    tx_status: TxStatus,
 }
 
 impl Default for Conn {
@@ -109,6 +139,7 @@ impl Conn {
             portals: HashMap::new(),
             copy_carry: Vec::new(),
             copy_header_seen: false,
+            tx_status: TxStatus::Idle,
         }
     }
 
@@ -139,6 +170,39 @@ impl Conn {
         self.copy_carry.clear();
         self.copy_header_seen = false;
         self.phase = Phase::Query;
+    }
+
+    /// `ReadyForQuery`, with the transaction state that is true at this moment.
+    fn ready(&self, out: &mut Vec<u8>) {
+        msg(out, b'Z', |b| b.push(self.tx_status.byte()));
+    }
+
+    /// An ErrorResponse, and the state it leaves behind.
+    ///
+    /// A failed statement inside a transaction block puts the SESSION in a
+    /// failed transaction -- `E` until `ROLLBACK` -- because that is what
+    /// PostgreSQL does and what a poolering client reads the byte to find out.
+    /// An error outside a transaction leaves it idle.
+    fn error(&mut self, out: &mut Vec<u8>, code: &str, message: &str) {
+        if self.tx_status == TxStatus::InTransaction {
+            self.tx_status = TxStatus::Failed;
+        }
+
+        error_response(out, code, message);
+    }
+
+    /// What a statement did to the transaction state.
+    ///
+    /// `BEGIN` opens one; `COMMIT` and `ROLLBACK` close it, failed or not. A
+    /// statement inside a failed transaction is refused by PostgreSQL, but a
+    /// blackhole answers everything -- what matters here is that the byte it
+    /// reports does not lie about the block being open.
+    fn note_transaction(&mut self, kind: &PlanKind) {
+        match kind {
+            PlanKind::Begin => self.tx_status = TxStatus::InTransaction,
+            PlanKind::Commit | PlanKind::Rollback => self.tx_status = TxStatus::Idle,
+            _ => {}
+        }
     }
 
     /// Count complete tuples in a binary COPY stream, carrying the tail.
@@ -344,7 +408,7 @@ impl Conn {
                     b.extend_from_slice(&1i32.to_be_bytes());
                     b.extend_from_slice(&1i32.to_be_bytes());
                 });
-                ready(out);
+                self.ready(out);
                 self.phase = Phase::Query;
                 Some(len)
             }
@@ -388,7 +452,7 @@ impl Conn {
         if handled.is_none() {
             // Malformed body inside a well-framed message: answer an error and
             // consume it, so the stream stays synchronised.
-            error_response(out, "08P01", "malformed message body");
+            self.error(out, "08P01", "malformed message body");
         }
 
         return Some(total);
@@ -463,13 +527,19 @@ impl Conn {
                         }
                     }
 
-                    ready(out);
+                    self.ready(out);
 
                     return Some(());
                 }
 
+                // A statement that opens, ends or fails a transaction changes
+                // what the NEXT `ReadyForQuery` must say, and it is noted before
+                // the answer is written so that the byte and the statement
+                // cannot disagree.
+                self.note_transaction(&plan.kind);
+
                 answer(&plan, out, catalog, true);
-                ready(out);
+                self.ready(out);
             }
 
             // In flight: count rows, and end on done or fail.
@@ -500,7 +570,7 @@ impl Conn {
                 };
                 self.leave_copy_in();
                 complete_raw(out, &format!("COPY {rows}"));
-                ready(out);
+                self.ready(out);
             }
 
             tag::COPY_FAIL if matches!(self.phase, Phase::CopyIn { .. }) => {
@@ -508,16 +578,16 @@ impl Conn {
                 // protocol's own definition, and answering it as success would
                 // tell a loader its data landed.
                 self.leave_copy_in();
-                error_response(out, "57014", "COPY from stdin failed");
-                ready(out);
+                self.error(out, "57014", "COPY from stdin failed");
+                self.ready(out);
             }
 
             tag::COPY_DATA | tag::COPY_DONE | tag::COPY_FAIL => {
                 // A COPY message outside a COPY is the client desynchronised, not
                 // something to absorb quietly: absorbing it is what lets the two
                 // sides disagree for the rest of the connection.
-                error_response(out, "08P01", "COPY message outside a COPY operation");
-                ready(out);
+                self.error(out, "08P01", "COPY message outside a COPY operation");
+                self.ready(out);
             }
 
             tag::PARSE => {
@@ -591,7 +661,22 @@ impl Conn {
                             _ => None,
                         };
 
+                        // The extended protocol's Execute is where a statement
+                        // actually runs, so it is where the transaction state
+                        // changes. `SYNC` is what asks for the byte, later.
+                        // Copied out, because `note_transaction` needs `self`
+                        // mutably and `p` is borrowed from it.
+                        let touched_tx = matches!(
+                            p.kind,
+                            PlanKind::Begin | PlanKind::Commit | PlanKind::Rollback
+                        );
+
                         answer(p, out, catalog, false);
+
+                        if touched_tx {
+                            let kind = p.kind.clone();
+                            self.note_transaction(&kind);
+                        }
 
                         if let Some((columns, binary)) = streams_rows {
                             let _ = columns;
@@ -604,7 +689,7 @@ impl Conn {
                 }
             }
 
-            tag::SYNC => ready(out),
+            tag::SYNC => self.ready(out),
 
             // Flush means "send what you have". The caller writes `out` after
             // this call returns, so there is nothing to do but not swallow it.
@@ -785,10 +870,6 @@ fn error_response(out: &mut Vec<u8>, code: &str, message: &str) {
     });
 }
 
-fn ready(out: &mut Vec<u8>) {
-    msg(out, b'Z', |b| b.push(b'I'));
-}
-
 /// One DataRow of `n` int8 columns, every value the text "1".
 fn data_row(out: &mut Vec<u8>, n: usize) {
     msg(out, b'D', |b| {
@@ -942,6 +1023,33 @@ mod tests {
         (c, v)
     }
 
+    /// The status byte of the LAST `ReadyForQuery` in a reply.
+    ///
+    /// `Z` messages are `[b'Z'][len:i32][status:u8]`, so the byte the client
+    /// reads sits at the end of the last one -- which is always where
+    /// `ReadyForQuery` is in a well-formed reply.
+    fn last_ready_status(out: &[u8]) -> u8 {
+        let mut i = 0;
+        let mut status = None;
+
+        while i + 5 <= out.len() {
+            let tag = out[i];
+            let len = i32::from_be_bytes([out[i + 1], out[i + 2], out[i + 3], out[i + 4]]) as usize;
+
+            if len < 4 || i + 1 + len > out.len() {
+                break;
+            }
+
+            if tag == b'Z' {
+                status = Some(out[i + 5]);
+            }
+
+            i += 1 + len;
+        }
+
+        status.expect("no ReadyForQuery in the reply")
+    }
+
     #[test]
     fn ssl_request_is_declined_without_leaving_startup() {
         let (mut c, v) = (Conn::new(), view());
@@ -1063,6 +1171,99 @@ mod tests {
         assert!(t.contains(&b'T'), "simple query describes its rows");
         assert!(t.contains(&b'D'), "and returns one");
         assert_eq!(t.last(), Some(&b'Z'));
+    }
+
+    /// **The status byte is not a constant.**
+    ///
+    /// `ReadyForQuery` always said `I`. pgxpool reads it to decide whether a
+    /// connection is free, so after a raw `BEGIN` it put the connection back in
+    /// the pool with the transaction still open underneath the next user of it.
+    /// PostgreSQL reports `T` there and so must this.
+    #[test]
+    fn a_raw_begin_reports_in_transaction() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+
+        c.advance(&tagged(b'Q', |b| cstr(b, "BEGIN")), &mut out, &v);
+
+        // `BEGIN` answers `BEGIN`, then `ReadyForQuery`, whose status byte is
+        // the byte after the message's own length.
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("BEGIN"), "{text}");
+        assert_eq!(last_ready_status(&out), b'T', "a transaction block is open");
+    }
+
+    /// `COMMIT` and `ROLLBACK` close it in both directions, including out of a
+    /// failed transaction.
+    #[test]
+    fn commit_and_rollback_report_idle() {
+        for end in ["COMMIT", "ROLLBACK"] {
+            let (mut c, v) = connected();
+            let mut out = Vec::new();
+
+            c.advance(&tagged(b'Q', |b| cstr(b, "BEGIN")), &mut out, &v);
+            assert_eq!(last_ready_status(&out), b'T');
+
+            out.clear();
+            c.advance(&tagged(b'Q', |b| cstr(b, end)), &mut out, &v);
+            assert_eq!(last_ready_status(&out), b'I', "after {end}");
+        }
+    }
+
+    /// An error inside a transaction block leaves the session in a FAILED
+    /// transaction -- `E` -- until it is rolled back, which is what PostgreSQL
+    /// does and what tells a client its statements cannot be retried in place.
+    /// Outside a transaction, an error leaves the session idle.
+    #[test]
+    fn an_error_inside_a_transaction_reports_failed() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+
+        // Outside: idle.
+        c.advance(&tagged(b'Q', |b| cstr(b, "BEGIN")), &mut out, &v);
+        out.clear();
+
+        // A COPY message with no COPY open is the desync case, and an error.
+        c.advance(&tagged(b'c', |_| {}), &mut out, &v);
+        assert!(out.contains(&b'E'), "an ErrorResponse");
+        assert_eq!(last_ready_status(&out), b'E', "failed transaction");
+
+        out.clear();
+        c.advance(&tagged(b'Q', |b| cstr(b, "ROLLBACK")), &mut out, &v);
+        assert_eq!(last_ready_status(&out), b'I', "ROLLBACK clears it");
+
+        // And an error with no transaction open stays idle.
+        out.clear();
+        c.advance(&tagged(b'f', |b| cstr(b, "nope")), &mut out, &v);
+        assert_eq!(last_ready_status(&out), b'I');
+    }
+
+    /// The extended protocol's Execute changes the state, and `Sync` is what
+    /// reports it -- so `Parse/Bind/Execute(Sync)` around a `BEGIN` must say `T`.
+    #[test]
+    fn an_extended_begin_reports_in_transaction() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+
+        let mut input = Vec::new();
+        input.extend_from_slice(&tagged(b'P', |b| {
+            cstr(b, "");
+            cstr(b, "BEGIN");
+            b.extend_from_slice(&0i16.to_be_bytes());
+        }));
+        input.extend_from_slice(&tagged(b'B', |b| {
+            cstr(b, "");
+            cstr(b, "");
+            b.extend_from_slice(&0i16.to_be_bytes()); // no formats
+            b.extend_from_slice(&0i16.to_be_bytes()); // no params
+            b.extend_from_slice(&0i16.to_be_bytes()); // no result formats
+        }));
+        input.extend_from_slice(&tagged(b'E', |b| cstr(b, "")));
+        input.extend_from_slice(&tagged(b'S', |_| {}));
+
+        c.advance(&input, &mut out, &v);
+
+        assert_eq!(last_ready_status(&out), b'T', "Sync reports the open block");
     }
 
     /// The one piece of real behaviour: a client that creates a table and then
