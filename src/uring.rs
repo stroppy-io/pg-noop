@@ -66,10 +66,13 @@ struct Slot {
     sent: usize,
     in_flight: u32,
     closing: bool,
+    /// When this connection stops being allowed to sit in startup. `None` once
+    /// startup has completed or a timer has already retired it.
+    startup_deadline: Option<std::time::Instant>,
 }
 
 impl Slot {
-    fn new(fd: RawFd) -> Self {
+    fn new(fd: RawFd, startup_deadline: Option<std::time::Instant>) -> Self {
         Slot {
             fd,
             conn: Conn::new(),
@@ -79,6 +82,7 @@ impl Slot {
             sent: 0,
             in_flight: 0,
             closing: false,
+            startup_deadline,
         }
     }
 }
@@ -179,23 +183,37 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
     // that do not clear by retrying, cleared when the wait has expired.
     let mut accept_paused_until: Option<std::time::Instant> = None;
 
+    // The earliest startup deadline among the connections that have not
+    // completed one, or `None` when every connection on this shard has. Kept as
+    // a minimum rather than recomputed each pass: with either deadline pending
+    // the loop does no more than compare an Option, and the scan that refreshes
+    // this runs only when a deadline actually comes due.
+    let startup_timeout = crate::config::startup_timeout();
+    let mut earliest_startup: Option<std::time::Instant> = None;
+
     push_accept(&mut ring)?;
     ring.submit()?;
 
     loop {
-        // **Wait for a completion, or for the accept deadline.**
+        // **Wait for a completion, or for the earliest deadline.**
         //
-        // A paused accept is invisible to a completion: it is reached only by
-        // the code below, and `submit_and_wait` never returns to it -- so a
-        // 100 ms backoff became a shard that never accepted again, while every
-        // later connect sat in the backlog, including the one that would have
-        // made room. Bounding the wait is the whole mechanism: when the
-        // deadline passes, `io_uring_enter` returns ETIME and this loop keeps
-        // running.
+        // Two obligations of this shard are invisible to a completion: a paused
+        // accept, and a connection that has not completed startup. Both are
+        // reached only by the code below, and `submit_and_wait` never returns to
+        // it -- so a 100 ms accept backoff became a shard that never accepted
+        // again, and an idle client held its fd for as long as it liked. Bounding
+        // the wait is the whole mechanism: when a deadline passes, `io_uring_enter`
+        // returns ETIME and this loop keeps running.
         //
-        // With no deadline pending -- the steady state, and every state but fd
-        // exhaustion -- this is the plain blocking wait it always was.
-        let expired = match accept_paused_until {
+        // With neither deadline pending -- the steady state under load -- this is
+        // the plain blocking wait it always was, and nothing is added to the hot
+        // path but the comparison of two `None`s.
+        let deadline = match (accept_paused_until, earliest_startup) {
+            (None, None) => None,
+            (a, b) => Some(a.into_iter().chain(b).min().expect("one is Some")),
+        };
+
+        let expired = match deadline {
             None => {
                 ring.submit_and_wait(1)?;
 
@@ -288,17 +306,25 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
                             );
                         }
 
+                        let admitted = startup_timeout
+                            .map(|t| std::time::Instant::now() + t);
+
                         let i = match free.pop() {
                             Some(i) => {
-                                slots[i] = Some(Slot::new(fd));
+                                slots[i] = Some(Slot::new(fd, admitted));
                                 i
                             }
                             None => {
-                                slots.push(Some(Slot::new(fd)));
+                                slots.push(Some(Slot::new(fd, admitted)));
                                 slots.len() - 1
                             }
                         };
                         submit_recv(&mut ring, &mut slots, i)?;
+
+                        if let Some(at) = admitted {
+                            earliest_startup =
+                                Some(earliest_startup.map_or(at, |e| e.min(at)));
+                        }
                     }
                     // Only re-arm when the pause has expired. While it has
                     // not, no accept is in flight and the loop keeps serving
@@ -353,6 +379,15 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
                     }
 
                     if slot.send.is_empty() {
+                        // Startup completed: this connection is no longer the
+                        // one the startup deadline is about. Clearing the slot's
+                        // deadline here is what keeps `earliest_startup` from
+                        // waking the shard for a client that has long since
+                        // spoken.
+                        if !slot.conn.awaiting_startup() {
+                            slot.startup_deadline = None;
+                        }
+
                         if slot.conn.is_closed() {
                             slot.closing = true;
                             reap(&mut slots, &mut free, idx);
@@ -393,19 +428,55 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
             }
         }
 
-        // **The paused accept, once the wait has come back.** Only reached when
-        // one was pending; otherwise `expired` is false and this is a branch on
-        // a bool.
+        // **The deadlines, once the wait has come back.** Only reached when at
+        // least one was pending; with none, `expired` is false and this is a
+        // branch on a bool.
         if expired {
-            // Checked against the clock rather than assumed, because the wait
-            // can return for other reasons too and this must not re-arm accept
-            // early.
+            // A paused accept whose backoff has passed resumes here. Checked
+            // against the clock rather than assumed: the wait can also have been
+            // bounded by the *other* deadline and returned early.
             if let Some(t) = accept_paused_until {
                 if std::time::Instant::now() >= t {
                     accept_paused_until = None;
                     push_accept(&mut ring)?;
                 }
             }
+
+            // Connections still in startup whose deadline has passed.
+            //
+            // `shutdown`, not `close`: a slot with a receive in flight may not
+            // be freed, and shutting the socket down is what makes that receive
+            // return 0, so the ordinary path reaps it. Closing the fd here
+            // instead would leave the kernel reading into a slot the shard has
+            // already forgotten.
+            let now = std::time::Instant::now();
+            let mut next: Option<std::time::Instant> = None;
+
+            for slot in slots.iter_mut().flatten() {
+                let Some(at) = slot.startup_deadline else {
+                    continue;
+                };
+
+                if at <= now {
+                    if slot.conn.awaiting_startup() {
+                        eprintln!(
+                            "pgnoop: connection did not complete startup within {}ms; closing",
+                            startup_timeout.map_or(0, |t| t.as_millis())
+                        );
+                        // SAFETY: the fd is owned by the slot and is closed only
+                        // once its receive completes.
+                        unsafe { libc::shutdown(slot.fd, libc::SHUT_RDWR) };
+                    }
+
+                    slot.startup_deadline = None;
+
+                    continue;
+                }
+
+                next = Some(next.map_or(at, |n| n.min(at)));
+            }
+
+            earliest_startup = next;
         }
     }
 }

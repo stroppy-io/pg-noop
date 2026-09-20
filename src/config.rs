@@ -117,6 +117,32 @@ impl Io {
 /// thing whichever one is moving the bytes.
 pub const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// How long a connection may stay in startup before it is closed.
+///
+/// pgwire allowed 60 s; the rewrite dropped it, and a client that connects and
+/// sends nothing then holds an fd, a receive buffer and a slot for as long as it
+/// likes. The default bind is 0.0.0.0, so "a client" includes whatever the
+/// network can reach.
+///
+/// The same 60 s, because the timeout is a property of the protocol's users
+/// rather than of this server: a driver that has not spoken in a minute is not a
+/// driver that is about to. `PGNOOP_STARTUP_TIMEOUT_MS` overrides it, and `0`
+/// disables it for anyone who wants the old behaviour on purpose.
+const STARTUP_TIMEOUT_DEFAULT_MS: u64 = 60_000;
+
+/// The startup timeout in force. Read by both backends, so that "a client that
+/// never speaks" means the same thing whichever one is serving.
+pub fn startup_timeout() -> Option<std::time::Duration> {
+    match std::env::var("PGNOOP_STARTUP_TIMEOUT_MS") {
+        Ok(v) => v
+            .parse::<u64>()
+            .ok()
+            .filter(|ms| *ms > 0)
+            .map(std::time::Duration::from_millis),
+        Err(_) => Some(std::time::Duration::from_millis(STARTUP_TIMEOUT_DEFAULT_MS)),
+    }
+}
+
 impl Config {
     pub fn load() -> Self {
         let cli = CliArgs::parse();

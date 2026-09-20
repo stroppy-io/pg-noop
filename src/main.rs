@@ -111,10 +111,43 @@ async fn serve(mut socket: TcpStream, catalog: CatalogView) {
     let mut out: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut chunk = vec![0u8; 64 * 1024];
 
+    // The deadline is on the *connection*, not on each read: it is the startup
+    // handshake that has to finish, and a client that dribbles its startup
+    // packet out one byte at a time would otherwise extend it indefinitely.
+    let startup_deadline =
+        config::startup_timeout().map(|t| tokio::time::Instant::now() + t);
+
     loop {
-        let n = match socket.read(&mut chunk).await {
-            Ok(0) | Err(_) => return,
-            Ok(n) => n,
+        // A client that has not completed startup may legitimately have sent
+        // nothing yet, and `read` would wait for it forever: the socket is open,
+        // the shard has a slot, and neither is ever given back. Bounding the
+        // wait is the whole mechanism -- once startup is done, the same read is
+        // the unbounded one it always was.
+        let n = if conn.awaiting_startup() {
+            match startup_deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline, socket.read(&mut chunk)).await {
+                    Ok(Ok(n)) if n > 0 => n,
+                    // Timed out, closed, or failed: all three end the connection,
+                    // and the caller has what it needs to tell them apart in the
+                    // log line below.
+                    Ok(Ok(_)) | Ok(Err(_)) => return,
+                    Err(_elapsed) => {
+                        eprintln!(
+                            "pgnoop: connection did not complete startup in time; closing"
+                        );
+                        return;
+                    }
+                },
+                None => match socket.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => n,
+                },
+            }
+        } else {
+            match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            }
         };
 
         out.clear();

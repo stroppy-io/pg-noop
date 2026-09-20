@@ -50,6 +50,13 @@ Parameters are resolved in order: **CLI flag → environment variable → `pgnoo
 | Shards (threads) | `--workers` | `PGNOOP_WORKERS` | number of logical CPUs |
 | I/O backend | `--io` | `PGNOOP_IO` | `uring` (`epoll` also available) |
 | Config file path | `--config` | `PGNOOP_CONFIG` | `./pgnoop.json` |
+| Startup timeout | — | `PGNOOP_STARTUP_TIMEOUT_MS` | `60000` (`0` disables) |
+
+A connection that does not complete its startup handshake within the startup
+timeout is closed, so a client that connects and never speaks cannot hold an fd
+and a receive buffer indefinitely. `PGNOOP_IO=uring` falls back to `epoll` when
+the kernel refuses the ring (a container's seccomp profile, or a kernel without
+io_uring), and says so on stderr; `--io epoll` asks for epoll directly.
 
 **`pgnoop.json` example:**
 ```json

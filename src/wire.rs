@@ -100,6 +100,16 @@ impl Conn {
         self.phase == Phase::Closed
     }
 
+    /// True until a startup handshake has completed.
+    ///
+    /// The phase a client is in while it may legitimately have sent nothing at
+    /// all: a TCP connection that exists is not a client yet, and the server
+    /// cannot tell a slow driver from an idle socket that will never speak.
+    /// Callers use this to bound how long that state may last.
+    pub fn awaiting_startup(&self) -> bool {
+        self.phase == Phase::Startup
+    }
+
     /// Consume every COMPLETE message in `input`, appending replies to `out`.
     ///
     /// Returns how many bytes were consumed. A partial message at the end is
