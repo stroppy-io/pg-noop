@@ -20,20 +20,23 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "macros", "
 # Shard-per-core needs two things the std library will not give: a listener per
 # shard on one port (SO_REUSEPORT) and a thread pinned to a core.
 socket2 = { version = "0.6", features = ["all"] }
+# errno constants, on every platform. The accept path compares `EMFILE` and
+# friends whichever backend is serving, and libc has those on Darwin as well as
+# Linux -- only the PINNING call is Linux-only, and that is `cfg`'d in main.rs.
+libc = "0.2"
 async-trait = "0.1"
 futures = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# The io_uring backend and the CPU pinning that shards it are Linux-only, and
-# both break the Apple release targets if they are unconditional: the io-uring
-# crate needs `MAP_POPULATE`, `MADV_DONTFORK` and the `SYS_io_uring_*` syscalls,
-# and `libc::cpu_set_t` / `sched_setaffinity` have no Darwin equivalent. Neither
-# can be adapted, so the dependency is scoped to the platform that has it and
-# `epoll` carries everywhere else.
+# The io_uring backend is Linux-only: the crate needs `MAP_POPULATE`,
+# `MADV_DONTFORK` and the `SYS_io_uring_*` syscalls, none of which exist on
+# Darwin and none of which can be adapted. The dependency and the module are
+# scoped to the platform that has it; `epoll` carries everywhere else, which is
+# also the runtime fallback for a kernel that will not give up a ring (see
+# `main::resolve_io`).
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
 io-uring = "0.7"
 
 [profile.release]
