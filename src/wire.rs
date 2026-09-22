@@ -43,6 +43,13 @@ mod tag {
     pub const COPY_DATA: u8 = b'd';
     pub const COPY_DONE: u8 = b'c';
     pub const COPY_FAIL: u8 = b'f';
+
+    /// Whether a message belongs to the extended protocol, which is what
+    /// decides how an error in it ends. PostgreSQL's `SocketBackend` marks
+    /// exactly these as `doing_extended_query_message`.
+    pub fn is_extended(t: u8) -> bool {
+        matches!(t, PARSE | BIND | DESCRIBE | EXECUTE | CLOSE | FLUSH)
+    }
 }
 
 /// Largest message this server will frame. PostgreSQL's own limit is 1 GB; a
@@ -77,6 +84,14 @@ enum Phase {
         rows: u64,
         binary: bool,
     },
+    /// After an error in an extended-protocol message. PostgreSQL discards
+    /// every message until `Sync`, then sends ONE `ReadyForQuery`; a driver
+    /// that pipelined Parse/Bind/Execute/Sync counts on that, because it has
+    /// already sent the rest of the batch and must not get answers for it.
+    ///
+    /// This codec used to answer the error and carry on, so a Query behind a
+    /// malformed Parse executed and both it and the Sync reported ready.
+    AwaitingSync,
     Closed,
 }
 
@@ -192,6 +207,20 @@ impl Conn {
         }
 
         error_response(out, code, message);
+    }
+
+    /// An error, and the recovery the protocol prescribes for where it
+    /// happened. In the simple protocol the reply ends with `ReadyForQuery`
+    /// and the next message runs. In the extended protocol nothing more is
+    /// said until the client's `Sync`, and nothing in between is executed.
+    fn refuse(&mut self, extended: bool, out: &mut Vec<u8>, code: &str, message: &str) {
+        self.error(out, code, message);
+
+        if extended {
+            self.phase = Phase::AwaitingSync;
+        } else {
+            self.ready(out);
+        }
     }
 
     /// What a statement did to the transaction state.
@@ -333,7 +362,9 @@ impl Conn {
                 // A COPY in flight is framed the same way a query is; which
                 // messages MEAN anything is `dispatch`'s business, not the
                 // framer's.
-                Phase::Query | Phase::CopyIn { .. } => self.message(rest, out, catalog),
+                Phase::Query | Phase::CopyIn { .. } | Phase::AwaitingSync => {
+                    self.message(rest, out, catalog)
+                }
                 Phase::Closed => return pos,
             };
 
@@ -455,7 +486,7 @@ impl Conn {
         if handled.is_none() {
             // Malformed body inside a well-framed message: answer an error and
             // consume it, so the stream stays synchronised.
-            self.error(out, "08P01", "malformed message body");
+            self.refuse(tag::is_extended(t), out, "08P01", "malformed message body");
         }
 
         Some(total)
@@ -470,6 +501,23 @@ impl Conn {
         out: &mut Vec<u8>,
         catalog: &CatalogView,
     ) -> Option<()> {
+        // Skipping to Sync: only Sync ends it, and only Terminate is otherwise
+        // heard. Everything else is consumed unanswered -- no BindComplete for
+        // a Bind, no ParseComplete for a Parse -- because the driver has
+        // already stopped counting on them.
+        if self.phase == Phase::AwaitingSync {
+            match t {
+                tag::SYNC => {
+                    self.phase = Phase::Query;
+                    self.ready(out);
+                }
+                tag::TERMINATE => self.phase = Phase::Closed,
+                _ => {}
+            }
+
+            return Some(());
+        }
+
         match t {
             tag::TERMINATE => {
                 self.phase = Phase::Closed;
@@ -1735,6 +1783,100 @@ mod tests {
             "and the Sync after it is still answered, so the stream is in sync"
         );
         assert!(framed < input.len());
+    }
+
+    /// **An error in an extended-protocol message discards everything until
+    /// Sync.** PostgreSQL answers `ErrorResponse`, then reads and drops every
+    /// message until `Sync`, then sends ONE `ReadyForQuery`. This codec answered
+    /// the error and kept going: the Query after a malformed Parse executed,
+    /// and both it and the Sync reported ready -- `E,T,D,C,Z,Z` where the
+    /// client's driver expects `E,Z`.
+    #[test]
+    fn an_error_in_an_extended_message_discards_everything_until_sync() {
+        let (mut c, v) = connected();
+
+        // Malformed Parse (no NUL anywhere), then a Query, then Sync, in one
+        // packet -- which is how a pipelining driver sends them.
+        let mut input = Vec::new();
+        msg(&mut input, b'P', |b| b.extend_from_slice(b"no-nul-here"));
+        input.extend(tagged(b'Q', |b| cstr(b, "select 1")));
+        input.extend(tagged(b'S', |_| {}));
+
+        let mut out = Vec::new();
+        assert_eq!(c.advance(&input, &mut out, &v), input.len());
+        assert_eq!(
+            tags(&out),
+            vec![b'E', b'Z'],
+            "the Query must be discarded, and Sync must answer exactly once"
+        );
+
+        // And after Sync the connection is normal again.
+        out.clear();
+        c.advance(&tagged(b'Q', |b| cstr(b, "select 1")), &mut out, &v);
+        assert_eq!(tags(&out), vec![b'T', b'D', b'C', b'Z']);
+    }
+
+    /// Extended messages that arrive while skipping are not answered either --
+    /// no BindComplete for a Bind, no ParseComplete for a Parse. A driver
+    /// counts replies against what it sent, and a stray `2` desynchronises it.
+    #[test]
+    fn extended_messages_are_silent_while_awaiting_sync() {
+        let (mut c, v) = connected();
+
+        let mut input = Vec::new();
+        msg(&mut input, b'P', |b| b.extend_from_slice(b"no-nul-here"));
+        input.extend(tagged(b'P', |b| {
+            cstr(b, "s1");
+            cstr(b, "select 1");
+            b.extend_from_slice(&0i16.to_be_bytes());
+        }));
+        input.extend(tagged(b'B', |b| {
+            cstr(b, "");
+            cstr(b, "s1");
+            b.extend_from_slice(&0i16.to_be_bytes());
+            b.extend_from_slice(&0i16.to_be_bytes());
+            b.extend_from_slice(&0i16.to_be_bytes());
+        }));
+        input.extend(tagged(b'E', |b| {
+            cstr(b, "");
+            b.extend_from_slice(&0i32.to_be_bytes());
+        }));
+        input.extend(tagged(b'H', |_| {}));
+        input.extend(tagged(b'S', |_| {}));
+
+        let mut out = Vec::new();
+        c.advance(&input, &mut out, &v);
+        assert_eq!(tags(&out), vec![b'E', b'Z']);
+    }
+
+    /// A Terminate while skipping still closes: the client is allowed to give
+    /// up without sending the Sync it never got an answer for.
+    #[test]
+    fn terminate_while_awaiting_sync_closes() {
+        let (mut c, v) = connected();
+
+        let mut input = Vec::new();
+        msg(&mut input, b'P', |b| b.extend_from_slice(b"no-nul-here"));
+        input.extend(tagged(b'X', |_| {}));
+
+        let mut out = Vec::new();
+        c.advance(&input, &mut out, &v);
+        assert!(c.is_closed());
+    }
+
+    /// The simple protocol has no Sync, so an error there ends with
+    /// `ReadyForQuery` at once and the next message runs. A COPY message with
+    /// no COPY open is the one simple-protocol error this codec produces.
+    #[test]
+    fn a_simple_protocol_error_is_ready_at_once() {
+        let (mut c, v) = connected();
+
+        let mut input = tagged(b'c', |_| {});
+        input.extend(tagged(b'Q', |b| cstr(b, "select 1")));
+
+        let mut out = Vec::new();
+        c.advance(&input, &mut out, &v);
+        assert_eq!(tags(&out), vec![b'E', b'Z', b'T', b'D', b'C', b'Z']);
     }
 
     #[test]
