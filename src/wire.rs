@@ -90,9 +90,16 @@ enum Phase {
     /// ends at a newline, so newlines are the rows; in binary format there are no
     /// newlines at all -- `pgx.CopyFrom` encodes field lengths and payload bytes,
     /// and `0x0a` appears wherever a value happens to contain it.
+    ///
+    /// `extended` travels because it decides how the COPY ENDS. Entered from a
+    /// simple Query, CopyDone is answered with the tag and `ReadyForQuery`.
+    /// Entered from Execute, the client has already sent a Sync behind the
+    /// Execute and will send another behind CopyDone; PostgreSQL ignores the
+    /// first and answers the second, so CopyDone gets the tag alone.
     CopyIn {
         rows: u64,
         binary: bool,
+        extended: bool,
     },
     /// After an error in an extended-protocol message. PostgreSQL discards
     /// every message until `Sync`, then sends ONE `ReadyForQuery`; a driver
@@ -186,11 +193,15 @@ impl Conn {
     }
 
     /// Answer a `COPY ... FROM STDIN` and wait for rows.
-    fn enter_copy_in(&mut self, columns: usize, binary: bool, out: &mut Vec<u8>) {
+    fn enter_copy_in(&mut self, columns: usize, binary: bool, extended: bool, out: &mut Vec<u8>) {
         copy_in_response(out, columns, binary);
         self.copy_carry.clear();
         self.copy_header_seen = false;
-        self.phase = Phase::CopyIn { rows: 0, binary };
+        self.phase = Phase::CopyIn {
+            rows: 0,
+            binary,
+            extended,
+        };
     }
 
     /// Back to ordinary statements, with the framing state dropped.
@@ -536,6 +547,15 @@ impl Conn {
             return Some(());
         }
 
+        // A COPY in flight has its own vocabulary, and everything outside it is
+        // a violation rather than a statement to run.
+        if let Phase::CopyIn {
+            binary, extended, ..
+        } = self.phase
+        {
+            return self.copy_message(t, body, binary, extended, out);
+        }
+
         match t {
             tag::TERMINATE => {
                 self.phase = Phase::Closed;
@@ -585,7 +605,7 @@ impl Conn {
                 {
                     match direction {
                         CopyDirection::FromStdin => {
-                            self.enter_copy_in(columns, binary, out);
+                            self.enter_copy_in(columns, binary, false, out);
 
                             return Some(());
                         }
@@ -618,46 +638,6 @@ impl Conn {
                 self.note_transaction(&plan.kind);
 
                 answer(&plan, out, catalog, true, failed);
-                self.ready(out);
-            }
-
-            // In flight: count rows, and end on done or fail.
-            tag::COPY_DATA if matches!(self.phase, Phase::CopyIn { .. }) => {
-                let binary = matches!(self.phase, Phase::CopyIn { binary: true, .. });
-
-                if binary {
-                    self.count_binary_copy_rows(body);
-
-                    if self.is_closed() {
-                        return Some(());
-                    }
-                } else if let Phase::CopyIn { rows, .. } = &mut self.phase {
-                    // One CopyData message is one or more rows of text, newline
-                    // separated. Counting newlines is what PostgreSQL reports and
-                    // is right even when a driver batches many rows per message
-                    // and even when a row straddles two: every newline the client
-                    // sends is counted exactly once, in whichever message carried
-                    // it.
-                    *rows += body.iter().filter(|&&b| b == b'\n').count() as u64;
-                }
-            }
-
-            tag::COPY_DONE if matches!(self.phase, Phase::CopyIn { .. }) => {
-                let rows = match &self.phase {
-                    Phase::CopyIn { rows, .. } => *rows,
-                    _ => 0,
-                };
-                self.leave_copy_in();
-                complete_raw(out, &format!("COPY {rows}"));
-                self.ready(out);
-            }
-
-            tag::COPY_FAIL if matches!(self.phase, Phase::CopyIn { .. }) => {
-                // The client is abandoning its own COPY. That is an error by the
-                // protocol's own definition, and answering it as success would
-                // tell a loader its data landed.
-                self.leave_copy_in();
-                self.error(out, "57014", "COPY from stdin failed");
                 self.ready(out);
             }
 
@@ -820,9 +800,13 @@ impl Conn {
 
                         if let Some((columns, binary)) = streams_rows {
                             let _ = columns;
-                            self.phase = Phase::CopyIn { rows: 0, binary };
                             self.copy_carry.clear();
                             self.copy_header_seen = false;
+                            self.phase = Phase::CopyIn {
+                                rows: 0,
+                                binary,
+                                extended: true,
+                            };
                         }
                     }
                     // Executing a portal that was never bound used to fabricate
@@ -856,6 +840,83 @@ impl Conn {
 
             // Unknown: consumed and ignored, which is what a blackhole is for.
             _ => {}
+        }
+
+        Some(())
+    }
+
+    /// One message while a COPY FROM STDIN is open.
+    ///
+    /// `d`, `c` and `f` are the conversation. `S` and `H` are ignored, as
+    /// PostgreSQL's `CopyGetData` ignores them, because libpq and rust-postgres
+    /// send a Sync behind the Execute that started the COPY without noticing
+    /// that it was one. Anything else is the client talking out of turn, and
+    /// PostgreSQL ends the COPY with a protocol violation rather than running
+    /// it -- a Query executed mid-COPY used to answer rows into a stream the
+    /// client was reading as COPY replies.
+    ///
+    /// How the COPY ends depends on how it began: see `Phase::CopyIn`.
+    fn copy_message(
+        &mut self,
+        t: u8,
+        body: &[u8],
+        binary: bool,
+        extended: bool,
+        out: &mut Vec<u8>,
+    ) -> Option<()> {
+        match t {
+            tag::COPY_DATA => {
+                if binary {
+                    self.count_binary_copy_rows(body);
+                } else if let Phase::CopyIn { rows, .. } = &mut self.phase {
+                    // One CopyData message is one or more rows of text, newline
+                    // separated. Counting newlines is what PostgreSQL reports and
+                    // is right even when a driver batches many rows per message
+                    // and even when a row straddles two: every newline the client
+                    // sends is counted exactly once, in whichever message carried
+                    // it.
+                    *rows += body.iter().filter(|&&b| b == b'\n').count() as u64;
+                }
+            }
+
+            tag::COPY_DONE => {
+                let rows = match &self.phase {
+                    Phase::CopyIn { rows, .. } => *rows,
+                    _ => 0,
+                };
+                self.leave_copy_in();
+                complete_raw(out, &format!("COPY {rows}"));
+
+                // Simple protocol: the statement is over, say so. Extended: the
+                // client's Sync behind CopyDone asks for the byte, later.
+                if !extended {
+                    self.ready(out);
+                }
+            }
+
+            tag::COPY_FAIL => {
+                // The client is abandoning its own COPY. That is an error by the
+                // protocol's own definition, and answering it as success would
+                // tell a loader its data landed.
+                self.leave_copy_in();
+                self.refuse(extended, out, "57014", "COPY from stdin failed");
+            }
+
+            // Sent behind the Execute by drivers that did not notice the
+            // statement was a COPY; PostgreSQL ignores both here.
+            tag::SYNC | tag::FLUSH => {}
+
+            tag::TERMINATE => self.phase = Phase::Closed,
+
+            _ => {
+                self.leave_copy_in();
+                self.refuse(
+                    extended,
+                    out,
+                    "08P01",
+                    "unexpected message type during COPY from stdin",
+                );
+            }
         }
 
         Some(())
@@ -2222,6 +2283,140 @@ mod tests {
         c.advance(&input, &mut out, &v);
         assert_eq!(tags(&out), vec![b'1', b'2', b'C', b'Z'], "ROLLBACK runs");
         assert_eq!(last_ready_status(&out), b'I');
+    }
+
+    /// Parse/Bind/Execute/Sync for a statement, in one packet, the way a
+    /// driver sends them.
+    fn extended(sql: &str) -> Vec<u8> {
+        let mut input = tagged(b'P', |b| {
+            cstr(b, "");
+            cstr(b, sql);
+            b.extend_from_slice(&0i16.to_be_bytes());
+        });
+        input.extend(tagged(b'B', |b| {
+            cstr(b, "");
+            cstr(b, "");
+            b.extend_from_slice(&0i16.to_be_bytes());
+            b.extend_from_slice(&0i16.to_be_bytes());
+            b.extend_from_slice(&0i16.to_be_bytes());
+        }));
+        input.extend(tagged(b'E', |b| {
+            cstr(b, "");
+            b.extend_from_slice(&0i32.to_be_bytes());
+        }));
+        input.extend(tagged(b'S', |_| {}));
+        input
+    }
+
+    /// **A COPY entered through the extended protocol ends at the client's
+    /// Sync, not at CopyDone.** rust-postgres and libpq send Execute+Sync,
+    /// wait for CopyInResponse, stream, then send CopyDone+Sync and expect
+    /// `C, Z`. This codec answered the first Sync mid-COPY and let CopyDone
+    /// send its own ReadyForQuery: `G, Z, C, Z, Z`, and the driver read
+    /// `UnexpectedMessage` twice.
+    #[test]
+    fn an_extended_copy_ends_at_sync() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+
+        c.advance(&extended("COPY t FROM STDIN"), &mut out, &v);
+        assert_eq!(
+            tags(&out),
+            vec![b'1', b'2', b'G'],
+            "the Sync sent with Execute is swallowed while COPY is open"
+        );
+
+        let mut input = tagged(b'd', |b| b.extend_from_slice(b"1\n2\n"));
+        input.extend(tagged(b'c', |_| {}));
+        input.extend(tagged(b'S', |_| {}));
+        out.clear();
+        c.advance(&input, &mut out, &v);
+        assert_eq!(tags(&out), vec![b'C', b'Z'], "one ReadyForQuery, from Sync");
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("COPY 2"), "{text}");
+
+        // And the next query is answered normally: the stream is in sync.
+        out.clear();
+        c.advance(&extended("select 1"), &mut out, &v);
+        assert_eq!(tags(&out), vec![b'1', b'2', b'D', b'C', b'Z']);
+    }
+
+    /// The simple protocol has no Sync, so there CopyDone still ends with
+    /// ReadyForQuery -- and a Flush or Sync a confused client sends during
+    /// either kind is ignored, as PostgreSQL ignores them.
+    #[test]
+    fn a_simple_copy_still_ends_at_copy_done() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+
+        c.advance(
+            &tagged(b'Q', |b| cstr(b, "COPY t FROM STDIN")),
+            &mut out,
+            &v,
+        );
+        assert_eq!(tags(&out), vec![b'G']);
+
+        let mut input = tagged(b'H', |_| {});
+        input.extend(tagged(b'S', |_| {}));
+        input.extend(tagged(b'd', |b| b.extend_from_slice(b"1\n")));
+        input.extend(tagged(b'c', |_| {}));
+        out.clear();
+        c.advance(&input, &mut out, &v);
+        assert_eq!(tags(&out), vec![b'C', b'Z']);
+    }
+
+    /// An ordinary message during COPY is a protocol violation, not a query
+    /// to run. A Query executed mid-COPY answered rows into a stream the
+    /// client was reading as COPY replies.
+    #[test]
+    fn a_query_during_copy_is_refused_not_run() {
+        // Extended: the error skips to Sync.
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        c.advance(&extended("COPY t FROM STDIN"), &mut out, &v);
+
+        let mut input = tagged(b'Q', |b| cstr(b, "select 1"));
+        input.extend(tagged(b'd', |b| b.extend_from_slice(b"late\n")));
+        input.extend(tagged(b'S', |_| {}));
+        out.clear();
+        c.advance(&input, &mut out, &v);
+        assert_eq!(tags(&out), vec![b'E', b'Z'], "no rows, one ready");
+        assert_eq!(first_sqlstate(&out), "08P01");
+
+        // Simple: the error is ready at once, and the COPY is over.
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'Q', |b| cstr(b, "COPY t FROM STDIN")),
+            &mut out,
+            &v,
+        );
+        out.clear();
+        c.advance(&tagged(b'Q', |b| cstr(b, "select 1")), &mut out, &v);
+        assert_eq!(tags(&out), vec![b'E', b'Z']);
+        out.clear();
+        c.advance(&tagged(b'Q', |b| cstr(b, "select 1")), &mut out, &v);
+        assert_eq!(
+            tags(&out),
+            vec![b'T', b'D', b'C', b'Z'],
+            "COPY is no longer open"
+        );
+    }
+
+    /// CopyFail in an extended COPY is an extended error: ErrorResponse, then
+    /// nothing until the client's Sync.
+    #[test]
+    fn copy_fail_in_an_extended_copy_waits_for_sync() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        c.advance(&extended("COPY t FROM STDIN"), &mut out, &v);
+
+        let mut input = tagged(b'f', |b| cstr(b, "gave up"));
+        input.extend(tagged(b'S', |_| {}));
+        out.clear();
+        c.advance(&input, &mut out, &v);
+        assert_eq!(tags(&out), vec![b'E', b'Z']);
+        assert_eq!(first_sqlstate(&out), "57014");
     }
 
     #[test]
