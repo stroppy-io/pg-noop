@@ -653,6 +653,22 @@ impl Conn {
                 // [portal][stmt_name] then parameters we never look at.
                 let (portal, after) = cstr_at(body, 0)?;
                 let (stmt, _) = cstr_at(body, after)?;
+
+                // A statement that was never prepared -- or was closed -- is
+                // not bound to; it is reported. Answering BindComplete here
+                // let a driver with a stale statement cache run against a
+                // statement the server did not have.
+                if !self.statements.contains_key(stmt) {
+                    self.refuse(
+                        true,
+                        out,
+                        "26000",
+                        &format!("prepared statement \"{stmt}\" does not exist"),
+                    );
+
+                    return Some(());
+                }
+
                 // Two String allocations per query if done unconditionally, and
                 // a driver binds the SAME portal to the SAME statement forever.
                 match self.portals.get(portal) {
@@ -668,7 +684,22 @@ impl Conn {
                 // ['S'|'P'][name]
                 let kind = body.first().copied().unwrap_or(b'P');
                 let (name, _) = cstr_at(body, 1)?;
-                let plan = self.plan_for(kind, name);
+
+                let Some(plan) = self.plan_for(kind, name) else {
+                    let (code, what) = if kind == b'S' {
+                        ("26000", "prepared statement")
+                    } else {
+                        ("34000", "portal")
+                    };
+                    self.refuse(
+                        true,
+                        out,
+                        code,
+                        &format!("{what} \"{name}\" does not exist"),
+                    );
+
+                    return Some(());
+                };
 
                 // A described STATEMENT also gets its parameter types, and a
                 // blackhole derives none -- an empty list is the honest answer.
@@ -676,11 +707,7 @@ impl Conn {
                     msg(out, b't', |b| b.extend_from_slice(&0i16.to_be_bytes()));
                 }
 
-                let described = match plan {
-                    Some(p) => row_description(p, catalog, out),
-                    None => false,
-                };
-                if !described {
+                if !row_description(plan, catalog, out) {
                     msg(out, b'n', |_| {});
                 }
             }
@@ -735,7 +762,14 @@ impl Conn {
                             self.copy_header_seen = false;
                         }
                     }
-                    None => complete(out, "SELECT", Some(0)),
+                    // Executing a portal that was never bound used to fabricate
+                    // `SELECT 0`. PostgreSQL reports it, and so does this.
+                    None => self.refuse(
+                        true,
+                        out,
+                        "34000",
+                        &format!("portal \"{portal}\" does not exist"),
+                    ),
                 }
             }
 
@@ -1877,6 +1911,103 @@ mod tests {
         let mut out = Vec::new();
         c.advance(&input, &mut out, &v);
         assert_eq!(tags(&out), vec![b'E', b'Z', b'T', b'D', b'C', b'Z']);
+    }
+
+    /// The SQLSTATE of the first ErrorResponse in a reply, as the five bytes
+    /// after the `C` field tag.
+    fn first_sqlstate(out: &[u8]) -> String {
+        let mut i = 0;
+        while i + 5 <= out.len() {
+            let len = i32::from_be_bytes(out[i + 1..i + 5].try_into().unwrap()) as usize;
+            if out[i] == b'E' {
+                let body = &out[i + 5..i + 1 + len];
+                let at = body.iter().position(|&b| b == b'C').expect("a C field") + 1;
+                return String::from_utf8_lossy(&body[at..at + 5]).into_owned();
+            }
+            i += 1 + len;
+        }
+        panic!("no ErrorResponse in the reply")
+    }
+
+    /// **A name that was never prepared is an error, not an empty answer.**
+    /// Bind to an unknown statement answered BindComplete, Execute of an
+    /// unknown portal fabricated `SELECT 0`, and Describe of either answered as
+    /// if it existed. A driver whose statement cache was invalidated -- or
+    /// that closed the statement itself -- then reads answers for a statement
+    /// the server does not have, and never learns it. PostgreSQL says 26000 for
+    /// a statement and 34000 for a portal, and skips to Sync.
+    #[test]
+    fn bind_to_an_unknown_statement_is_an_error() {
+        let (mut c, v) = connected();
+
+        let mut input = tagged(b'B', |b| {
+            cstr(b, "p1");
+            cstr(b, "never-prepared");
+            b.extend_from_slice(&0i16.to_be_bytes());
+            b.extend_from_slice(&0i16.to_be_bytes());
+            b.extend_from_slice(&0i16.to_be_bytes());
+        });
+        input.extend(tagged(b'E', |b| {
+            cstr(b, "p1");
+            b.extend_from_slice(&0i32.to_be_bytes());
+        }));
+        input.extend(tagged(b'S', |_| {}));
+
+        let mut out = Vec::new();
+        c.advance(&input, &mut out, &v);
+        assert_eq!(tags(&out), vec![b'E', b'Z'], "no BindComplete, no rows");
+        assert_eq!(first_sqlstate(&out), "26000");
+
+        // And the portal was not created by the failed Bind.
+        out.clear();
+        let mut input = tagged(b'E', |b| {
+            cstr(b, "p1");
+            b.extend_from_slice(&0i32.to_be_bytes());
+        });
+        input.extend(tagged(b'S', |_| {}));
+        c.advance(&input, &mut out, &v);
+        assert_eq!(tags(&out), vec![b'E', b'Z']);
+        assert_eq!(first_sqlstate(&out), "34000");
+    }
+
+    #[test]
+    fn describe_of_an_unknown_name_is_an_error() {
+        for (kind, code) in [(b'S', "26000"), (b'P', "34000")] {
+            let (mut c, v) = connected();
+
+            let mut input = tagged(b'D', |b| {
+                b.push(kind);
+                cstr(b, "nope");
+            });
+            input.extend(tagged(b'S', |_| {}));
+
+            let mut out = Vec::new();
+            c.advance(&input, &mut out, &v);
+            assert_eq!(
+                tags(&out),
+                vec![b'E', b'Z'],
+                "Describe {} must not answer ParameterDescription or NoData",
+                kind as char
+            );
+            assert_eq!(first_sqlstate(&out), code);
+        }
+    }
+
+    /// Close of a name that does not exist is NOT an error: PostgreSQL
+    /// answers CloseComplete, and drivers close speculatively.
+    #[test]
+    fn close_of_an_unknown_name_is_not_an_error() {
+        let (mut c, v) = connected();
+
+        let mut input = tagged(b'C', |b| {
+            b.push(b'S');
+            cstr(b, "nope");
+        });
+        input.extend(tagged(b'S', |_| {}));
+
+        let mut out = Vec::new();
+        c.advance(&input, &mut out, &v);
+        assert_eq!(tags(&out), vec![b'3', b'Z']);
     }
 
     #[test]
