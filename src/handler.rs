@@ -646,6 +646,131 @@ fn is_table_constraint_keyword(word: &str) -> bool {
     )
 }
 
+/// The parameter types a Parse declares, completed from the SQL text.
+///
+/// `declared` is the Parse message's list, where 0 means "you decide". For
+/// each `$n` up to the highest one in the text, the declared type wins; an
+/// undeclared one is taken from a `::type` cast directly on the placeholder;
+/// and what is left is reported as unknown (OID 0). PostgreSQL would infer
+/// it from the column it is compared with, which a blackhole cannot; the
+/// alternative, text, was measured to break pgx, which then refuses to
+/// encode a Go integer into a text parameter -- whereas for an unknown OID
+/// it encodes from the Go value's own type. The count is what a driver
+/// checks its arguments against before it binds, so it has to cover every
+/// placeholder.
+///
+/// Text work, done once at Parse.
+pub(crate) fn parameter_types(sql: &str, declared: &[u32]) -> Vec<u32> {
+    let placeholders = highest_placeholder(sql);
+    let n = declared.len().max(placeholders);
+
+    (0..n)
+        .map(|i| match declared.get(i) {
+            Some(&oid) if oid != 0 => oid,
+            _ => cast_on_placeholder(sql, i + 1)
+                .map(|t| map_sql_type(t).oid())
+                .unwrap_or(0),
+        })
+        .collect()
+}
+
+/// The highest `$n` in the text, outside string literals. 0 when there is
+/// none.
+fn highest_placeholder(sql: &str) -> usize {
+    let mut highest = 0;
+
+    for (at, _) in placeholders(sql) {
+        highest = highest.max(at);
+    }
+
+    highest
+}
+
+/// Every `$n` outside string literals: its number and the index after it.
+fn placeholders(sql: &str) -> Vec<(usize, usize)> {
+    let b = sql.as_bytes();
+    let mut found = Vec::new();
+    let mut i = 0;
+
+    while i < b.len() {
+        match b[i] {
+            // A string literal: skip to its close, treating '' as one quote.
+            b'\'' => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\'' {
+                        if b.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'$' if b.get(i + 1).is_some_and(u8::is_ascii_digit) => {
+                let start = i + 1;
+                let mut end = start;
+                while end < b.len() && b[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if let Ok(n) = sql[start..end].parse::<usize>() {
+                    found.push((n, end));
+                }
+                i = end;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    found
+}
+
+/// The type name after `$n::`, if the placeholder is cast directly.
+fn cast_on_placeholder(sql: &str, n: usize) -> Option<&str> {
+    let b = sql.as_bytes();
+
+    for (at, after) in placeholders(sql) {
+        if at != n {
+            continue;
+        }
+
+        let mut i = skip_ws(sql, after);
+        if b.get(i) != Some(&b':') || b.get(i + 1) != Some(&b':') {
+            continue;
+        }
+        i = skip_ws(sql, i + 2);
+
+        // The type name, possibly two words ("double precision", "character
+        // varying"), possibly with a modifier in parentheses.
+        let start = i;
+        let mut end = start;
+        while end < b.len() && is_ident_continue(b[end]) {
+            end += 1;
+        }
+        if end == start {
+            continue;
+        }
+        let second = skip_ws(sql, end);
+        let mut second_end = second;
+        while second_end < b.len() && is_ident_continue(b[second_end]) {
+            second_end += 1;
+        }
+        if second_end > second
+            && (sql[second..second_end].eq_ignore_ascii_case("precision")
+                || sql[second..second_end].eq_ignore_ascii_case("varying"))
+        {
+            end = second_end;
+        }
+
+        return Some(&sql[start..end]);
+    }
+
+    None
+}
+
 fn map_sql_type(type_sql: &str) -> Type {
     let words = type_words(type_sql, 4);
     let first = words.first().map(String::as_str).unwrap_or("");
@@ -664,6 +789,13 @@ fn map_sql_type(type_sql: &str) -> Type {
         "DATE" => Type::DATE,
         "TIMESTAMP" => Type::TIMESTAMP,
         "BOOLEAN" | "BOOL" => Type::BOOL,
+        "REAL" | "FLOAT4" => Type::FLOAT4,
+        "DOUBLE" | "FLOAT8" => Type::FLOAT8,
+        "TIMESTAMPTZ" => Type::TIMESTAMPTZ,
+        "UUID" => Type::UUID,
+        "BYTEA" => Type::BYTEA,
+        "JSON" => Type::JSON,
+        "JSONB" => Type::JSONB,
         _ => Type::TEXT,
     }
 }

@@ -134,11 +134,21 @@ impl TxStatus {
     }
 }
 
+/// A prepared statement: its plan and the parameter types Describe reports.
+struct Statement {
+    plan: PreparedPlan,
+    /// One OID per `$n`, declared by Parse or completed from the text. This
+    /// used to be dropped at Parse and reported as zero, so a driver refused
+    /// to bind any parametrised statement: pgx `expected 0 arguments, got 1`,
+    /// rust-postgres `Parameters(1, 0)`.
+    params: Vec<u32>,
+}
+
 pub struct Conn {
     phase: Phase,
     /// Prepared statements by name. "" is the unnamed statement, which clients
     /// reuse constantly, so it is a normal entry rather than a special case.
-    statements: HashMap<String, PreparedPlan>,
+    statements: HashMap<String, Statement>,
     /// Portal name -> statement name.
     portals: HashMap<String, String>,
     /// Bytes of a binary COPY stream that did not yet form a whole tuple.
@@ -716,7 +726,8 @@ impl Conn {
             tag::PARSE => {
                 // [stmt_name][query][n_params:i16][types...]
                 let (name, after) = cstr_at(body, 0)?;
-                let (sql, _) = cstr_at(body, after)?;
+                let (sql, after) = cstr_at(body, after)?;
+                let declared = oid_list(body, after)?;
                 let plan = PreparedPlan::build(sql);
 
                 if self.failed() && !ends_transaction(&plan.kind) {
@@ -725,7 +736,9 @@ impl Conn {
                     return Some(());
                 }
 
-                self.statements.insert(name.to_string(), plan);
+                let params = crate::handler::parameter_types(sql, &declared);
+                self.statements
+                    .insert(name.to_string(), Statement { plan, params });
                 msg(out, b'1', |_| {});
             }
 
@@ -738,7 +751,7 @@ impl Conn {
                 // not bound to; it is reported. Answering BindComplete here
                 // let a driver with a stale statement cache run against a
                 // statement the server did not have.
-                let Some(plan) = self.statements.get(stmt) else {
+                let Some(Statement { plan, .. }) = self.statements.get(stmt) else {
                     self.refuse(
                         true,
                         out,
@@ -771,7 +784,7 @@ impl Conn {
                 let kind = body.first().copied().unwrap_or(b'P');
                 let (name, _) = cstr_at(body, 1)?;
 
-                let Some(plan) = self.plan_for(kind, name) else {
+                let Some(Statement { plan, params }) = self.described(kind, name) else {
                     let (code, what) = if kind == b'S' {
                         ("26000", "prepared statement")
                     } else {
@@ -801,10 +814,14 @@ impl Conn {
                     return Some(());
                 }
 
-                // A described STATEMENT also gets its parameter types, and a
-                // blackhole derives none -- an empty list is the honest answer.
+                // A described STATEMENT also gets its parameter types.
                 if kind == b'S' {
-                    msg(out, b't', |b| b.extend_from_slice(&0i16.to_be_bytes()));
+                    msg(out, b't', |b| {
+                        b.extend_from_slice(&(params.len() as i16).to_be_bytes());
+                        for oid in params {
+                            b.extend_from_slice(&oid.to_be_bytes());
+                        }
+                    });
                 }
 
                 if !row_description(plan, catalog, out) {
@@ -824,7 +841,7 @@ impl Conn {
                     .and_then(|s| self.statements.get(s))
                 {
                     // Execute does NOT re-send RowDescription; Describe did.
-                    Some(p) => {
+                    Some(Statement { plan: p, .. }) => {
                         let failed = self.failed();
                         if failed && !ends_transaction(&p.kind) {
                             self.refuse(true, out, "25P02", ABORTED);
@@ -1018,7 +1035,8 @@ impl Conn {
         Some(())
     }
 
-    fn plan_for(&self, kind: u8, name: &str) -> Option<&PreparedPlan> {
+    /// The statement a Describe names, directly or through a portal.
+    fn described(&self, kind: u8, name: &str) -> Option<&Statement> {
         if kind == b'S' {
             self.statements.get(name)
         } else {
@@ -1274,6 +1292,20 @@ fn ddl_tag(sql: &str) -> &'static str {
 
 fn cstr_read(body: &[u8]) -> Option<&str> {
     cstr_at(body, 0).map(|(s, _)| s)
+}
+
+/// An int16 count at `from` followed by that many int32 OIDs, as Parse
+/// declares its parameter types. A count that outruns the body is malformed.
+fn oid_list(body: &[u8], from: usize) -> Option<Vec<u32>> {
+    let n = i16::from_be_bytes(body.get(from..from + 2)?.try_into().ok()?);
+    let n = usize::try_from(n).ok()?;
+    let bytes = body.get(from + 2..from + 2 + 4 * n)?;
+
+    Some(
+        (0..n)
+            .map(|i| u32::from_be_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()))
+            .collect(),
+    )
 }
 
 /// The NUL-terminated string starting at `from`, and the index after its NUL.
@@ -2686,6 +2718,109 @@ mod tests {
         let (_, out) = binary_copy(&[&stream]);
         let text = String::from_utf8_lossy(&out);
         assert!(text.contains("COPY 1"), "{text}");
+    }
+
+    /// The parameter OIDs of the first ParameterDescription in a reply.
+    fn parameter_description(out: &[u8]) -> Vec<u32> {
+        let mut i = 0;
+        while i + 5 <= out.len() {
+            let len = i32::from_be_bytes(out[i + 1..i + 5].try_into().unwrap()) as usize;
+            if out[i] == b't' {
+                let body = &out[i + 5..i + 1 + len];
+                let n = i16::from_be_bytes([body[0], body[1]]) as usize;
+                return (0..n)
+                    .map(|k| u32::from_be_bytes(body[2 + 4 * k..6 + 4 * k].try_into().unwrap()))
+                    .collect();
+            }
+            i += 1 + len;
+        }
+        panic!("no ParameterDescription in the reply")
+    }
+
+    /// Parse with declared parameter types, Describe the statement, Sync.
+    fn parse_and_describe(c: &mut Conn, v: &CatalogView, sql: &str, oids: &[u32]) -> Vec<u8> {
+        let mut input = tagged(b'P', |b| {
+            cstr(b, "s");
+            cstr(b, sql);
+            b.extend_from_slice(&(oids.len() as i16).to_be_bytes());
+            for oid in oids {
+                b.extend_from_slice(&oid.to_be_bytes());
+            }
+        });
+        input.extend(tagged(b'D', |b| {
+            b.push(b'S');
+            cstr(b, "s");
+        }));
+        input.extend(tagged(b'S', |_| {}));
+
+        let mut out = Vec::new();
+        c.advance(&input, &mut out, v);
+        out
+    }
+
+    /// **ParameterDescription reports the statement's parameters.** It
+    /// reported zero, always: Parse read the statement name and the SQL and
+    /// dropped the declared types on the floor. A driver checks the count
+    /// against its arguments before it binds -- pgx: `expected 0 arguments,
+    /// got 1`; rust-postgres: `Parameters(1, 0)` -- so no parametrised
+    /// statement could be executed at all.
+    #[test]
+    fn declared_parameter_types_are_reported() {
+        let (mut c, v) = connected();
+        let out = parse_and_describe(&mut c, &v, "select $1", &[20]);
+        assert_eq!(parameter_description(&out), vec![20]);
+
+        let out = parse_and_describe(&mut c, &v, "select $1, $2", &[20, 25]);
+        assert_eq!(parameter_description(&out), vec![20, 25]);
+    }
+
+    /// An undeclared parameter with a cast takes the cast's type; without
+    /// one it is reported as unknown (OID 0). Text was tried first and
+    /// measured to break pgx, which refuses to encode a Go integer into a
+    /// text parameter; given an unknown OID it encodes from the value's own
+    /// type, so `UPDATE t SET v = $1 WHERE id = $2` with two int64 arguments
+    /// -- the case in issue #1 -- goes through.
+    #[test]
+    fn undeclared_parameters_are_inferred_from_casts_or_reported_unknown() {
+        let (mut c, v) = connected();
+
+        let out = parse_and_describe(&mut c, &v, "select $1::bigint", &[]);
+        assert_eq!(parameter_description(&out), vec![20]);
+
+        let out = parse_and_describe(&mut c, &v, "UPDATE t SET v = $1 WHERE id = $2", &[]);
+        assert_eq!(parameter_description(&out), vec![0, 0]);
+
+        // A declared 0 means "infer", and a declared type beats a cast.
+        let out = parse_and_describe(&mut c, &v, "select $1::int4, $2::int4", &[0, 20]);
+        assert_eq!(parameter_description(&out), vec![23, 20]);
+
+        // Placeholders are counted by the highest number, not by occurrences,
+        // and a `$1` inside a string literal is not a placeholder.
+        let out = parse_and_describe(&mut c, &v, "select $2, $2, '$3'", &[]);
+        assert_eq!(parameter_description(&out), vec![0, 0]);
+
+        // No parameters is still no parameters.
+        let out = parse_and_describe(&mut c, &v, "select 1", &[]);
+        assert_eq!(parameter_description(&out), Vec::<u32>::new());
+    }
+
+    /// A Parse whose declared count outruns its body is malformed, not
+    /// "zero parameters".
+    #[test]
+    fn a_parse_with_a_truncated_type_list_is_malformed() {
+        let (mut c, v) = connected();
+        let mut input = tagged(b'P', |b| {
+            cstr(b, "s");
+            cstr(b, "select $1");
+            b.extend_from_slice(&3i16.to_be_bytes());
+            b.extend_from_slice(&20u32.to_be_bytes());
+        });
+        input.extend(tagged(b'S', |_| {}));
+
+        let mut out = Vec::new();
+        c.advance(&input, &mut out, &v);
+        assert_eq!(tags(&out), vec![b'E', b'Z']);
+        assert_eq!(first_sqlstate(&out), "08P01");
     }
 
     #[test]
