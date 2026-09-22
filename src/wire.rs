@@ -67,9 +67,12 @@ const ABORTED: &str =
     "current transaction is aborted, commands ignored until end of transaction block";
 
 /// The statements PostgreSQL still accepts in a failed transaction: the ones
-/// that end it.
+/// that end it, and the empty one, which has nothing in it to refuse.
 fn ends_transaction(kind: &PlanKind) -> bool {
-    matches!(kind, PlanKind::Commit | PlanKind::Rollback)
+    matches!(
+        kind,
+        PlanKind::Commit | PlanKind::Rollback | PlanKind::Empty
+    )
 }
 
 /// Where a connection is in its life. The startup exchange is unframed and has
@@ -1239,6 +1242,8 @@ fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Ru
             }
             CopyDirection::FromFile => complete(out, "COPY", Some(0)),
         },
+        // PostgreSQL's answer to nothing: `I`, in place of CommandComplete.
+        PlanKind::Empty => msg(out, b'I', |_| {}),
         PlanKind::FromText => complete(out, "SELECT", Some(0)),
     }
 
@@ -3468,6 +3473,45 @@ mod tests {
         c.advance(&input, &mut out, &v);
         assert_eq!(tags(&out), vec![b'E', b'Z']);
         assert_eq!(first_sqlstate(&out), "08P01");
+    }
+
+    /// **An empty query is EmptyQueryResponse, not `SELECT 0`.** `""`, `";"`
+    /// and whitespace around a semicolon are all the empty statement, and
+    /// PostgreSQL answers `I` for it; this classified it as unknown text and
+    /// answered CommandComplete for a SELECT that was never written.
+    #[test]
+    fn an_empty_query_is_an_empty_query_response() {
+        for sql in ["", ";", " ; ", "\n;;\t"] {
+            let (mut c, v) = connected();
+            let mut out = Vec::new();
+            c.advance(&tagged(b'Q', |b| cstr(b, sql)), &mut out, &v);
+            assert_eq!(tags(&out), vec![b'I', b'Z'], "{sql:?}");
+        }
+    }
+
+    /// The same through the extended protocol: Describe says NoData, and
+    /// Execute answers EmptyQueryResponse in place of CommandComplete.
+    #[test]
+    fn an_empty_prepared_statement_executes_to_an_empty_query_response() {
+        let (mut c, v) = connected();
+        let out = parse_and_describe(&mut c, &v, "", &[]);
+        assert_eq!(tags(&out), vec![b'1', b't', b'n', b'Z']);
+
+        let out = query_with_formats(&mut c, &v, ";", &[]);
+        assert_eq!(tags(&out), vec![b'1', b'2', b'n', b'I', b'Z']);
+    }
+
+    /// An empty query is allowed in a failed transaction -- there is nothing
+    /// in it to refuse -- and leaves the state as it found it.
+    #[test]
+    fn an_empty_query_is_allowed_in_a_failed_transaction() {
+        let (mut c, v) = connected();
+        failed(&mut c, &v);
+
+        let mut out = Vec::new();
+        c.advance(&tagged(b'Q', |b| cstr(b, "")), &mut out, &v);
+        assert_eq!(tags(&out), vec![b'I', b'Z']);
+        assert_eq!(last_ready_status(&out), b'E');
     }
 
     #[test]

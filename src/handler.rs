@@ -1252,6 +1252,10 @@ pub enum PlanKind {
         /// is what decides how they are counted.
         binary: bool,
     },
+    /// Nothing at all: `""`, `";"`, or whitespace and semicolons. PostgreSQL
+    /// answers EmptyQueryResponse, and a client that sends one -- some do, as
+    /// a liveness probe -- reads that byte and not a CommandComplete.
+    Empty,
     /// Anything unrecognised: decided from the text as before. Rare, and not on
     /// any benchmark's hot path.
     FromText,
@@ -1298,6 +1302,8 @@ impl PreparedPlan {
                 columns: count_copy_columns(sql),
                 binary: copy_is_binary(sql),
             }
+        } else if sql.bytes().all(|b| b.is_ascii_whitespace() || b == b';') {
+            PlanKind::Empty
         } else {
             PlanKind::FromText
         };
@@ -1406,7 +1412,7 @@ fn respond_to_plan(handler: &NoopHandler, plan: &PreparedPlan) -> Response {
             )),
             CopyDirection::FromFile => Response::Execution(Tag::new("COPY").with_rows(0)),
         },
-        PlanKind::FromText => classify_extended(handler, &plan.sql),
+        PlanKind::Empty | PlanKind::FromText => classify_extended(handler, &plan.sql),
     }
 }
 
