@@ -144,13 +144,50 @@ struct Statement {
     params: Vec<u32>,
 }
 
+/// The result formats a Bind asked for: none (text), one for every column,
+/// or one per column. Collapsed at Bind so that the two shapes every driver
+/// sends -- nothing, or the same code for every column -- allocate nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Formats {
+    All(i16),
+    PerColumn(Vec<i16>),
+}
+
+impl Formats {
+    const TEXT: Formats = Formats::All(0);
+
+    fn from_codes(codes: &[i16]) -> Formats {
+        match codes {
+            [] => Formats::TEXT,
+            [one] => Formats::All(*one),
+            [first, rest @ ..] if rest.iter().all(|c| c == first) => Formats::All(*first),
+            _ => Formats::PerColumn(codes.to_vec()),
+        }
+    }
+
+    /// The format of column `i`. Past the end of a per-column list is text,
+    /// which is where PostgreSQL's `pq_getmsgint` would have read zero.
+    fn get(&self, i: usize) -> i16 {
+        match self {
+            Formats::All(code) => *code,
+            Formats::PerColumn(codes) => codes.get(i).copied().unwrap_or(0),
+        }
+    }
+}
+
+/// A portal: a bound statement and the result formats the Bind asked for.
+struct Portal {
+    statement: String,
+    formats: Formats,
+}
+
 pub struct Conn {
     phase: Phase,
     /// Prepared statements by name. "" is the unnamed statement, which clients
     /// reuse constantly, so it is a normal entry rather than a special case.
     statements: HashMap<String, Statement>,
-    /// Portal name -> statement name.
-    portals: HashMap<String, String>,
+    /// Portals by name. "" is the unnamed portal, rebound by every query.
+    portals: HashMap<String, Portal>,
     /// Bytes of a binary COPY stream that did not yet form a whole tuple.
     ///
     /// A `CopyData` message is a slice of the stream, not a row: pgx fills a
@@ -711,7 +748,7 @@ impl Conn {
                 let failed = self.failed();
                 self.note_transaction(&plan.kind);
 
-                answer(&plan, out, catalog, true, failed);
+                answer(&plan, out, catalog, true, failed, &Formats::TEXT);
                 self.ready(out);
             }
 
@@ -743,15 +780,18 @@ impl Conn {
             }
 
             tag::BIND => {
-                // [portal][stmt_name] then parameters we never look at.
+                // [portal][stmt][n_pfmt][pfmt..][n_params][(len, bytes)..]
+                // [n_rfmt][rfmt..]. The values are never looked at; the
+                // counts and the result formats are.
                 let (portal, after) = cstr_at(body, 0)?;
-                let (stmt, _) = cstr_at(body, after)?;
+                let (stmt, after) = cstr_at(body, after)?;
+                let bind = bind_tail(body, after)?;
 
                 // A statement that was never prepared -- or was closed -- is
                 // not bound to; it is reported. Answering BindComplete here
                 // let a driver with a stale statement cache run against a
                 // statement the server did not have.
-                let Some(Statement { plan, .. }) = self.statements.get(stmt) else {
+                let Some(Statement { plan, params }) = self.statements.get(stmt) else {
                     self.refuse(
                         true,
                         out,
@@ -768,12 +808,54 @@ impl Conn {
                     return Some(());
                 }
 
+                // The counts PostgreSQL checks, with its SQLSTATE and wording.
+                if bind.params != params.len() {
+                    let want = params.len();
+                    self.refuse(
+                        true,
+                        out,
+                        "08P01",
+                        &format!(
+                            "bind message supplies {} parameters, but prepared statement \"{stmt}\" requires {want}",
+                            bind.params
+                        ),
+                    );
+
+                    return Some(());
+                }
+
+                if let Some(mismatch) = bind.format_mismatch {
+                    self.refuse(
+                        true,
+                        out,
+                        "08P01",
+                        &format!(
+                            "bind message has {mismatch} parameter formats but {} parameters",
+                            bind.params
+                        ),
+                    );
+
+                    return Some(());
+                }
+
                 // Two String allocations per query if done unconditionally, and
                 // a driver binds the SAME portal to the SAME statement forever.
-                match self.portals.get(portal) {
-                    Some(cur) if cur == stmt => {}
-                    _ => {
-                        self.portals.insert(portal.to_string(), stmt.to_string());
+                // The formats are replaced in place: for every driver's usual
+                // shapes that is a copy of an enum, not an allocation.
+                match self.portals.get_mut(portal) {
+                    Some(cur) if cur.statement == stmt => cur.formats = bind.formats,
+                    Some(cur) => {
+                        cur.statement = stmt.to_string();
+                        cur.formats = bind.formats;
+                    }
+                    None => {
+                        self.portals.insert(
+                            portal.to_string(),
+                            Portal {
+                                statement: stmt.to_string(),
+                                formats: bind.formats,
+                            },
+                        );
                     }
                 }
                 msg(out, b'2', |_| {});
@@ -784,7 +866,7 @@ impl Conn {
                 let kind = body.first().copied().unwrap_or(b'P');
                 let (name, _) = cstr_at(body, 1)?;
 
-                let Some(Statement { plan, params }) = self.described(kind, name) else {
+                let Some((Statement { plan, params }, formats)) = self.described(kind, name) else {
                     let (code, what) = if kind == b'S' {
                         ("26000", "prepared statement")
                     } else {
@@ -824,7 +906,7 @@ impl Conn {
                     });
                 }
 
-                if !row_description(plan, catalog, out) {
+                if !row_description(plan, catalog, formats, out) {
                     msg(out, b'n', |_| {});
                 }
             }
@@ -838,10 +920,10 @@ impl Conn {
                 match self
                     .portals
                     .get(portal)
-                    .and_then(|s| self.statements.get(s))
+                    .and_then(|p| self.statements.get(&p.statement).map(|s| (s, &p.formats)))
                 {
                     // Execute does NOT re-send RowDescription; Describe did.
-                    Some(Statement { plan: p, .. }) => {
+                    Some((Statement { plan: p, .. }, formats)) => {
                         let failed = self.failed();
                         if failed && !ends_transaction(&p.kind) {
                             self.refuse(true, out, "25P02", ABORTED);
@@ -872,7 +954,7 @@ impl Conn {
                             PlanKind::Begin | PlanKind::Commit | PlanKind::Rollback
                         );
 
-                        answer(p, out, catalog, false, failed);
+                        answer(p, out, catalog, false, failed, formats);
 
                         if touched_tx {
                             let kind = p.kind.clone();
@@ -1035,12 +1117,16 @@ impl Conn {
         Some(())
     }
 
-    /// The statement a Describe names, directly or through a portal.
-    fn described(&self, kind: u8, name: &str) -> Option<&Statement> {
+    /// The statement a Describe names, directly or through a portal, and the
+    /// result formats to describe it in. A statement has no portal and so no
+    /// formats: PostgreSQL reports text there, whatever a later Bind asks.
+    fn described(&self, kind: u8, name: &str) -> Option<(&Statement, &Formats)> {
         if kind == b'S' {
-            self.statements.get(name)
+            self.statements.get(name).map(|s| (s, &Formats::TEXT))
         } else {
-            self.portals.get(name).and_then(|s| self.statements.get(s))
+            self.portals
+                .get(name)
+                .and_then(|p| self.statements.get(&p.statement).map(|s| (s, &p.formats)))
         }
     }
 }
@@ -1053,24 +1139,28 @@ impl Conn {
 /// COMMIT reads it: committing a failed transaction rolls it back, and
 /// PostgreSQL's tag says `ROLLBACK` so the client can see that its COMMIT
 /// committed nothing.
+///
+/// `formats` is what the portal's Bind asked the rows to be encoded in. The
+/// simple protocol has no Bind and is always text.
 fn answer(
     plan: &PreparedPlan,
     out: &mut Vec<u8>,
     catalog: &CatalogView,
     describe: bool,
     failed: bool,
+    formats: &Formats,
 ) {
     match &plan.kind {
         PlanKind::SelectMeta { .. } | PlanKind::SelectStub { .. } => {
-            let cols = plan_columns(plan, catalog);
+            let cols = resolve_columns(plan, catalog);
             if describe {
-                row_description(plan, catalog, out);
+                row_description_of(&cols, formats, out);
             }
             // A metadata select answers empty; a stub select answers one row.
-            let rows = if matches!(plan.kind, PlanKind::SelectMeta { .. }) && cols.resolved {
+            let rows = if matches!(plan.kind, PlanKind::SelectMeta { .. }) && cols.resolved() {
                 0
             } else {
-                data_row(out, cols.count);
+                data_row(out, &cols, formats);
                 1
             };
             complete(out, "SELECT", Some(rows));
@@ -1201,83 +1291,146 @@ fn error_response(out: &mut Vec<u8>, code: &str, message: &str) {
     });
 }
 
-/// One DataRow of `n` int8 columns, every value the text "1".
-fn data_row(out: &mut Vec<u8>, n: usize) {
+/// One DataRow, every value a `1`, encoded per column in the format the
+/// portal asked for.
+///
+/// Text is the one byte `1` whatever the type. Binary is the type's own wire
+/// form -- eight bytes for an int8, four for an int4, one for a bool -- which
+/// is what a driver that read the RowDescription will decode. The row used to
+/// be text regardless of what Bind asked: pgx, which asks for binary int8 by
+/// default, then failed with `invalid length for int8: 1`.
+fn data_row(out: &mut Vec<u8>, cols: &Columns, formats: &Formats) {
     msg(out, b'D', |b| {
-        b.extend_from_slice(&(n as i16).to_be_bytes());
-        for _ in 0..n {
-            b.extend_from_slice(&1i32.to_be_bytes());
-            b.push(b'1');
+        b.extend_from_slice(&(cols.len() as i16).to_be_bytes());
+        for i in 0..cols.len() {
+            if formats.get(i) == 1 {
+                binary_one(b, cols.oid(i));
+            } else {
+                b.extend_from_slice(&1i32.to_be_bytes());
+                b.push(b'1');
+            }
         }
     });
 }
 
-struct Columns {
-    count: usize,
-    resolved: bool,
-}
+/// The value 1 in the binary send format of the type `oid`, with its length.
+fn binary_one(b: &mut Vec<u8>, oid: u32) {
+    fn field(b: &mut Vec<u8>, bytes: &[u8]) {
+        b.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+        b.extend_from_slice(bytes);
+    }
 
-fn plan_columns(plan: &PreparedPlan, catalog: &CatalogView) -> Columns {
-    match &plan.kind {
-        PlanKind::SelectMeta { table, columns } => match catalog.columns_for(table, columns) {
-            Some(names) => Columns {
-                count: names.len(),
-                resolved: true,
-            },
-            None => Columns {
-                count: columns.len().max(1),
-                resolved: false,
-            },
-        },
-        PlanKind::SelectStub { columns } => Columns {
-            count: *columns,
-            resolved: false,
-        },
-        _ => Columns {
-            count: 0,
-            resolved: false,
-        },
+    match oid {
+        // bool
+        16 => field(b, &[1]),
+        // int2, int4, int8
+        21 => field(b, &1i16.to_be_bytes()),
+        23 => field(b, &1i32.to_be_bytes()),
+        20 => field(b, &1i64.to_be_bytes()),
+        // float4, float8
+        700 => field(b, &1f32.to_be_bytes()),
+        701 => field(b, &1f64.to_be_bytes()),
+        // numeric: one base-10000 digit, weight 0, positive, scale 0, digit 1.
+        1700 => field(b, &[0, 1, 0, 0, 0, 0, 0, 0, 0, 1]),
+        // date: days since 2000-01-01. timestamp, timestamptz: microseconds
+        // since then. Zero is a valid value of each; "1" would not be.
+        1082 => field(b, &0i32.to_be_bytes()),
+        1114 | 1184 => field(b, &0i64.to_be_bytes()),
+        // text, varchar, bpchar, bytea, json and anything else whose binary
+        // form is its bytes.
+        _ => field(b, b"1"),
     }
 }
 
-/// RowDescription, using the client's own column names when the catalog knows
-/// the table -- a driver that created a table and selects from it gets its names
-/// back, which is the one piece of real behaviour this server has.
-fn row_description(plan: &PreparedPlan, catalog: &CatalogView, out: &mut Vec<u8>) -> bool {
-    // Resolved names only when the catalog knows the table; otherwise n stub
-    // columns, named from a &'static str rather than n freshly allocated
-    // Strings.
-    let resolved = match &plan.kind {
-        PlanKind::SelectMeta { table, columns } => catalog
-            .columns_for(table, columns)
-            .or_else(|| Some(stub_cols(columns.len().max(1)))),
-        PlanKind::SelectStub { columns } => Some(stub_cols(*columns)),
-        _ => return false,
-    };
+/// The columns a SELECT answers with: the catalog's, when it knows the table,
+/// or `n` stubs. Resolved once per answer and used for both the
+/// RowDescription and the DataRow, so the two cannot disagree.
+enum Columns {
+    /// `?column?` int8, `n` times, from a `&'static str` rather than n freshly
+    /// allocated Strings.
+    Stub(usize),
+    Known(Vec<(String, u32)>),
+}
 
-    let Some(cols) = resolved else { return false };
-
-    msg(out, b'T', |b| {
-        b.extend_from_slice(&(cols.len() as i16).to_be_bytes());
-        for (name, oid) in cols.iter() {
-            cstr(b, name);
-            b.extend_from_slice(&0i32.to_be_bytes()); // table oid
-            b.extend_from_slice(&0i16.to_be_bytes()); // column no
-            b.extend_from_slice(&oid.to_be_bytes()); // type oid
-            b.extend_from_slice(&(-1i16).to_be_bytes()); // type size
-            b.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
-            b.extend_from_slice(&0i16.to_be_bytes()); // text format
+impl Columns {
+    fn len(&self) -> usize {
+        match self {
+            Columns::Stub(n) => *n,
+            Columns::Known(cols) => cols.len(),
         }
-    });
+    }
+
+    fn resolved(&self) -> bool {
+        matches!(self, Columns::Known(_))
+    }
+
+    fn name(&self, i: usize) -> &str {
+        match self {
+            Columns::Stub(_) => STUB_COL,
+            Columns::Known(cols) => &cols[i].0,
+        }
+    }
+
+    fn oid(&self, i: usize) -> u32 {
+        match self {
+            Columns::Stub(_) => 20,
+            Columns::Known(cols) => cols[i].1,
+        }
+    }
+}
+
+fn resolve_columns(plan: &PreparedPlan, catalog: &CatalogView) -> Columns {
+    match &plan.kind {
+        PlanKind::SelectMeta { table, columns } => match catalog.columns_for(table, columns) {
+            Some(names) => Columns::Known(names),
+            None => Columns::Stub(columns.len().max(1)),
+        },
+        PlanKind::SelectStub { columns } => Columns::Stub(*columns),
+        _ => Columns::Stub(0),
+    }
+}
+
+/// RowDescription for a plan that returns rows, or false for one that does
+/// not. Uses the client's own column names when the catalog knows the table --
+/// a driver that created a table and selects from it gets its names back,
+/// which is the one piece of real behaviour this server has.
+fn row_description(
+    plan: &PreparedPlan,
+    catalog: &CatalogView,
+    formats: &Formats,
+    out: &mut Vec<u8>,
+) -> bool {
+    if !matches!(
+        plan.kind,
+        PlanKind::SelectMeta { .. } | PlanKind::SelectStub { .. }
+    ) {
+        return false;
+    }
+
+    row_description_of(&resolve_columns(plan, catalog), formats, out);
 
     true
 }
 
-const STUB_COL: &str = "?column?";
-
-fn stub_cols(n: usize) -> Vec<(String, u32)> {
-    (0..n).map(|_| (STUB_COL.to_string(), 20u32)).collect()
+/// RowDescription: each column's name, type, and the format code the portal
+/// asked for. The format codes are the client's own request read back, and a
+/// driver that asked for binary decodes what follows as binary.
+fn row_description_of(cols: &Columns, formats: &Formats, out: &mut Vec<u8>) {
+    msg(out, b'T', |b| {
+        b.extend_from_slice(&(cols.len() as i16).to_be_bytes());
+        for i in 0..cols.len() {
+            cstr(b, cols.name(i));
+            b.extend_from_slice(&0i32.to_be_bytes()); // table oid
+            b.extend_from_slice(&0i16.to_be_bytes()); // column no
+            b.extend_from_slice(&cols.oid(i).to_be_bytes()); // type oid
+            b.extend_from_slice(&(-1i16).to_be_bytes()); // type size
+            b.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
+            b.extend_from_slice(&formats.get(i).to_be_bytes());
+        }
+    });
 }
+
+const STUB_COL: &str = "?column?";
 
 fn ddl_tag(sql: &str) -> &'static str {
     let head = sql.trim_start();
@@ -1306,6 +1459,85 @@ fn oid_list(body: &[u8], from: usize) -> Option<Vec<u32>> {
             .map(|i| u32::from_be_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()))
             .collect(),
     )
+}
+
+/// What a Bind says after its two names.
+struct BindTail {
+    /// How many parameter values it carries.
+    params: usize,
+    /// The parameter-format count, when it is not 0, 1 or `params`.
+    format_mismatch: Option<usize>,
+    /// The result formats it asks for.
+    formats: Formats,
+}
+
+/// Decode the rest of a Bind: parameter formats, parameter values, result
+/// formats. `None` is a body that ends before its own counts do, or a format
+/// code that is neither text nor binary -- malformed, not "no formats".
+fn bind_tail(body: &[u8], from: usize) -> Option<BindTail> {
+    fn i16_at(body: &[u8], at: usize) -> Option<i16> {
+        Some(i16::from_be_bytes(body.get(at..at + 2)?.try_into().ok()?))
+    }
+
+    let mut at = from;
+
+    let n_pformats = usize::try_from(i16_at(body, at)?).ok()?;
+    at += 2;
+    for _ in 0..n_pformats {
+        if !matches!(i16_at(body, at)?, 0 | 1) {
+            return None;
+        }
+        at += 2;
+    }
+
+    let params = usize::try_from(i16_at(body, at)?).ok()?;
+    at += 2;
+    for _ in 0..params {
+        let len = i32::from_be_bytes(body.get(at..at + 4)?.try_into().ok()?);
+        at += 4;
+        if len >= 0 {
+            at += len as usize;
+            body.get(..at)?;
+        }
+    }
+
+    let n_rformats = usize::try_from(i16_at(body, at)?).ok()?;
+    at += 2;
+    let mut codes = [0i16; 64];
+    let mut spilled = Vec::new();
+    for i in 0..n_rformats {
+        let code = i16_at(body, at)?;
+        if !matches!(code, 0 | 1) {
+            return None;
+        }
+        at += 2;
+        if i < codes.len() {
+            codes[i] = code;
+        } else {
+            if spilled.is_empty() {
+                spilled.extend_from_slice(&codes);
+            }
+            spilled.push(code);
+        }
+    }
+
+    if at != body.len() {
+        return None;
+    }
+
+    let formats = if spilled.is_empty() {
+        Formats::from_codes(&codes[..n_rformats])
+    } else {
+        Formats::from_codes(&spilled)
+    };
+
+    let format_mismatch = (n_pformats > 1 && n_pformats != params).then_some(n_pformats);
+
+    Some(BindTail {
+        params,
+        format_mismatch,
+        formats,
+    })
 }
 
 /// The NUL-terminated string starting at `from`, and the index after its NUL.
@@ -2819,6 +3051,256 @@ mod tests {
 
         let mut out = Vec::new();
         c.advance(&input, &mut out, &v);
+        assert_eq!(tags(&out), vec![b'E', b'Z']);
+        assert_eq!(first_sqlstate(&out), "08P01");
+    }
+
+    /// The body of the first message tagged `want` in a reply.
+    fn first_body(out: &[u8], want: u8) -> Option<&[u8]> {
+        let mut i = 0;
+        while i + 5 <= out.len() {
+            let len = i32::from_be_bytes(out[i + 1..i + 5].try_into().unwrap()) as usize;
+            if out[i] == want {
+                return Some(&out[i + 5..i + 1 + len]);
+            }
+            i += 1 + len;
+        }
+        None
+    }
+
+    /// The format code of each column in the first RowDescription.
+    fn row_description_formats(out: &[u8]) -> Vec<i16> {
+        let body = first_body(out, b'T').expect("a RowDescription");
+        let n = i16::from_be_bytes([body[0], body[1]]) as usize;
+        let mut at = 2;
+        let mut formats = Vec::new();
+        for _ in 0..n {
+            let end = body[at..].iter().position(|&b| b == 0).unwrap();
+            at += end + 1 + 4 + 2 + 4 + 2 + 4;
+            formats.push(i16::from_be_bytes([body[at], body[at + 1]]));
+            at += 2;
+        }
+        formats
+    }
+
+    /// Each field of the first DataRow, `None` for NULL.
+    fn data_row_fields(out: &[u8]) -> Vec<Option<Vec<u8>>> {
+        let body = first_body(out, b'D').expect("a DataRow");
+        let n = i16::from_be_bytes([body[0], body[1]]) as usize;
+        let mut at = 2;
+        let mut fields = Vec::new();
+        for _ in 0..n {
+            let len = i32::from_be_bytes(body[at..at + 4].try_into().unwrap());
+            at += 4;
+            if len < 0 {
+                fields.push(None);
+            } else {
+                fields.push(Some(body[at..at + len as usize].to_vec()));
+                at += len as usize;
+            }
+        }
+        fields
+    }
+
+    /// Parse `sql`, Bind with the given result formats, Describe the portal,
+    /// Execute, Sync -- the shape pgx and rust-postgres send for a query.
+    fn query_with_formats(c: &mut Conn, v: &CatalogView, sql: &str, formats: &[i16]) -> Vec<u8> {
+        let mut input = tagged(b'P', |b| {
+            cstr(b, "");
+            cstr(b, sql);
+            b.extend_from_slice(&0i16.to_be_bytes());
+        });
+        input.extend(tagged(b'B', |b| {
+            cstr(b, "");
+            cstr(b, "");
+            b.extend_from_slice(&0i16.to_be_bytes()); // parameter formats
+            b.extend_from_slice(&0i16.to_be_bytes()); // parameters
+            b.extend_from_slice(&(formats.len() as i16).to_be_bytes());
+            for f in formats {
+                b.extend_from_slice(&f.to_be_bytes());
+            }
+        }));
+        input.extend(tagged(b'D', |b| {
+            b.push(b'P');
+            cstr(b, "");
+        }));
+        input.extend(tagged(b'E', |b| {
+            cstr(b, "");
+            b.extend_from_slice(&0i32.to_be_bytes());
+        }));
+        input.extend(tagged(b'S', |_| {}));
+
+        let mut out = Vec::new();
+        c.advance(&input, &mut out, v);
+        assert_eq!(tags(&out).last(), Some(&b'Z'), "{sql}: {:?}", tags(&out));
+        out
+    }
+
+    /// **The result format a client asks for is the one it gets.** Bind read
+    /// two names and ignored the rest, so a portal bound with result format 1
+    /// was described as text and answered with the one ASCII byte `1`.
+    /// rust-postgres decoded that as a binary INT8 and failed with
+    /// `UnexpectedEof`; pgx, which asks for binary int8 by default, failed
+    /// with `invalid length for int8: 1`. This is the second half of issue #1.
+    #[test]
+    fn a_binary_result_format_is_honoured() {
+        let (mut c, v) = connected();
+        let out = query_with_formats(&mut c, &v, "select 1", &[1]);
+
+        assert_eq!(row_description_formats(&out), vec![1]);
+        assert_eq!(
+            data_row_fields(&out),
+            vec![Some(1i64.to_be_bytes().to_vec())],
+            "a binary int8 is eight bytes"
+        );
+
+        // Text is still text.
+        let out = query_with_formats(&mut c, &v, "select 1", &[0]);
+        assert_eq!(row_description_formats(&out), vec![0]);
+        assert_eq!(data_row_fields(&out), vec![Some(b"1".to_vec())]);
+
+        // And no formats at all means text, as the protocol says.
+        let out = query_with_formats(&mut c, &v, "select 1", &[]);
+        assert_eq!(data_row_fields(&out), vec![Some(b"1".to_vec())]);
+    }
+
+    /// A single format code applies to every column; a list is per column.
+    #[test]
+    fn one_result_format_applies_to_every_column() {
+        let (mut c, v) = connected();
+
+        let out = query_with_formats(&mut c, &v, "select 1, 2, 3", &[1]);
+        assert_eq!(row_description_formats(&out), vec![1, 1, 1]);
+        assert!(data_row_fields(&out)
+            .iter()
+            .all(|f| f.as_ref().unwrap().len() == 8));
+
+        let out = query_with_formats(&mut c, &v, "select 1, 2", &[0, 1]);
+        assert_eq!(row_description_formats(&out), vec![0, 1]);
+        let fields = data_row_fields(&out);
+        assert_eq!(fields[0], Some(b"1".to_vec()));
+        assert_eq!(fields[1], Some(1i64.to_be_bytes().to_vec()));
+    }
+
+    /// A select from a table the catalog knows describes the client's own
+    /// types, in the format the client asked for -- and answers no rows, which
+    /// is the rule for a metadata select and unchanged here.
+    #[test]
+    fn known_columns_are_described_with_their_types_and_the_asked_format() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'Q', |b| {
+                cstr(b, "CREATE TABLE t (a INT, b TEXT, c BOOLEAN)")
+            }),
+            &mut out,
+            &v,
+        );
+
+        let out = query_with_formats(&mut c, &v, "select a, b, c from t", &[1, 0, 1]);
+        assert_eq!(row_description_formats(&out), vec![1, 0, 1]);
+        assert!(
+            first_body(&out, b'D').is_none(),
+            "a metadata select answers empty"
+        );
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("SELECT 0"), "{text}");
+    }
+
+    /// The binary form of `1` per type the catalog can announce. Only int8
+    /// reaches a DataRow today (stub columns are int8, and a known table
+    /// answers no rows), but the RowDescription can promise any of these and
+    /// the encoder has to keep that promise if a row is ever sent.
+    #[test]
+    fn binary_one_is_each_types_own_wire_form() {
+        let one = |oid: u32| {
+            let mut b = Vec::new();
+            binary_one(&mut b, oid);
+            let len = i32::from_be_bytes(b[..4].try_into().unwrap()) as usize;
+            assert_eq!(b.len(), 4 + len, "oid {oid}: length prefix matches");
+            b[4..].to_vec()
+        };
+
+        assert_eq!(one(16), vec![1], "bool");
+        assert_eq!(one(21), 1i16.to_be_bytes(), "int2");
+        assert_eq!(one(23), 1i32.to_be_bytes(), "int4");
+        assert_eq!(one(20), 1i64.to_be_bytes(), "int8");
+        assert_eq!(one(700), 1f32.to_be_bytes(), "float4");
+        assert_eq!(one(701), 1f64.to_be_bytes(), "float8");
+        assert_eq!(one(1700), vec![0, 1, 0, 0, 0, 0, 0, 0, 0, 1], "numeric 1");
+        assert_eq!(one(1082), 0i32.to_be_bytes(), "date: 2000-01-01");
+        assert_eq!(one(1114), 0i64.to_be_bytes(), "timestamp");
+        assert_eq!(one(25), b"1", "text");
+        assert_eq!(one(1043), b"1", "varchar");
+    }
+
+    /// Describe of a STATEMENT has no portal and so no formats: PostgreSQL
+    /// reports text there, whatever a later Bind will ask for.
+    #[test]
+    fn describe_statement_reports_text_formats() {
+        let (mut c, v) = connected();
+        let out = parse_and_describe(&mut c, &v, "select 1", &[]);
+        assert_eq!(row_description_formats(&out), vec![0]);
+    }
+
+    /// Bind is parsed to its end and its counts are checked: the parameter
+    /// count must match the statement, and there are 0, 1 or n parameter
+    /// format codes. Anything else is 08P01, as it is in PostgreSQL.
+    #[test]
+    fn bind_counts_are_validated() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'P', |b| {
+                cstr(b, "s");
+                cstr(b, "select $1::int8");
+                b.extend_from_slice(&0i16.to_be_bytes());
+            }),
+            &mut out,
+            &v,
+        );
+
+        let bind = |pformats: &[i16], params: &[Option<&[u8]>]| {
+            let mut input = tagged(b'B', |b| {
+                cstr(b, "");
+                cstr(b, "s");
+                b.extend_from_slice(&(pformats.len() as i16).to_be_bytes());
+                for f in pformats {
+                    b.extend_from_slice(&f.to_be_bytes());
+                }
+                b.extend_from_slice(&(params.len() as i16).to_be_bytes());
+                for p in params {
+                    match p {
+                        Some(bytes) => {
+                            b.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                            b.extend_from_slice(bytes);
+                        }
+                        None => b.extend_from_slice(&(-1i32).to_be_bytes()),
+                    }
+                }
+                b.extend_from_slice(&0i16.to_be_bytes());
+            });
+            input.extend(tagged(b'S', |_| {}));
+            input
+        };
+
+        // Right: one parameter, one value (binary int8 here, a NULL below).
+        out.clear();
+        c.advance(&bind(&[1], &[Some(&7i64.to_be_bytes())]), &mut out, &v);
+        assert_eq!(tags(&out), vec![b'2', b'Z']);
+        out.clear();
+        c.advance(&bind(&[], &[None]), &mut out, &v);
+        assert_eq!(tags(&out), vec![b'2', b'Z']);
+
+        // Wrong: no parameters for a statement with one.
+        out.clear();
+        c.advance(&bind(&[], &[]), &mut out, &v);
+        assert_eq!(tags(&out), vec![b'E', b'Z']);
+        assert_eq!(first_sqlstate(&out), "08P01");
+
+        // Wrong: two parameter formats for one parameter.
+        out.clear();
+        c.advance(&bind(&[0, 0], &[Some(b"7")]), &mut out, &v);
         assert_eq!(tags(&out), vec![b'E', b'Z']);
         assert_eq!(first_sqlstate(&out), "08P01");
     }
