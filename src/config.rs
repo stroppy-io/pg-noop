@@ -133,22 +133,63 @@ pub const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis
 /// disables it for anyone who wants the old behaviour on purpose.
 const STARTUP_TIMEOUT_DEFAULT_MS: u64 = 60_000;
 
-/// The startup timeout in force. Read by both backends, so that "a client that
-/// never speaks" means the same thing whichever one is serving.
+/// The startup timeout in force, decided once. Read by both backends, so that
+/// "a client that never speaks" means the same thing whichever one is serving.
+static STARTUP_TIMEOUT: std::sync::OnceLock<Option<std::time::Duration>> =
+    std::sync::OnceLock::new();
+
+/// The startup timeout in force. `Config::load` validates and records it; a
+/// caller that arrives first (a test) gets the environment parsed leniently,
+/// since exiting is `load`'s decision, not a connection's.
 pub fn startup_timeout() -> Option<std::time::Duration> {
-    match std::env::var("PGNOOP_STARTUP_TIMEOUT_MS") {
-        Ok(v) => v
-            .parse::<u64>()
-            .ok()
-            .filter(|ms| *ms > 0)
-            .map(std::time::Duration::from_millis),
-        Err(_) => Some(std::time::Duration::from_millis(STARTUP_TIMEOUT_DEFAULT_MS)),
+    *STARTUP_TIMEOUT.get_or_init(|| {
+        parse_startup_timeout(std::env::var("PGNOOP_STARTUP_TIMEOUT_MS").ok().as_deref()).unwrap_or(
+            Some(std::time::Duration::from_millis(STARTUP_TIMEOUT_DEFAULT_MS)),
+        )
+    })
+}
+
+/// `PGNOOP_STARTUP_TIMEOUT_MS` as the timeout it means. Unset is the default,
+/// an exact `0` is disabled, a positive number is itself, and anything else is
+/// an error.
+///
+/// It used to be `parse().ok()`, which made a value that did not parse into
+/// `None` -- the same `None` that means disabled. `60000x`, a typo, silently
+/// removed the guard the variable exists to tune. A value the operator wrote
+/// and the server cannot read is refused, the way `--io epol` is.
+fn parse_startup_timeout(value: Option<&str>) -> Result<Option<std::time::Duration>, String> {
+    let Some(value) = value else {
+        return Ok(Some(std::time::Duration::from_millis(
+            STARTUP_TIMEOUT_DEFAULT_MS,
+        )));
+    };
+
+    match value.trim().parse::<u64>() {
+        Ok(0) => Ok(None),
+        Ok(ms) => Ok(Some(std::time::Duration::from_millis(ms))),
+        Err(_) => Err(format!(
+            "PGNOOP_STARTUP_TIMEOUT_MS={value:?} is not a number of milliseconds; \
+             expected a positive integer, or 0 to disable"
+        )),
     }
 }
 
 impl Config {
     pub fn load() -> Self {
         let cli = CliArgs::parse();
+
+        // Decided here, once, so a bad value stops the server before it binds
+        // rather than being discovered -- or silently ignored -- per connection.
+        let timeout =
+            match parse_startup_timeout(std::env::var("PGNOOP_STARTUP_TIMEOUT_MS").ok().as_deref())
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("pgnoop: {e}");
+                    std::process::exit(2);
+                }
+            };
+        let _ = STARTUP_TIMEOUT.set(timeout);
 
         let file: FileConfig = std::fs::read_to_string(&cli.config)
             .ok()
@@ -172,5 +213,40 @@ impl Config {
                 .map(|s| Io::parse(&s))
                 .unwrap_or_default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A value that does not parse is an error, not "disabled".** The
+    /// parse failure became `None`, and `None` is also the explicit
+    /// disabled state, so `PGNOOP_STARTUP_TIMEOUT_MS=60000x` -- a typo --
+    /// silently removed the guard the variable exists to tune.
+    #[test]
+    fn a_malformed_timeout_is_refused() {
+        for bad in ["60000x", "", " ", "-1", "1.5", "none"] {
+            assert!(
+                parse_startup_timeout(Some(bad)).is_err(),
+                "{bad:?} must be refused, not treated as disabled"
+            );
+        }
+    }
+
+    /// Only an exact `0` disables; unset is the default; a number is itself.
+    #[test]
+    fn zero_disables_and_unset_is_the_default() {
+        assert_eq!(parse_startup_timeout(Some("0")), Ok(None));
+        assert_eq!(
+            parse_startup_timeout(None),
+            Ok(Some(std::time::Duration::from_millis(
+                STARTUP_TIMEOUT_DEFAULT_MS
+            )))
+        );
+        assert_eq!(
+            parse_startup_timeout(Some("2500")),
+            Ok(Some(std::time::Duration::from_millis(2500)))
+        );
     }
 }
