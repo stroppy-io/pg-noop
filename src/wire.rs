@@ -342,11 +342,16 @@ impl Conn {
 
             let fields = i16::from_be_bytes([buf[pos], buf[pos + 1]]);
 
-            // The trailer: an int16 -1 ends the stream. Not a row.
-            if fields < 0 {
+            // The trailer: an int16 -1 ends the stream. Not a row. Any other
+            // negative count is not a trailer, it is a malformed stream.
+            if fields == -1 {
                 pos += 2;
 
                 break;
+            }
+
+            if fields < -1 {
+                return Err("invalid field count in COPY data");
             }
 
             let mut p = pos + 2;
@@ -363,7 +368,12 @@ impl Conn {
 
                 p += 4;
 
-                // -1 is NULL: a length with no bytes after it.
+                // -1 is NULL: a length with no bytes after it. Below that is
+                // not a length at all.
+                if len < -1 {
+                    return Err("invalid field size in COPY data");
+                }
+
                 if len >= 0 {
                     if (n - p) < len as usize {
                         whole = false;
@@ -2553,6 +2563,31 @@ mod tests {
 
         let (_, out) = binary_copy(&[&stream]);
         assert_eq!(first_sqlstate(&out), "22P04");
+    }
+
+    /// **Only -1 is special.** A field count of -1 is the trailer and a field
+    /// length of -1 is NULL; every other negative value is a malformed stream.
+    /// This treated every negative count as the trailer and every negative
+    /// length as NULL, so a length of -2 was counted as a valid row.
+    #[test]
+    fn binary_copy_rejects_negative_values_other_than_minus_one() {
+        // Field length -2.
+        let mut stream = binary_header(0, &[]);
+        stream.extend_from_slice(&1i16.to_be_bytes());
+        stream.extend_from_slice(&(-2i32).to_be_bytes());
+        stream.extend_from_slice(&(-1i16).to_be_bytes());
+
+        let (_, out) = binary_copy(&[&stream]);
+        assert_eq!(first_sqlstate(&out), "22P04", "length -2");
+        let text = String::from_utf8_lossy(&out);
+        assert!(!text.contains("COPY 1"), "{text}");
+
+        // Field count -2.
+        let mut stream = binary_header(0, &[]);
+        stream.extend_from_slice(&(-2i16).to_be_bytes());
+
+        let (_, out) = binary_copy(&[&stream]);
+        assert_eq!(first_sqlstate(&out), "22P04", "count -2");
     }
 
     #[test]
