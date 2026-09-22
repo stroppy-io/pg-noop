@@ -28,7 +28,133 @@ use std::time::{Duration, Instant};
 
 /// Latency samples retained per worker. Unbounded, a 5s run at 3M q/s keeps
 /// 15M samples per worker and the final clone doubles it.
+///
+/// Bounded how matters. The worker used to keep its FIRST `MAX_SAMPLES` and
+/// drop every later one; at the documented throughput that filled within the
+/// first second, so p99 and max described the warm-up and never saw a
+/// steady-state or late-run stall. The reservoir below keeps a uniform sample
+/// of everything the worker saw instead.
 const MAX_SAMPLES: usize = 1 << 17;
+
+/// A uniform sample of at most `cap` values from a stream of any length:
+/// Algorithm R. Every value that arrives has the same chance of being in the
+/// reservoir at the end, whether it came first or last.
+struct Reservoir {
+    samples: Vec<u64>,
+    /// How many values were offered, which is what the samples stand for.
+    seen: u64,
+    cap: usize,
+    rng: u64,
+}
+
+impl Reservoir {
+    fn new(cap: usize, seed: u64) -> Self {
+        Reservoir {
+            samples: Vec::with_capacity(cap.min(1 << 16)),
+            seen: 0,
+            cap,
+            // xorshift needs a nonzero state; the seed is a worker index.
+            rng: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+        }
+    }
+
+    fn push(&mut self, v: u64) {
+        self.seen += 1;
+
+        if self.samples.len() < self.cap {
+            self.samples.push(v);
+
+            return;
+        }
+
+        // Replace a random slot with probability cap / seen.
+        let slot = self.next() % self.seen;
+        if (slot as usize) < self.cap {
+            self.samples[slot as usize] = v;
+        }
+    }
+
+    /// xorshift64*: enough randomness to pick a slot, no dependency, no
+    /// allocation, and nothing in the loop that could stall a worker.
+    fn next(&mut self) -> u64 {
+        let mut x = self.rng;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn into_parts(self) -> WorkerSamples {
+        (self.samples, self.seen)
+    }
+}
+
+/// What one worker hands back: its reservoir, and how many batches it stands
+/// for.
+type WorkerSamples = (Vec<u64>, u64);
+
+/// Percentiles over every worker's reservoir, weighted by what each worker
+/// saw: a sample from a worker that completed a thousand batches stands for
+/// more than one from a worker that completed a hundred, and merging the
+/// reservoirs as equals would let the slow connection's tail dominate.
+struct Percentiles {
+    /// (value, weight), sorted by value.
+    weighted: Vec<(u64, f64)>,
+    total: f64,
+    seen: u64,
+}
+
+impl Percentiles {
+    fn from_workers(workers: Vec<WorkerSamples>) -> Self {
+        let mut weighted = Vec::new();
+        let mut seen = 0u64;
+
+        for (samples, count) in workers {
+            if samples.is_empty() {
+                continue;
+            }
+            let weight = count as f64 / samples.len() as f64;
+            weighted.extend(samples.into_iter().map(|v| (v, weight)));
+            seen += count;
+        }
+
+        weighted.sort_unstable_by_key(|&(v, _)| v);
+        let total = weighted.iter().map(|&(_, w)| w).sum();
+
+        Percentiles {
+            weighted,
+            total,
+            seen,
+        }
+    }
+
+    /// The smallest value at or below which fraction `p` of the weight lies.
+    fn at(&self, p: f64) -> u64 {
+        let Some(&(last, _)) = self.weighted.last() else {
+            return 0;
+        };
+
+        let target = self.total * p;
+        let mut cumulative = 0.0;
+        for &(v, w) in &self.weighted {
+            cumulative += w;
+            if cumulative >= target {
+                return v;
+            }
+        }
+
+        last
+    }
+
+    fn samples(&self) -> usize {
+        self.weighted.len()
+    }
+
+    fn seen(&self) -> u64 {
+        self.seen
+    }
+}
 
 fn arg(name: &str, default: usize) -> usize {
     let mut it = std::env::args().skip(1);
@@ -238,10 +364,10 @@ fn main() {
     // Why this is measured at all: throughput medians hide the tail, and the
     // tail is where a scheduler shows itself. Two backends can agree on median
     // q/s and disagree completely about p99.
-    let lat: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let lat: Arc<Mutex<Vec<WorkerSamples>>> = Arc::new(Mutex::new(Vec::new()));
     let mut threads = Vec::new();
 
-    for _ in 0..conns {
+    for worker in 0..conns {
         let (batch, done, total) = (batch.clone(), done.clone(), total.clone());
         let lat = lat.clone();
         let (ready_workers, go) = (ready_workers.clone(), go.clone());
@@ -292,7 +418,7 @@ fn main() {
 
             let mut chunk = vec![0u8; 64 * 1024];
             let mut count: u64 = 0;
-            let mut mine: Vec<u64> = Vec::with_capacity(1 << 16);
+            let mut mine = Reservoir::new(MAX_SAMPLES, worker as u64 + 1);
 
             'work: while !done.load(Ordering::Relaxed) {
                 let t0 = Instant::now();
@@ -315,15 +441,13 @@ fn main() {
                         }
                     }
                 }
-                if mine.len() < MAX_SAMPLES {
-                    mine.push(t0.elapsed().as_nanos() as u64);
-                }
+                mine.push(t0.elapsed().as_nanos() as u64);
                 count += depth as u64;
             }
 
             total.fetch_add(count, Ordering::Relaxed);
             if let Ok(mut all) = lat.lock() {
-                all.extend_from_slice(&mine);
+                all.push(mine.into_parts());
             }
         }));
     }
@@ -365,20 +489,19 @@ fn main() {
     let elapsed = start.elapsed().as_secs_f64();
 
     let q = total.load(Ordering::Relaxed);
-    let mut all = lat.lock().map(|g| g.clone()).unwrap_or_default();
-    all.sort_unstable();
+    let workers = lat
+        .lock()
+        .map(|mut g| std::mem::take(&mut *g))
+        .unwrap_or_default();
+    let percentiles = Percentiles::from_workers(workers);
+    let pct = |p: f64| -> f64 { percentiles.at(p) as f64 / 1e6 };
 
-    let pct = |p: f64| -> f64 {
-        if all.is_empty() {
-            return 0.0;
-        }
-        let i = ((all.len() - 1) as f64 * p).round() as usize;
-        all[i] as f64 / 1e6
-    };
-
+    // `n` is how many samples the percentiles were computed from and `of` how
+    // many batches they stand for; when the two differ, the samples are a
+    // uniform draw across the whole run, not its first seconds.
     let unit = if depth == 1 { "query" } else { "batch" };
     println!(
-        "{} conns, depth {}, {:.1}s: {} queries, {:.0} q/s | {} ms p50 {:.3} p90 {:.3} p99 {:.3} p999 {:.3} max {:.3} (n={})",
+        "{} conns, depth {}, {:.1}s: {} queries, {:.0} q/s | {} ms p50 {:.3} p90 {:.3} p99 {:.3} p999 {:.3} max {:.3} (n={} of {})",
         live,
         depth,
         elapsed,
@@ -390,6 +513,83 @@ fn main() {
         pct(0.99),
         pct(0.999),
         pct(1.0),
-        all.len(),
+        percentiles.samples(),
+        percentiles.seen(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Under the cap every sample is kept, in order, and `seen` counts them.
+    #[test]
+    fn a_reservoir_under_its_cap_keeps_everything() {
+        let mut r = Reservoir::new(8, 1);
+        for v in 0..5 {
+            r.push(v);
+        }
+        assert_eq!(r.samples, vec![0, 1, 2, 3, 4]);
+        assert_eq!(r.seen, 5);
+    }
+
+    /// **The samples describe the whole run, not its first seconds.** The
+    /// worker used to record its first MAX_SAMPLES latencies and drop every
+    /// later one, so at documented throughput p99 and max were a property of
+    /// the warm-up. A reservoir draws uniformly from everything it saw: the
+    /// cap holds, `seen` is the true count, and the late part of the stream
+    /// is represented in proportion.
+    #[test]
+    fn a_reservoir_over_its_cap_represents_the_late_stream() {
+        const CAP: usize = 1000;
+        const N: u64 = 200_000;
+
+        let mut r = Reservoir::new(CAP, 7);
+        for v in 0..N {
+            r.push(v);
+        }
+        assert_eq!(r.samples.len(), CAP);
+        assert_eq!(r.seen, N);
+
+        // The last tenth of the stream should hold about a tenth of the
+        // samples. A prefix sampler holds none of it.
+        let late = r.samples.iter().filter(|&&v| v >= N * 9 / 10).count();
+        assert!(
+            (50..=150).contains(&late),
+            "expected ~100 of {CAP} samples from the last tenth, got {late}"
+        );
+
+        // And the mean sits near the middle, which a prefix cannot.
+        let mean = r.samples.iter().sum::<u64>() as f64 / CAP as f64;
+        assert!(
+            (mean - N as f64 / 2.0).abs() < N as f64 * 0.05,
+            "mean {mean} is not near {}",
+            N / 2
+        );
+    }
+
+    /// Two workers' reservoirs are merged by weight: a worker that saw ten
+    /// times the samples contributes ten times the mass, whatever the two
+    /// reservoirs' lengths. Otherwise a slow connection's samples would
+    /// count as much as a fast one's and the percentiles would drift high.
+    #[test]
+    fn percentiles_weight_each_worker_by_what_it_saw() {
+        let fast = (vec![1u64; 10], 1000u64);
+        let slow = (vec![100u64; 10], 100u64);
+        let p = Percentiles::from_workers(vec![fast, slow]);
+
+        assert_eq!(p.samples(), 20);
+        assert_eq!(p.seen(), 1100);
+        assert_eq!(p.at(0.50), 1);
+        assert_eq!(p.at(0.90), 1);
+        assert_eq!(p.at(0.95), 100);
+        assert_eq!(p.at(1.0), 100);
+    }
+
+    #[test]
+    fn percentiles_of_nothing_are_zero() {
+        let p = Percentiles::from_workers(Vec::new());
+        assert_eq!(p.at(0.5), 0);
+        assert_eq!(p.samples(), 0);
+    }
 }
