@@ -175,10 +175,16 @@ impl Formats {
     }
 }
 
-/// A portal: a bound statement and the result formats the Bind asked for.
+/// A portal: a bound statement, the result formats the Bind asked for, and
+/// how far it has been read.
 struct Portal {
     statement: String,
     formats: Formats,
+    /// Whether the portal has been read to its end. A plan answers at most
+    /// one row, so this is the whole cursor: Execute of a consumed portal
+    /// answers no row and `SELECT 0`, as PostgreSQL does for a portal already
+    /// fetched to its end. Execute used to replay the row every time.
+    consumed: bool,
 }
 
 pub struct Conn {
@@ -748,7 +754,18 @@ impl Conn {
                 let failed = self.failed();
                 self.note_transaction(&plan.kind);
 
-                answer(&plan, out, catalog, true, failed, &Formats::TEXT);
+                answer(
+                    &plan,
+                    out,
+                    catalog,
+                    Run {
+                        describe: true,
+                        failed,
+                        formats: &Formats::TEXT,
+                        max_rows: 0,
+                        consumed: false,
+                    },
+                );
                 self.ready(out);
             }
 
@@ -843,10 +860,12 @@ impl Conn {
                 // The formats are replaced in place: for every driver's usual
                 // shapes that is a copy of an enum, not an allocation.
                 match self.portals.get_mut(portal) {
-                    Some(cur) if cur.statement == stmt => cur.formats = bind.formats,
                     Some(cur) => {
-                        cur.statement = stmt.to_string();
+                        if cur.statement != stmt {
+                            cur.statement = stmt.to_string();
+                        }
                         cur.formats = bind.formats;
+                        cur.consumed = false;
                     }
                     None => {
                         self.portals.insert(
@@ -854,6 +873,7 @@ impl Conn {
                             Portal {
                                 statement: stmt.to_string(),
                                 formats: bind.formats,
+                                consumed: false,
                             },
                         );
                     }
@@ -912,75 +932,93 @@ impl Conn {
             }
 
             tag::EXECUTE => {
-                let (portal, _) = cstr_at(body, 0)?;
+                // [portal][max_rows:i32]. Zero is no limit.
+                let (name, after) = cstr_at(body, 0)?;
+                let max_rows = i32::from_be_bytes(body.get(after..after + 4)?.try_into().ok()?);
+                let failed = self.failed();
+
                 // No clone: `answer` is a free function precisely so the plan can
                 // stay borrowed out of `self`. It used to be a method, which made
                 // the borrow checker demand `.cloned()` -- a DEEP copy of the sql
                 // String and the parsed table/column Vecs, on every Execute.
-                match self
+                // The portal is borrowed mutably and the statement immutably,
+                // from two different fields, which the borrow checker allows.
+                let statement = self
                     .portals
-                    .get(portal)
-                    .and_then(|p| self.statements.get(&p.statement).map(|s| (s, &p.formats)))
-                {
-                    // Execute does NOT re-send RowDescription; Describe did.
-                    Some((Statement { plan: p, .. }, formats)) => {
-                        let failed = self.failed();
-                        if failed && !ends_transaction(&p.kind) {
-                            self.refuse(true, out, "25P02", ABORTED);
+                    .get_mut(name)
+                    .and_then(|portal| self.statements.get(&portal.statement).map(|s| (portal, s)));
 
-                            return Some(());
-                        }
-
-                        // A COPY that streams from the client needs the
-                        // connection to change phase, which is not something a
-                        // free function writing into `out` can do. Read what it
-                        // is first, answer, then enter the phase.
-                        let streams_rows = match &p.kind {
-                            PlanKind::Copy {
-                                direction: CopyDirection::FromStdin,
-                                columns,
-                                binary,
-                            } => Some((*columns, *binary)),
-                            _ => None,
-                        };
-
-                        // The extended protocol's Execute is where a statement
-                        // actually runs, so it is where the transaction state
-                        // changes. `SYNC` is what asks for the byte, later.
-                        // Copied out, because `note_transaction` needs `self`
-                        // mutably and `p` is borrowed from it.
-                        let touched_tx = matches!(
-                            p.kind,
-                            PlanKind::Begin | PlanKind::Commit | PlanKind::Rollback
-                        );
-
-                        answer(p, out, catalog, false, failed, formats);
-
-                        if touched_tx {
-                            let kind = p.kind.clone();
-                            self.note_transaction(&kind);
-                        }
-
-                        if let Some((columns, binary)) = streams_rows {
-                            let _ = columns;
-                            self.copy_carry.clear();
-                            self.copy_header_seen = false;
-                            self.copy_trailer_seen = false;
-                            self.phase = Phase::CopyIn {
-                                rows: 0,
-                                binary,
-                                extended: true,
-                            };
-                        }
-                    }
-                    // Executing a portal that was never bound used to fabricate
-                    // `SELECT 0`. PostgreSQL reports it, and so does this.
-                    None => self.refuse(
+                // Executing a portal that was never bound used to fabricate
+                // `SELECT 0`. PostgreSQL reports it, and so does this. A portal
+                // whose statement was closed is closed with it.
+                let Some((portal, Statement { plan: p, .. })) = statement else {
+                    self.refuse(
                         true,
                         out,
                         "34000",
-                        &format!("portal \"{portal}\" does not exist"),
-                    ),
+                        &format!("portal \"{name}\" does not exist"),
+                    );
+
+                    return Some(());
+                };
+
+                if failed && !ends_transaction(&p.kind) {
+                    self.refuse(true, out, "25P02", ABORTED);
+
+                    return Some(());
+                }
+
+                // A COPY that streams from the client needs the connection to
+                // change phase, which is not something a free function writing
+                // into `out` can do. Read what it is first, answer, then enter
+                // the phase.
+                let streams_rows = match &p.kind {
+                    PlanKind::Copy {
+                        direction: CopyDirection::FromStdin,
+                        binary,
+                        ..
+                    } => Some(*binary),
+                    _ => None,
+                };
+
+                // The extended protocol's Execute is where a statement actually
+                // runs, so it is where the transaction state changes. `SYNC` is
+                // what asks for the byte, later. Copied out, because
+                // `note_transaction` needs `self` mutably and `p` is borrowed
+                // from it.
+                let touched_tx = matches!(
+                    p.kind,
+                    PlanKind::Begin | PlanKind::Commit | PlanKind::Rollback
+                );
+
+                // Execute does NOT re-send RowDescription; Describe did.
+                portal.consumed = answer(
+                    p,
+                    out,
+                    catalog,
+                    Run {
+                        describe: false,
+                        failed,
+                        formats: &portal.formats,
+                        max_rows,
+                        consumed: portal.consumed,
+                    },
+                );
+
+                if touched_tx {
+                    let kind = p.kind.clone();
+                    self.note_transaction(&kind);
+                }
+
+                if let Some(binary) = streams_rows {
+                    self.copy_carry.clear();
+                    self.copy_header_seen = false;
+                    self.copy_trailer_seen = false;
+                    self.phase = Phase::CopyIn {
+                        rows: 0,
+                        binary,
+                        extended: true,
+                    };
                 }
             }
 
@@ -1135,41 +1173,50 @@ impl Conn {
 /// it never needed `self`, and being a method is what forced a deep clone of the
 /// plan at every Execute.
 ///
-/// `failed` is whether the transaction the statement runs in has failed. Only
-/// COMMIT reads it: committing a failed transaction rolls it back, and
-/// PostgreSQL's tag says `ROLLBACK` so the client can see that its COMMIT
-/// committed nothing.
-///
-/// `formats` is what the portal's Bind asked the rows to be encoded in. The
-/// simple protocol has no Bind and is always text.
-fn answer(
-    plan: &PreparedPlan,
-    out: &mut Vec<u8>,
-    catalog: &CatalogView,
-    describe: bool,
-    failed: bool,
-    formats: &Formats,
-) {
+/// Returns whether the portal has now been read to its end. Only a plan that
+/// returns rows has an end to reach; the rest are done when they answer.
+fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Run<'_>) -> bool {
     match &plan.kind {
         PlanKind::SelectMeta { .. } | PlanKind::SelectStub { .. } => {
             let cols = resolve_columns(plan, catalog);
-            if describe {
-                row_description_of(&cols, formats, out);
+            if run.describe {
+                row_description_of(&cols, run.formats, out);
             }
+
+            // A portal already read to its end has nothing more: PostgreSQL
+            // answers `SELECT 0` with no row, and so does this.
+            if run.consumed {
+                complete(out, "SELECT", Some(0));
+
+                return true;
+            }
+
             // A metadata select answers empty; a stub select answers one row.
-            let rows = if matches!(plan.kind, PlanKind::SelectMeta { .. }) && cols.resolved() {
-                0
+            if matches!(plan.kind, PlanKind::SelectMeta { .. }) && cols.resolved() {
+                complete(out, "SELECT", Some(0));
+
+                return true;
+            }
+
+            data_row(out, &cols, run.formats);
+
+            // The one row is also the last one, but with a limit of one the
+            // server cannot know that until it looks for the next -- which is
+            // why PostgreSQL answers PortalSuspended here, and the next
+            // Execute finds the end.
+            if run.max_rows == 1 {
+                portal_suspended(out);
             } else {
-                data_row(out, &cols, formats);
-                1
-            };
-            complete(out, "SELECT", Some(rows));
+                complete(out, "SELECT", Some(1));
+            }
+
+            return true;
         }
         PlanKind::Insert => complete_raw(out, "INSERT 0 1"),
         PlanKind::Update => complete_raw(out, "UPDATE 1"),
         PlanKind::Delete => complete_raw(out, "DELETE 1"),
         PlanKind::Begin => complete_raw(out, "BEGIN"),
-        PlanKind::Commit if failed => complete_raw(out, "ROLLBACK"),
+        PlanKind::Commit if run.failed => complete_raw(out, "ROLLBACK"),
         PlanKind::Commit => complete_raw(out, "COMMIT"),
         PlanKind::Rollback => complete_raw(out, "ROLLBACK"),
         PlanKind::Ddl => {
@@ -1194,6 +1241,32 @@ fn answer(
         },
         PlanKind::FromText => complete(out, "SELECT", Some(0)),
     }
+
+    true
+}
+
+/// How one execution of a plan is to be answered.
+struct Run<'a> {
+    /// Whether to send RowDescription first: the simple protocol does, and
+    /// Execute does not, because Describe did.
+    describe: bool,
+    /// Whether the transaction the statement runs in has failed. Only COMMIT
+    /// reads it: committing a failed transaction rolls it back, and
+    /// PostgreSQL's tag says `ROLLBACK` so the client can see that its COMMIT
+    /// committed nothing.
+    failed: bool,
+    /// What the portal's Bind asked the rows to be encoded in. The simple
+    /// protocol has no Bind and is always text.
+    formats: &'a Formats,
+    /// Execute's row limit; zero is none.
+    max_rows: i32,
+    /// Whether the portal was already read to its end.
+    consumed: bool,
+}
+
+/// `PortalSuspended`: the row limit was reached with the portal still open.
+fn portal_suspended(out: &mut Vec<u8>) {
+    msg(out, b's', |_| {});
 }
 
 // ------------------------------------------------------------------ encoding
@@ -1835,7 +1908,10 @@ mod tests {
             b.extend_from_slice(&0i16.to_be_bytes()); // no params
             b.extend_from_slice(&0i16.to_be_bytes()); // no result formats
         }));
-        input.extend_from_slice(&tagged(b'E', |b| cstr(b, "")));
+        input.extend_from_slice(&tagged(b'E', |b| {
+            cstr(b, "");
+            b.extend_from_slice(&0i32.to_be_bytes());
+        }));
         input.extend_from_slice(&tagged(b'S', |_| {}));
 
         c.advance(&input, &mut out, &v);
@@ -3301,6 +3377,95 @@ mod tests {
         // Wrong: two parameter formats for one parameter.
         out.clear();
         c.advance(&bind(&[0, 0], &[Some(b"7")]), &mut out, &v);
+        assert_eq!(tags(&out), vec![b'E', b'Z']);
+        assert_eq!(first_sqlstate(&out), "08P01");
+    }
+
+    /// Execute a named portal with a row limit, then Sync.
+    fn execute(c: &mut Conn, v: &CatalogView, portal: &str, max_rows: i32) -> Vec<u8> {
+        let mut input = tagged(b'E', |b| {
+            cstr(b, portal);
+            b.extend_from_slice(&max_rows.to_be_bytes());
+        });
+        input.extend(tagged(b'S', |_| {}));
+        let mut out = Vec::new();
+        c.advance(&input, &mut out, v);
+        out
+    }
+
+    /// Parse `sql` and bind it to portal `p1`, text formats.
+    fn bind_p1(c: &mut Conn, v: &CatalogView, sql: &str) {
+        let mut input = tagged(b'P', |b| {
+            cstr(b, "s1");
+            cstr(b, sql);
+            b.extend_from_slice(&0i16.to_be_bytes());
+        });
+        input.extend(tagged(b'B', |b| {
+            cstr(b, "p1");
+            cstr(b, "s1");
+            b.extend_from_slice(&0i16.to_be_bytes());
+            b.extend_from_slice(&0i16.to_be_bytes());
+            b.extend_from_slice(&0i16.to_be_bytes());
+        }));
+        let mut out = Vec::new();
+        c.advance(&input, &mut out, v);
+        assert_eq!(tags(&out), vec![b'1', b'2']);
+    }
+
+    /// **A portal is a cursor, and Execute reads `max_rows`.** Execute parsed
+    /// only the portal name, so a limit was ignored and a second Execute of the
+    /// same portal replayed the row. PostgreSQL returns the row and
+    /// PortalSuspended when the limit is hit, and `SELECT 0` with no row for
+    /// a portal already read to its end.
+    #[test]
+    fn a_portal_suspends_at_max_rows_and_does_not_replay() {
+        let (mut c, v) = connected();
+        bind_p1(&mut c, &v, "select 1");
+
+        let out = execute(&mut c, &v, "p1", 1);
+        assert_eq!(
+            tags(&out),
+            vec![b'D', b's', b'Z'],
+            "the row, then PortalSuspended"
+        );
+
+        let out = execute(&mut c, &v, "p1", 1);
+        assert_eq!(tags(&out), vec![b'C', b'Z'], "no row the second time");
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("SELECT 0"), "{text}");
+    }
+
+    /// No limit reads the portal to its end in one go, and a later Execute of
+    /// it finds nothing more.
+    #[test]
+    fn an_unlimited_execute_completes_the_portal() {
+        let (mut c, v) = connected();
+        bind_p1(&mut c, &v, "select 1");
+
+        let out = execute(&mut c, &v, "p1", 0);
+        assert_eq!(tags(&out), vec![b'D', b'C', b'Z']);
+        assert!(String::from_utf8_lossy(&out).contains("SELECT 1"));
+
+        let out = execute(&mut c, &v, "p1", 0);
+        assert_eq!(tags(&out), vec![b'C', b'Z']);
+        assert!(String::from_utf8_lossy(&out).contains("SELECT 0"));
+
+        // Binding again is a new portal, with its row.
+        bind_p1(&mut c, &v, "select 1");
+        let out = execute(&mut c, &v, "p1", 0);
+        assert_eq!(tags(&out), vec![b'D', b'C', b'Z']);
+    }
+
+    /// An Execute without its `max_rows` is malformed, not "no limit".
+    #[test]
+    fn an_execute_without_max_rows_is_malformed() {
+        let (mut c, v) = connected();
+        bind_p1(&mut c, &v, "select 1");
+
+        let mut input = tagged(b'E', |b| cstr(b, "p1"));
+        input.extend(tagged(b'S', |_| {}));
+        let mut out = Vec::new();
+        c.advance(&input, &mut out, &v);
         assert_eq!(tags(&out), vec![b'E', b'Z']);
         assert_eq!(first_sqlstate(&out), "08P01");
     }
