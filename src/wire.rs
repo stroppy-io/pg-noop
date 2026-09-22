@@ -268,15 +268,27 @@ impl Conn {
 
     /// Count complete tuples in a binary COPY stream, carrying the tail.
     ///
-    /// The framing is PostgreSQL's: an 11-byte signature, two int32s, then per
-    /// tuple an int16 field count followed by each field's int32 length (-1 for
-    /// NULL) and its bytes, ending with an int16 -1 trailer. A field's length is
-    /// what makes this countable at all -- newline bytes inside a payload are
-    /// just bytes, which is exactly why counting them reported 2 for a 3-row
-    /// load.
-    fn count_binary_copy_rows(&mut self, body: &[u8]) {
+    /// The framing is PostgreSQL's: an 11-byte signature, an int32 of flags,
+    /// an int32 extension length and that many bytes of extension, then per
+    /// tuple an int16 field count followed by each field's int32 length (-1
+    /// for NULL) and its bytes, ending with an int16 -1 trailer. A field's
+    /// length is what makes this countable at all -- newline bytes inside a
+    /// payload are just bytes, which is exactly why counting them reported 2
+    /// for a 3-row load.
+    ///
+    /// The header is checked, not skipped. The signature is what says this
+    /// is a binary COPY at all; bits 16..31 of the flags are critical, and a
+    /// reader that does not know one must refuse; and the extension length
+    /// decides where the first tuple begins -- a fixed 19 was reading a
+    /// four-byte extension as a tuple and answering `COPY 3` for one row.
+    ///
+    /// `Err` is a framing violation: the COPY is over and the caller says so
+    /// with PostgreSQL's SQLSTATE for a bad COPY file.
+    fn count_binary_copy_rows(&mut self, body: &[u8]) -> Result<(), &'static str> {
         /// The signature, its flags and the header-extension length.
         const HEADER: usize = 19;
+
+        const SIGNATURE: &[u8; 11] = b"PGCOPY\n\xff\r\n\0";
 
         /// How much unparsed stream to hold before calling it a violation. A
         /// whole tuple has to fit for any progress to be possible; past this the
@@ -294,10 +306,32 @@ impl Conn {
             if n < HEADER {
                 self.copy_carry = buf;
 
-                return;
+                return Ok(());
             }
 
-            pos = HEADER;
+            if &buf[..11] != SIGNATURE {
+                return Err("COPY file signature not recognized");
+            }
+
+            let flags = i32::from_be_bytes([buf[11], buf[12], buf[13], buf[14]]);
+            if flags & !0xffff != 0 {
+                return Err("unrecognized critical flags in COPY file header");
+            }
+
+            let extension = i32::from_be_bytes([buf[15], buf[16], buf[17], buf[18]]);
+            if extension < 0 {
+                return Err("invalid COPY file header (wrong length)");
+            }
+
+            // The extension is skipped whole, so it has to be here whole.
+            let first_tuple = HEADER + extension as usize;
+            if n < first_tuple {
+                self.copy_carry = buf;
+
+                return Ok(());
+            }
+
+            pos = first_tuple;
             self.copy_header_seen = true;
         }
 
@@ -369,6 +403,8 @@ impl Conn {
             buf.clear();
             self.copy_carry = buf;
         }
+
+        Ok(())
     }
 
     /// Consume every COMPLETE message in `input`, appending replies to `out`.
@@ -867,7 +903,14 @@ impl Conn {
         match t {
             tag::COPY_DATA => {
                 if binary {
-                    self.count_binary_copy_rows(body);
+                    if let Err(violation) = self.count_binary_copy_rows(body) {
+                        // A stream that is not PostgreSQL's binary framing is
+                        // not counted, it is refused -- with the SQLSTATE the
+                        // server uses for a bad COPY file, and the recovery
+                        // the entry protocol prescribes.
+                        self.leave_copy_in();
+                        self.refuse(extended, out, "22P04", violation);
+                    }
                 } else if let Phase::CopyIn { rows, .. } = &mut self.phase {
                     // One CopyData message is one or more rows of text, newline
                     // separated. Counting newlines is what PostgreSQL reports and
@@ -2417,6 +2460,99 @@ mod tests {
         c.advance(&input, &mut out, &v);
         assert_eq!(tags(&out), vec![b'E', b'Z']);
         assert_eq!(first_sqlstate(&out), "57014");
+    }
+
+    /// A binary COPY header: signature, flags, and an extension of `ext` bytes.
+    fn binary_header(flags: i32, ext: &[u8]) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+        h.extend_from_slice(&flags.to_be_bytes());
+        h.extend_from_slice(&(ext.len() as i32).to_be_bytes());
+        h.extend_from_slice(ext);
+        h
+    }
+
+    /// One binary tuple of the given int8 values.
+    fn binary_tuple(values: &[i64]) -> Vec<u8> {
+        let mut t = Vec::new();
+        t.extend_from_slice(&(values.len() as i16).to_be_bytes());
+        for v in values {
+            t.extend_from_slice(&8i32.to_be_bytes());
+            t.extend_from_slice(&v.to_be_bytes());
+        }
+        t
+    }
+
+    /// Start a binary COPY and feed it `chunks`, then CopyDone; the reply to
+    /// the whole exchange after CopyInResponse.
+    fn binary_copy(chunks: &[&[u8]]) -> (Conn, Vec<u8>) {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'Q', |b| cstr(b, "COPY t FROM STDIN BINARY")),
+            &mut out,
+            &v,
+        );
+        assert_eq!(out[0], b'G');
+        out.clear();
+        for chunk in chunks {
+            c.advance(&tagged(b'd', |b| b.extend_from_slice(chunk)), &mut out, &v);
+        }
+        c.advance(&tagged(b'c', |_| {}), &mut out, &v);
+        (c, out)
+    }
+
+    /// **The header is not 19 bytes; it is 19 bytes plus the extension it
+    /// declares.** Bytes 15..19 carry the extension length, and a reader
+    /// must skip that many more before the first tuple. This one started
+    /// tuple parsing at byte 19 regardless, so a four-byte extension was read
+    /// as a field count and a length, and one tuple came back as `COPY 3`.
+    #[test]
+    fn binary_copy_skips_the_header_extension() {
+        let mut stream = binary_header(0, &[0xde, 0xad, 0xbe, 0xef]);
+        stream.extend(binary_tuple(&[1]));
+        stream.extend_from_slice(&(-1i16).to_be_bytes());
+
+        let (_, out) = binary_copy(&[&stream]);
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("COPY 1"), "{text}");
+
+        // And an extension split across messages is waited for, not parsed.
+        let (_, out) = binary_copy(&[&stream[..17], &stream[17..21], &stream[21..]]);
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("COPY 1"), "split: {text}");
+    }
+
+    /// A stream that does not start with the signature is not a binary COPY,
+    /// and PostgreSQL says so (22P04) instead of counting whatever it is.
+    #[test]
+    fn binary_copy_rejects_a_bad_signature() {
+        let mut stream = b"PGCOPY\n\xff\r\n\0".to_vec();
+        stream[0] = b'X';
+        stream.extend_from_slice(&0i32.to_be_bytes());
+        stream.extend_from_slice(&0i32.to_be_bytes());
+        stream.extend(binary_tuple(&[1]));
+
+        let (c, out) = binary_copy(&[&stream]);
+        assert_eq!(
+            tags(&out),
+            vec![b'E', b'Z', b'E', b'Z'],
+            "the COPY ended at the error; the CopyDone after it is outside a COPY"
+        );
+        assert_eq!(first_sqlstate(&out), "22P04");
+        assert!(!c.is_closed());
+    }
+
+    /// The flags word reserves bits 16..31 as critical: a reader that does
+    /// not understand one must refuse the file. None are defined, so any set
+    /// bit there is a refusal.
+    #[test]
+    fn binary_copy_rejects_critical_flags() {
+        let mut stream = binary_header(1 << 20, &[]);
+        stream.extend(binary_tuple(&[1]));
+
+        let (_, out) = binary_copy(&[&stream]);
+        assert_eq!(first_sqlstate(&out), "22P04");
     }
 
     #[test]
