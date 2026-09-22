@@ -114,10 +114,41 @@ fn bind_shards_to(
     Ok((addr, listeners))
 }
 
-/// Whether this platform can pin at all. Asked once, so a platform without
-/// pinning never prints a per-shard "could not pin" line for something it never
-/// attempted.
-const PINNING_SUPPORTED: bool = cfg!(target_os = "linux");
+/// The CPUs this process may run on, in order, from its affinity mask.
+///
+/// Shard ids used to be used as CPU ids. Under a restricted cpuset --
+/// `docker --cpuset-cpus=2` -- the allowed CPUs are not `0..n`, so shard 0
+/// asked for CPU 0, was refused, and ran unpinned after the banner had
+/// already said `pinned=true`. The mask is what the kernel will actually
+/// honour; shards are laid out on it.
+#[cfg(target_os = "linux")]
+fn allowed_cpus() -> Vec<usize> {
+    // SAFETY: cpu_set_t is a plain bitmask that the kernel fills; it is zeroed
+    // first and read only through CPU_ISSET within its own size.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return Vec::new();
+        }
+
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
+            .collect()
+    }
+}
+
+/// No mask to read, so nothing to pin to: the scheduler places the shards.
+#[cfg(not(target_os = "linux"))]
+fn allowed_cpus() -> Vec<usize> {
+    Vec::new()
+}
+
+/// The CPU shard `id` is pinned to, or none when the shards outnumber the
+/// CPUs -- two shards pinned to one CPU is worse than two the scheduler may
+/// move, so then nothing is pinned.
+fn cpu_for_shard(allowed: &[usize], id: usize) -> Option<usize> {
+    allowed.get(id).copied()
+}
 
 /// The backend to actually serve with, decided once before any shard starts.
 ///
@@ -251,18 +282,33 @@ async fn serve(mut socket: TcpStream, catalog: CatalogView) {
 
 /// One shard: a pinned thread, its own single-threaded reactor, its own
 /// listener, and every connection it accepts served to completion on it.
+///
+/// `cpu` is where to pin, if anywhere; what happened is reported back on
+/// `pinned` before the shard serves, so the banner can say what is true
+/// rather than what was intended.
 fn run_shard(
     id: usize,
     listener: std::net::TcpListener,
-    pin: bool,
+    cpu: Option<usize>,
+    pinned: std::sync::mpsc::Sender<bool>,
     io: Io,
     catalog: CatalogView,
 ) -> bool {
-    // Only ever true on Linux, where the call and the constant both exist.
-    #[cfg(target_os = "linux")]
-    if pin && !pin_to_cpu(id) {
-        eprintln!("pgnoop: shard {id} could not pin to cpu {id}; continuing unpinned");
-    }
+    let did_pin = match cpu {
+        #[cfg(target_os = "linux")]
+        Some(cpu) => {
+            let ok = pin_to_cpu(cpu);
+            if !ok {
+                eprintln!("pgnoop: shard {id} could not pin to cpu {cpu}; continuing unpinned");
+            }
+            ok
+        }
+        #[cfg(not(target_os = "linux"))]
+        Some(_) => false,
+        None => false,
+    };
+    let _ = pinned.send(did_pin);
+    drop(pinned);
 
     // Unused where the enum has a single variant; the loop below is the same.
     #[cfg(not(target_os = "linux"))]
@@ -379,18 +425,15 @@ fn main() {
         }
     };
 
-    // Pinning only makes sense while shards fit on distinct CPUs -- and only
-    // where the platform can pin at all; elsewhere this stays false and no shard
-    // tries.
-    let pin =
-        PINNING_SUPPORTED && shards <= std::thread::available_parallelism().map_or(1, |n| n.get());
-
-    eprintln!(
-        "pgnoop listening on {addr} ({} shards, {}, SO_REUSEPORT, pinned={})",
-        shards,
-        io.as_str(),
-        pin
-    );
+    // Pinning only makes sense while shards fit on distinct CPUs, and the
+    // CPUs are the ones the affinity mask allows -- not 0..shards. Where the
+    // platform cannot pin the list is empty and no shard tries.
+    let allowed = allowed_cpus();
+    let cpus: Vec<Option<usize>> = if shards <= allowed.len() {
+        (0..shards).map(|id| cpu_for_shard(&allowed, id)).collect()
+    } else {
+        vec![None; shards]
+    };
 
     // One handler, shared by every shard. This is NOT full share-nothing and the
     // reason is correctness: DDL arriving on a connection the kernel put on
@@ -400,16 +443,33 @@ fn main() {
     // remains shared per query is the Arc refcount, not the catalog.
     let catalog = CatalogView(Arc::new(NoopHandler::new()));
 
+    let (pinned_tx, pinned_rx) = std::sync::mpsc::channel();
     let mut threads = Vec::with_capacity(shards);
-    for (id, listener) in listeners.into_iter().enumerate() {
+    for ((id, listener), cpu) in listeners.into_iter().enumerate().zip(cpus) {
         let catalog = catalog.clone();
+        let pinned = pinned_tx.clone();
         threads.push(
             std::thread::Builder::new()
                 .name(format!("pgnoop-shard-{id}"))
-                .spawn(move || run_shard(id, listener, pin, io, catalog))
+                .spawn(move || run_shard(id, listener, cpu, pinned, io, catalog))
                 .expect("spawn shard"),
         );
     }
+    drop(pinned_tx);
+
+    // Every shard reports its pin before it serves, so the banner states what
+    // happened -- `pinned=31/32` is a fact, `pinned=true` was a plan. One
+    // report per shard; a shard that died before reporting counts as unpinned.
+    let pinned = (0..shards)
+        .filter(|_| pinned_rx.recv().unwrap_or(false))
+        .count();
+
+    eprintln!(
+        "pgnoop listening on {addr} ({} shards, {}, SO_REUSEPORT, pinned={pinned}/{})",
+        shards,
+        io.as_str(),
+        shards
+    );
 
     // A server whose every shard failed must not exit 0. Discarding the join
     // results means a fully dead process reports success to whatever
@@ -488,6 +548,32 @@ mod tests {
                 assert_eq!(resolve_io(Io::Uring), Io::Epoll);
             }
         }
+    }
+
+    /// **Shards are pinned to the CPUs the process may use, not to their own
+    /// ids.** Under a restricted cpuset (`docker --cpuset-cpus=2`) the
+    /// allowed CPUs are not `0..n`, and shard 0 pinning to CPU 0 fails --
+    /// after the banner has already claimed `pinned=true`. The affinity mask
+    /// is the fact; the shard id is not.
+    #[test]
+    fn shards_are_mapped_onto_the_affinity_mask() {
+        let all = allowed_cpus();
+        assert!(!all.is_empty(), "the process runs somewhere");
+
+        // Restrict THIS thread to the last allowed CPU, which is not CPU 0 on
+        // any box with more than one, and read the mask back.
+        let last = *all.last().unwrap();
+        assert!(pin_to_cpu(last), "pinning to an allowed CPU succeeds");
+
+        let allowed = allowed_cpus();
+        assert_eq!(allowed, vec![last], "the mask is what was set");
+
+        // Shard 0 maps onto the first ALLOWED CPU, whatever its number.
+        assert_eq!(cpu_for_shard(&allowed, 0), Some(last));
+        // And with more shards than CPUs nothing is pinned, since two shards
+        // on one CPU is worse than two shards the scheduler may move.
+        assert_eq!(cpu_for_shard(&allowed, 1), None);
+        assert!(pin_to_cpu(cpu_for_shard(&allowed, 0).unwrap()));
     }
 
     /// **A hostname is a bind address.** `--host localhost` used to panic with
