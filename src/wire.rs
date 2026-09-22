@@ -148,8 +148,12 @@ pub struct Conn {
     /// messages and a message can end mid-field. Counting therefore has to carry
     /// state, which is what this is.
     copy_carry: Vec<u8>,
-    /// Whether the 19-byte binary COPY header has been consumed.
+    /// Whether the binary COPY header has been consumed.
     copy_header_seen: bool,
+    /// Whether the binary COPY trailer has been seen. After it, more data is
+    /// a violation, and at CopyDone it is what makes a partial tuple an error
+    /// rather than a tail still to come.
+    copy_trailer_seen: bool,
     /// The state `ReadyForQuery` reports, which is not a constant.
     ///
     /// pgxpool reads it: a connection that reports idle while a transaction is
@@ -174,6 +178,7 @@ impl Conn {
             portals: HashMap::new(),
             copy_carry: Vec::new(),
             copy_header_seen: false,
+            copy_trailer_seen: false,
             tx_status: TxStatus::Idle,
         }
     }
@@ -197,6 +202,7 @@ impl Conn {
         copy_in_response(out, columns, binary);
         self.copy_carry.clear();
         self.copy_header_seen = false;
+        self.copy_trailer_seen = false;
         self.phase = Phase::CopyIn {
             rows: 0,
             binary,
@@ -208,6 +214,7 @@ impl Conn {
     fn leave_copy_in(&mut self) {
         self.copy_carry.clear();
         self.copy_header_seen = false;
+        self.copy_trailer_seen = false;
         self.phase = Phase::Query;
     }
 
@@ -295,6 +302,12 @@ impl Conn {
         /// client is not sending tuples and the buffer would grow without bound.
         const MAX_CARRY: usize = 1 << 20;
 
+        // The trailer ended the stream; a writer that keeps going is not
+        // writing this format.
+        if self.copy_trailer_seen && !body.is_empty() {
+            return Err("received copy data after EOF marker");
+        }
+
         self.copy_carry.extend_from_slice(body);
 
         let mut buf = std::mem::take(&mut self.copy_carry);
@@ -346,6 +359,11 @@ impl Conn {
             // negative count is not a trailer, it is a malformed stream.
             if fields == -1 {
                 pos += 2;
+                self.copy_trailer_seen = true;
+
+                if pos < n {
+                    return Err("received copy data after EOF marker");
+                }
 
                 break;
             }
@@ -848,6 +866,7 @@ impl Conn {
                             let _ = columns;
                             self.copy_carry.clear();
                             self.copy_header_seen = false;
+                            self.copy_trailer_seen = false;
                             self.phase = Phase::CopyIn {
                                 rows: 0,
                                 binary,
@@ -933,6 +952,30 @@ impl Conn {
             }
 
             tag::COPY_DONE => {
+                // The end of a binary stream is checked against its framing.
+                // PostgreSQL's reader takes a clean EOF at a tuple boundary
+                // as the end (`CopyFromBinaryOneRow`: "end of file, or
+                // trailer"), so a missing trailer is complete; a stream with
+                // no header is not a binary COPY at all, and one that ends
+                // mid-tuple is `unexpected EOF`. This used to answer `COPY n`
+                // for all three.
+                if binary {
+                    let violation = if !self.copy_header_seen {
+                        Some("COPY file signature not recognized")
+                    } else if !self.copy_carry.is_empty() {
+                        Some("unexpected EOF in COPY data")
+                    } else {
+                        None
+                    };
+
+                    if let Some(violation) = violation {
+                        self.leave_copy_in();
+                        self.refuse(extended, out, "22P04", violation);
+
+                        return Some(());
+                    }
+                }
+
                 let rows = match &self.phase {
                     Phase::CopyIn { rows, .. } => *rows,
                     _ => 0,
@@ -2588,6 +2631,61 @@ mod tests {
 
         let (_, out) = binary_copy(&[&stream]);
         assert_eq!(first_sqlstate(&out), "22P04", "count -2");
+    }
+
+    /// **CopyDone is checked against the framing, not taken on trust.** A
+    /// stream that ends mid-tuple is `unexpected EOF in COPY data` in
+    /// PostgreSQL; this answered `COPY n` for whatever had been counted and
+    /// dropped the partial tuple on the floor.
+    #[test]
+    fn binary_copy_done_with_a_partial_tuple_is_an_error() {
+        let mut stream = binary_header(0, &[]);
+        stream.extend(binary_tuple(&[1]));
+        let cut = stream.len() - 3;
+
+        let (_, out) = binary_copy(&[&stream[..cut]]);
+        assert_eq!(tags(&out), vec![b'E', b'Z'], "no CommandComplete");
+        assert_eq!(first_sqlstate(&out), "22P04");
+    }
+
+    /// Bytes after the trailer are `received copy data after EOF marker`,
+    /// whether they arrive in the same message or a later one.
+    #[test]
+    fn binary_copy_data_after_the_trailer_is_an_error() {
+        let mut stream = binary_header(0, &[]);
+        stream.extend(binary_tuple(&[1]));
+        stream.extend_from_slice(&(-1i16).to_be_bytes());
+        let trailer_end = stream.len();
+        stream.extend(binary_tuple(&[2]));
+
+        let (_, out) = binary_copy(&[&stream]);
+        assert_eq!(first_sqlstate(&out), "22P04", "same message");
+
+        let (_, out) = binary_copy(&[&stream[..trailer_end], &stream[trailer_end..]]);
+        assert_eq!(first_sqlstate(&out), "22P04", "later message");
+    }
+
+    /// A stream with no header at all is not a binary COPY: PostgreSQL's
+    /// `ReceiveCopyBinaryHeader` fails to read the signature and says so.
+    #[test]
+    fn binary_copy_done_with_no_header_is_an_error() {
+        let (_, out) = binary_copy(&[]);
+        assert_eq!(first_sqlstate(&out), "22P04");
+    }
+
+    /// The trailer is how a writer says it is done, but PostgreSQL's reader
+    /// (`CopyFromBinaryOneRow`) treats a clean EOF at a tuple boundary the
+    /// same way -- "EOF detected (end of file, or trailer)" -- so a stream that
+    /// omits it is complete, not malformed, and this server agrees with the
+    /// server it stands in for.
+    #[test]
+    fn binary_copy_without_a_trailer_is_still_complete() {
+        let mut stream = binary_header(0, &[]);
+        stream.extend(binary_tuple(&[1]));
+
+        let (_, out) = binary_copy(&[&stream]);
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("COPY 1"), "{text}");
     }
 
     #[test]
