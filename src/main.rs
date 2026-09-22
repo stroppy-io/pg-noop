@@ -39,7 +39,7 @@ fn pin_to_cpu(cpu: usize) -> bool {
     }
 }
 
-/// Resolve `host:port` into a socket address to bind.
+/// Resolve `host:port` into the socket addresses it names, in order.
 ///
 /// **Names, not just literals.** This parsed `SocketAddr` directly, which
 /// accepts `127.0.0.1:5432` and rejects `localhost:5432` -- a panic, not an
@@ -48,17 +48,70 @@ fn pin_to_cpu(cpu: usize) -> bool {
 /// doing less. The README documents `--host` as a bind address; a name is a bind
 /// address.
 ///
-/// The first resolved address is bound, which is what `bind` does too. A name
-/// that resolves to nothing is an error the caller reports, not a panic.
-fn resolve_bind_addr(host: &str, port: u16) -> std::io::Result<SocketAddr> {
+/// **All of them, not the first.** `bind` tries each address a name resolves
+/// to until one binds; keeping only the first meant `localhost` with its first
+/// address occupied exited with no shard served while the base bound the
+/// second. A name that resolves to nothing is an error the caller reports.
+fn resolve_bind_addrs(host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
     use std::net::ToSocketAddrs;
 
-    (host, port).to_socket_addrs()?.next().ok_or_else(|| {
-        std::io::Error::new(
+    let addrs: Vec<SocketAddr> = (host, port).to_socket_addrs()?.collect();
+
+    if addrs.is_empty() {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("{host}:{port} resolved to no addresses"),
-        )
-    })
+        ));
+    }
+
+    Ok(addrs)
+}
+
+/// One listener per shard, on the first candidate address where every shard
+/// can have one.
+///
+/// Bound here, before any shard exists, for two reasons. A shard cannot try
+/// the next address on its own -- every shard has to be on the SAME one, or
+/// the kernel is not balancing one port -- so the choice belongs to the
+/// process. And a bind that fails is then a startup error with a message,
+/// rather than a thread that exits and a process that reports "no shard
+/// served" after the fact.
+///
+/// The first shard's listener decides the address: for a port of 0 that is
+/// the kernel's pick, and the rest bind to it rather than each getting a
+/// port of its own. The error returned is the last candidate's.
+fn bind_shards(
+    candidates: &[SocketAddr],
+    shards: usize,
+    backlog: i32,
+) -> std::io::Result<(SocketAddr, Vec<std::net::TcpListener>)> {
+    let mut last = std::io::Error::new(std::io::ErrorKind::InvalidInput, "no addresses to bind");
+
+    for &candidate in candidates {
+        match bind_shards_to(candidate, shards, backlog) {
+            Ok(bound) => return Ok(bound),
+            Err(e) => last = e,
+        }
+    }
+
+    Err(last)
+}
+
+fn bind_shards_to(
+    candidate: SocketAddr,
+    shards: usize,
+    backlog: i32,
+) -> std::io::Result<(SocketAddr, Vec<std::net::TcpListener>)> {
+    let first = shard_listener(candidate, backlog)?;
+    let addr = first.local_addr()?;
+    let mut listeners = Vec::with_capacity(shards);
+    listeners.push(first);
+
+    for _ in 1..shards {
+        listeners.push(shard_listener(addr, backlog)?);
+    }
+
+    Ok((addr, listeners))
 }
 
 /// Whether this platform can pin at all. Asked once, so a platform without
@@ -198,7 +251,13 @@ async fn serve(mut socket: TcpStream, catalog: CatalogView) {
 
 /// One shard: a pinned thread, its own single-threaded reactor, its own
 /// listener, and every connection it accepts served to completion on it.
-fn run_shard(id: usize, addr: SocketAddr, pin: bool, io: Io, catalog: CatalogView) -> bool {
+fn run_shard(
+    id: usize,
+    listener: std::net::TcpListener,
+    pin: bool,
+    io: Io,
+    catalog: CatalogView,
+) -> bool {
     // Only ever true on Linux, where the call and the constant both exist.
     #[cfg(target_os = "linux")]
     if pin && !pin_to_cpu(id) {
@@ -208,14 +267,6 @@ fn run_shard(id: usize, addr: SocketAddr, pin: bool, io: Io, catalog: CatalogVie
     // Unused where the enum has a single variant; the loop below is the same.
     #[cfg(not(target_os = "linux"))]
     let _ = io;
-
-    let listener = match shard_listener(addr, 1024) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("pgnoop: shard {id} could not bind {addr}: {e}");
-            return false;
-        }
-    };
 
     // io_uring needs no runtime at all: the codec is sans-io, so a shard is a
     // loop that submits reads, runs the codec, and submits writes. epoll keeps
@@ -310,8 +361,18 @@ fn main() {
         config.workers
     };
 
-    let addr = match resolve_bind_addr(&config.host, config.port) {
+    // Resolve, then bind every shard's listener, before any shard runs: a
+    // name's addresses are tried in order until one takes all of them, and a
+    // failure is a startup error rather than a thread that quietly exits.
+    let candidates = match resolve_bind_addrs(&config.host, config.port) {
         Ok(a) => a,
+        Err(e) => {
+            eprintln!("pgnoop: cannot bind {}:{}: {e}", config.host, config.port);
+            std::process::exit(2);
+        }
+    };
+    let (addr, listeners) = match bind_shards(&candidates, shards, 1024) {
+        Ok(bound) => bound,
         Err(e) => {
             eprintln!("pgnoop: cannot bind {}:{}: {e}", config.host, config.port);
             std::process::exit(2);
@@ -325,9 +386,7 @@ fn main() {
         PINNING_SUPPORTED && shards <= std::thread::available_parallelism().map_or(1, |n| n.get());
 
     eprintln!(
-        "pgnoop listening on {}:{} ({} shards, {}, SO_REUSEPORT, pinned={})",
-        config.host,
-        config.port,
+        "pgnoop listening on {addr} ({} shards, {}, SO_REUSEPORT, pinned={})",
         shards,
         io.as_str(),
         pin
@@ -342,18 +401,18 @@ fn main() {
     let catalog = CatalogView(Arc::new(NoopHandler::new()));
 
     let mut threads = Vec::with_capacity(shards);
-    for id in 0..shards {
+    for (id, listener) in listeners.into_iter().enumerate() {
         let catalog = catalog.clone();
         threads.push(
             std::thread::Builder::new()
                 .name(format!("pgnoop-shard-{id}"))
-                .spawn(move || run_shard(id, addr, pin, io, catalog))
+                .spawn(move || run_shard(id, listener, pin, io, catalog))
                 .expect("spawn shard"),
         );
     }
 
-    // A server whose every shard failed to bind must not exit 0. Discarding the
-    // join results means a fully dead process reports success to whatever
+    // A server whose every shard failed must not exit 0. Discarding the join
+    // results means a fully dead process reports success to whatever
     // supervises it.
     let mut served = 0usize;
     for t in threads {
@@ -437,13 +496,62 @@ mod tests {
     /// than a decision.
     #[test]
     fn a_hostname_resolves() {
-        let addr = resolve_bind_addr("localhost", 5432).expect("localhost resolves");
+        let addrs = resolve_bind_addrs("localhost", 5432).expect("localhost resolves");
 
-        assert_eq!(addr.port(), 5432);
-        assert!(
-            addr.ip().is_loopback(),
-            "localhost must resolve to a loopback address, got {addr}"
+        assert!(!addrs.is_empty());
+        for addr in &addrs {
+            assert_eq!(addr.port(), 5432);
+            assert!(
+                addr.ip().is_loopback(),
+                "localhost must resolve to loopback addresses, got {addr}"
+            );
+        }
+    }
+
+    /// **Every resolved address is a candidate, not just the first.**
+    /// `TcpListener::bind` tries each address a name resolves to until one
+    /// binds; keeping only the first meant that with `localhost`'s first
+    /// address occupied and its second free, the server exited with no shard
+    /// served while the base bound the second and ran.
+    #[test]
+    fn bind_tries_each_address_until_one_binds() {
+        // Occupy a port with an ordinary listener (no SO_REUSEPORT), so a
+        // shard listener on it fails the way a foreign process makes it fail.
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied = taken.local_addr().unwrap();
+        let free: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let (bound, listeners) = bind_shards(&[occupied, free], 3, 16).expect("the second binds");
+
+        assert_ne!(
+            bound.port(),
+            occupied.port(),
+            "the occupied address was skipped"
         );
+        assert_ne!(
+            bound.port(),
+            0,
+            "the kernel's pick is reported, not the wildcard"
+        );
+        assert_eq!(listeners.len(), 3);
+        for l in &listeners {
+            assert_eq!(
+                l.local_addr().unwrap(),
+                bound,
+                "every shard is on the same address"
+            );
+        }
+    }
+
+    /// When no candidate binds, the error is the last one's, and it is an
+    /// error the caller reports rather than a panic.
+    #[test]
+    fn bind_reports_the_failure_when_nothing_binds() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied = taken.local_addr().unwrap();
+
+        let err = bind_shards(&[occupied, occupied], 2, 16).expect_err("nothing binds");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
     }
 
     /// A literal is still a literal, and IPv6 in brackets still works -- this is
@@ -451,16 +559,16 @@ mod tests {
     #[test]
     fn a_literal_resolves_to_itself() {
         assert_eq!(
-            resolve_bind_addr("127.0.0.1", 15432).unwrap(),
-            "127.0.0.1:15432".parse::<SocketAddr>().unwrap()
+            resolve_bind_addrs("127.0.0.1", 15432).unwrap(),
+            vec!["127.0.0.1:15432".parse::<SocketAddr>().unwrap()]
         );
         assert_eq!(
-            resolve_bind_addr("0.0.0.0", 5432).unwrap(),
-            "0.0.0.0:5432".parse::<SocketAddr>().unwrap()
+            resolve_bind_addrs("0.0.0.0", 5432).unwrap(),
+            vec!["0.0.0.0:5432".parse::<SocketAddr>().unwrap()]
         );
         assert_eq!(
-            resolve_bind_addr("::1", 5432).unwrap(),
-            "[::1]:5432".parse::<SocketAddr>().unwrap()
+            resolve_bind_addrs("::1", 5432).unwrap(),
+            vec!["[::1]:5432".parse::<SocketAddr>().unwrap()]
         );
     }
 
@@ -469,8 +577,8 @@ mod tests {
     /// the missing feature.
     #[test]
     fn a_name_that_does_not_resolve_is_an_error() {
-        let err = match resolve_bind_addr("no-such-host.invalid", 5432) {
-            Ok(a) => panic!("an invalid host resolved to {a}"),
+        let err = match resolve_bind_addrs("no-such-host.invalid", 5432) {
+            Ok(a) => panic!("an invalid host resolved to {a:?}"),
             Err(e) => e,
         };
 
