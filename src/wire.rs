@@ -62,6 +62,16 @@ const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 /// query, so it needs nothing like `MAX_MESSAGE`.
 const MAX_STARTUP: usize = 10000;
 
+/// PostgreSQL's own wording for a statement inside a failed transaction.
+const ABORTED: &str =
+    "current transaction is aborted, commands ignored until end of transaction block";
+
+/// The statements PostgreSQL still accepts in a failed transaction: the ones
+/// that end it.
+fn ends_transaction(kind: &PlanKind) -> bool {
+    matches!(kind, PlanKind::Commit | PlanKind::Rollback)
+}
+
 /// Where a connection is in its life. The startup exchange is unframed and has
 /// to be recognised by shape, not by a tag byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,16 +235,24 @@ impl Conn {
 
     /// What a statement did to the transaction state.
     ///
-    /// `BEGIN` opens one; `COMMIT` and `ROLLBACK` close it, failed or not. A
-    /// statement inside a failed transaction is refused by PostgreSQL, but a
-    /// blackhole answers everything -- what matters here is that the byte it
-    /// reports does not lie about the block being open.
+    /// `BEGIN` opens one, and inside an open one it is a warning that changes
+    /// nothing; `COMMIT` and `ROLLBACK` close it, failed or not. A statement
+    /// inside a failed transaction never reaches here: it is refused first,
+    /// with 25P02, which is what a client reading `E` expects.
     fn note_transaction(&mut self, kind: &PlanKind) {
         match kind {
-            PlanKind::Begin => self.tx_status = TxStatus::InTransaction,
+            PlanKind::Begin if self.tx_status == TxStatus::Idle => {
+                self.tx_status = TxStatus::InTransaction
+            }
             PlanKind::Commit | PlanKind::Rollback => self.tx_status = TxStatus::Idle,
             _ => {}
         }
+    }
+
+    /// Whether the session is in a failed transaction, where everything but
+    /// COMMIT and ROLLBACK is refused.
+    fn failed(&self) -> bool {
+        self.tx_status == TxStatus::Failed
     }
 
     /// Count complete tuples in a binary COPY stream, carrying the tail.
@@ -527,6 +545,16 @@ impl Conn {
                 let sql = cstr_read(body).unwrap_or("");
                 let plan = PreparedPlan::build(sql);
 
+                // A failed transaction runs nothing until it is ended. This
+                // used to answer the statement anyway, so a SELECT after an
+                // error got its row and a BEGIN flipped the state to `T`
+                // without any ROLLBACK.
+                if self.failed() && !ends_transaction(&plan.kind) {
+                    self.refuse(false, out, "25P02", ABORTED);
+
+                    return Some(());
+                }
+
                 // **COPY is decided by its direction, once, in the plan.**
                 //
                 // `COPY ... FROM STDIN` is a conversation, not an answer: the
@@ -586,9 +614,10 @@ impl Conn {
                 // what the NEXT `ReadyForQuery` must say, and it is noted before
                 // the answer is written so that the byte and the statement
                 // cannot disagree.
+                let failed = self.failed();
                 self.note_transaction(&plan.kind);
 
-                answer(&plan, out, catalog, true);
+                answer(&plan, out, catalog, true, failed);
                 self.ready(out);
             }
 
@@ -644,8 +673,15 @@ impl Conn {
                 // [stmt_name][query][n_params:i16][types...]
                 let (name, after) = cstr_at(body, 0)?;
                 let (sql, _) = cstr_at(body, after)?;
-                self.statements
-                    .insert(name.to_string(), PreparedPlan::build(sql));
+                let plan = PreparedPlan::build(sql);
+
+                if self.failed() && !ends_transaction(&plan.kind) {
+                    self.refuse(true, out, "25P02", ABORTED);
+
+                    return Some(());
+                }
+
+                self.statements.insert(name.to_string(), plan);
                 msg(out, b'1', |_| {});
             }
 
@@ -658,13 +694,19 @@ impl Conn {
                 // not bound to; it is reported. Answering BindComplete here
                 // let a driver with a stale statement cache run against a
                 // statement the server did not have.
-                if !self.statements.contains_key(stmt) {
+                let Some(plan) = self.statements.get(stmt) else {
                     self.refuse(
                         true,
                         out,
                         "26000",
                         &format!("prepared statement \"{stmt}\" does not exist"),
                     );
+
+                    return Some(());
+                };
+
+                if self.failed() && !ends_transaction(&plan.kind) {
+                    self.refuse(true, out, "25P02", ABORTED);
 
                     return Some(());
                 }
@@ -701,6 +743,20 @@ impl Conn {
                     return Some(());
                 };
 
+                // PostgreSQL refuses to describe a statement that returns rows
+                // inside a failed transaction, and only those: a client that
+                // blindly describes its ROLLBACK must still be able to send it.
+                if self.failed()
+                    && matches!(
+                        plan.kind,
+                        PlanKind::SelectMeta { .. } | PlanKind::SelectStub { .. }
+                    )
+                {
+                    self.refuse(true, out, "25P02", ABORTED);
+
+                    return Some(());
+                }
+
                 // A described STATEMENT also gets its parameter types, and a
                 // blackhole derives none -- an empty list is the honest answer.
                 if kind == b'S' {
@@ -725,6 +781,13 @@ impl Conn {
                 {
                     // Execute does NOT re-send RowDescription; Describe did.
                     Some(p) => {
+                        let failed = self.failed();
+                        if failed && !ends_transaction(&p.kind) {
+                            self.refuse(true, out, "25P02", ABORTED);
+
+                            return Some(());
+                        }
+
                         // A COPY that streams from the client needs the
                         // connection to change phase, which is not something a
                         // free function writing into `out` can do. Read what it
@@ -748,7 +811,7 @@ impl Conn {
                             PlanKind::Begin | PlanKind::Commit | PlanKind::Rollback
                         );
 
-                        answer(p, out, catalog, false);
+                        answer(p, out, catalog, false, failed);
 
                         if touched_tx {
                             let kind = p.kind.clone();
@@ -810,7 +873,18 @@ impl Conn {
 /// The rows and the completion tag for one plan. A FREE function, not a method:
 /// it never needed `self`, and being a method is what forced a deep clone of the
 /// plan at every Execute.
-fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, describe: bool) {
+///
+/// `failed` is whether the transaction the statement runs in has failed. Only
+/// COMMIT reads it: committing a failed transaction rolls it back, and
+/// PostgreSQL's tag says `ROLLBACK` so the client can see that its COMMIT
+/// committed nothing.
+fn answer(
+    plan: &PreparedPlan,
+    out: &mut Vec<u8>,
+    catalog: &CatalogView,
+    describe: bool,
+    failed: bool,
+) {
     match &plan.kind {
         PlanKind::SelectMeta { .. } | PlanKind::SelectStub { .. } => {
             let cols = plan_columns(plan, catalog);
@@ -830,6 +904,7 @@ fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, describ
         PlanKind::Update => complete_raw(out, "UPDATE 1"),
         PlanKind::Delete => complete_raw(out, "DELETE 1"),
         PlanKind::Begin => complete_raw(out, "BEGIN"),
+        PlanKind::Commit if failed => complete_raw(out, "ROLLBACK"),
         PlanKind::Commit => complete_raw(out, "COMMIT"),
         PlanKind::Rollback => complete_raw(out, "ROLLBACK"),
         PlanKind::Ddl => {
@@ -2008,6 +2083,145 @@ mod tests {
         let mut out = Vec::new();
         c.advance(&input, &mut out, &v);
         assert_eq!(tags(&out), vec![b'3', b'Z']);
+    }
+
+    /// Put a connection into a FAILED transaction: BEGIN, then the one
+    /// simple-protocol error this codec produces.
+    fn failed(c: &mut Conn, v: &CatalogView) {
+        let mut out = Vec::new();
+        c.advance(&tagged(b'Q', |b| cstr(b, "BEGIN")), &mut out, v);
+        c.advance(&tagged(b'c', |_| {}), &mut out, v);
+        assert_eq!(last_ready_status(&out), b'E');
+    }
+
+    /// **A failed transaction refuses statements, not just reports itself.**
+    /// The state byte said `E` and every statement still ran: a SELECT got its
+    /// row, and a BEGIN flipped the byte back to `T` with no ROLLBACK. A
+    /// client reading `E` expects PostgreSQL's 25P02 for anything but the
+    /// transaction's end, and a pool that retries in place relies on it.
+    #[test]
+    fn a_failed_transaction_refuses_everything_but_its_end() {
+        let (mut c, v) = connected();
+        failed(&mut c, &v);
+
+        for sql in [
+            "select 1",
+            "INSERT INTO t VALUES (1)",
+            "BEGIN",
+            "CREATE TABLE t (a int)",
+        ] {
+            let mut out = Vec::new();
+            c.advance(&tagged(b'Q', |b| cstr(b, sql)), &mut out, &v);
+            assert_eq!(tags(&out), vec![b'E', b'Z'], "{sql} must be refused");
+            assert_eq!(first_sqlstate(&out), "25P02", "{sql}");
+            assert_eq!(last_ready_status(&out), b'E', "{sql} must stay failed");
+        }
+
+        let mut out = Vec::new();
+        c.advance(&tagged(b'Q', |b| cstr(b, "ROLLBACK")), &mut out, &v);
+        assert_eq!(tags(&out), vec![b'C', b'Z']);
+        assert_eq!(last_ready_status(&out), b'I');
+    }
+
+    /// COMMIT of a failed transaction rolls it back, and says so: the tag is
+    /// `ROLLBACK`, which is how a client learns its COMMIT committed nothing.
+    #[test]
+    fn commit_of_a_failed_transaction_says_rollback() {
+        let (mut c, v) = connected();
+        failed(&mut c, &v);
+
+        let mut out = Vec::new();
+        c.advance(&tagged(b'Q', |b| cstr(b, "COMMIT")), &mut out, &v);
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("ROLLBACK"), "{text}");
+        assert!(!text.contains("COMMIT"), "{text}");
+        assert_eq!(last_ready_status(&out), b'I');
+    }
+
+    /// BEGIN inside an open transaction is a warning in PostgreSQL, not a new
+    /// block: the state stays `T`.
+    #[test]
+    fn begin_inside_a_transaction_keeps_it_open() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        c.advance(&tagged(b'Q', |b| cstr(b, "BEGIN")), &mut out, &v);
+        c.advance(&tagged(b'Q', |b| cstr(b, "BEGIN")), &mut out, &v);
+        assert_eq!(last_ready_status(&out), b'T');
+    }
+
+    /// The extended protocol is refused the same way, at Parse, Bind and
+    /// Execute -- and skips to Sync, since those are extended messages.
+    #[test]
+    fn a_failed_transaction_refuses_extended_messages_too() {
+        let (mut c, v) = connected();
+
+        // A statement prepared BEFORE the failure, so Bind and Execute can be
+        // tried on their own.
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'P', |b| {
+                cstr(b, "s1");
+                cstr(b, "select 1");
+                b.extend_from_slice(&0i16.to_be_bytes());
+            }),
+            &mut out,
+            &v,
+        );
+        failed(&mut c, &v);
+
+        // Parse of a new SELECT.
+        let mut input = tagged(b'P', |b| {
+            cstr(b, "s2");
+            cstr(b, "select 2");
+            b.extend_from_slice(&0i16.to_be_bytes());
+        });
+        input.extend(tagged(b'S', |_| {}));
+        out.clear();
+        c.advance(&input, &mut out, &v);
+        assert_eq!(tags(&out), vec![b'E', b'Z'], "Parse");
+        assert_eq!(first_sqlstate(&out), "25P02");
+
+        // Bind of the old one.
+        let mut input = tagged(b'B', |b| {
+            cstr(b, "");
+            cstr(b, "s1");
+            b.extend_from_slice(&0i16.to_be_bytes());
+            b.extend_from_slice(&0i16.to_be_bytes());
+            b.extend_from_slice(&0i16.to_be_bytes());
+        });
+        input.extend(tagged(b'E', |b| {
+            cstr(b, "");
+            b.extend_from_slice(&0i32.to_be_bytes());
+        }));
+        input.extend(tagged(b'S', |_| {}));
+        out.clear();
+        c.advance(&input, &mut out, &v);
+        assert_eq!(tags(&out), vec![b'E', b'Z'], "Bind");
+        assert_eq!(first_sqlstate(&out), "25P02");
+        assert_eq!(last_ready_status(&out), b'E');
+
+        // ROLLBACK through the extended protocol ends it.
+        let mut input = tagged(b'P', |b| {
+            cstr(b, "");
+            cstr(b, "ROLLBACK");
+            b.extend_from_slice(&0i16.to_be_bytes());
+        });
+        input.extend(tagged(b'B', |b| {
+            cstr(b, "");
+            cstr(b, "");
+            b.extend_from_slice(&0i16.to_be_bytes());
+            b.extend_from_slice(&0i16.to_be_bytes());
+            b.extend_from_slice(&0i16.to_be_bytes());
+        }));
+        input.extend(tagged(b'E', |b| {
+            cstr(b, "");
+            b.extend_from_slice(&0i32.to_be_bytes());
+        }));
+        input.extend(tagged(b'S', |_| {}));
+        out.clear();
+        c.advance(&input, &mut out, &v);
+        assert_eq!(tags(&out), vec![b'1', b'2', b'C', b'Z'], "ROLLBACK runs");
+        assert_eq!(last_ready_status(&out), b'I');
     }
 
     #[test]
