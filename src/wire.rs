@@ -1136,8 +1136,9 @@ impl Conn {
             }
 
             tag::DESCRIBE => {
-                // ['S'|'P'][name]
-                let kind = body.first().copied().unwrap_or(b'P');
+                // ['S'|'P'][name]. Anything else used to be read as a portal;
+                // PostgreSQL refuses it.
+                let kind = subtype(body)?;
                 let (name, _) = cstr_at(body, 1)?;
 
                 let Some((Statement { plan, params }, formats)) = self.described(kind, name) else {
@@ -1267,13 +1268,14 @@ impl Conn {
             tag::FLUSH => {}
 
             tag::CLOSE => {
-                let kind = body.first().copied().unwrap_or(b'P');
-                if let Some((name, _)) = cstr_at(body, 1) {
-                    if kind == b'S' {
-                        self.statements.remove(name);
-                    } else {
-                        self.portals.remove(name);
-                    }
+                // ['S'|'P'][name], strictly: Close `X` answered CloseComplete
+                // where PostgreSQL answers 08P01.
+                let kind = subtype(body)?;
+                let (name, _) = cstr_at(body, 1)?;
+                if kind == b'S' {
+                    self.statements.remove(name);
+                } else {
+                    self.portals.remove(name);
                 }
                 msg(out, b'3', |_| {});
             }
@@ -1783,6 +1785,15 @@ fn ddl_tag(sql: &str) -> &'static str {
 }
 
 // ------------------------------------------------------------------ decoding
+
+/// The `S` or `P` a Describe or Close begins with. Anything else is a
+/// malformed body, not a portal.
+fn subtype(body: &[u8]) -> Option<u8> {
+    match body.first() {
+        Some(&k @ (b'S' | b'P')) => Some(k),
+        _ => None,
+    }
+}
 
 /// An int16 count at `from` followed by that many int32 OIDs, as Parse
 /// declares its parameter types. A count that outruns the body is malformed.
@@ -4336,6 +4347,45 @@ mod tests {
         c.advance(&input, &mut out, &v);
         assert_eq!(tags(&out), vec![b'E', b'Z']);
         assert_eq!(first_sqlstate(&out), "08P01");
+    }
+
+    /// **Describe and Close take `S` or `P` and nothing else.** Any other
+    /// subtype was treated as a portal: Close `X` answered CloseComplete
+    /// where PostgreSQL answers 08P01.
+    #[test]
+    fn describe_and_close_subtypes_are_strict() {
+        for (tag, ok_tag) in [(b'D', b'n'), (b'C', b'3')] {
+            for sub in [b'X', b'p', b's', 0u8] {
+                let (mut c, v) = connected();
+                let mut input = tagged(tag, |b| {
+                    b.push(sub);
+                    cstr(b, "");
+                });
+                input.extend(tagged(b'S', |_| {}));
+                let mut out = Vec::new();
+                c.advance(&input, &mut out, &v);
+                assert_eq!(
+                    tags(&out),
+                    vec![b'E', b'Z'],
+                    "{} subtype {sub}",
+                    tag as char
+                );
+                assert_eq!(first_sqlstate(&out), "08P01");
+            }
+
+            // And the two valid ones still work on the unnamed portal, which
+            // is never absent for Close and is refused as absent by Describe.
+            let (mut c, v) = connected();
+            let mut input = tagged(tag, |b| {
+                b.push(b'P');
+                cstr(b, "");
+            });
+            input.extend(tagged(b'S', |_| {}));
+            let mut out = Vec::new();
+            c.advance(&input, &mut out, &v);
+            let t = tags(&out);
+            assert!(t == vec![ok_tag, b'Z'] || t == vec![b'E', b'Z'], "{:?}", t);
+        }
     }
 
     #[test]
