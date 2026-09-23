@@ -4266,6 +4266,21 @@ mod tests {
         }
     }
 
+    /// The reviewer's end-to-end case: a `)` inside a quoted column name
+    /// must not keep the statement out of COPY.
+    #[test]
+    fn a_quoted_paren_in_the_column_list_still_enters_copy() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'Q', |b| cstr(b, "COPY t (\"a)\", b) FROM STDIN")),
+            &mut out,
+            &v,
+        );
+        assert_eq!(tags(&out), vec![b'G']);
+        assert_eq!(i16::from_be_bytes([out[6], out[7]]), 2, "two columns");
+    }
+
     #[test]
     fn an_unknown_message_is_consumed_rather_than_desynchronising() {
         let (mut c, v) = connected();

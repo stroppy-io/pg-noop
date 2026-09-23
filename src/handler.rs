@@ -519,9 +519,12 @@ impl<'a> SqlWords<'a> {
         }
 
         // A parenthesised group: skipped whole, so a comma inside does not
-        // become a word and a newline inside does not end the search.
+        // become a word and a newline inside does not end the search. Whole
+        // means to the MATCHING parenthesis: this used to stop at the first
+        // `)`, so `("a)", b)` ended inside the quoted name, the direction
+        // after it was never found, and the statement was not a COPY at all.
         if first == '(' {
-            let end = self.rest.find(')').map_or(self.rest.len(), |i| i + 1);
+            let end = group_end(self.rest);
             let word = &self.rest[..end];
             self.rest = &self.rest[end..];
 
@@ -550,6 +553,57 @@ impl<'a> SqlWords<'a> {
 
         Some(word)
     }
+}
+
+/// The index just past the parenthesis matching the `(` that starts `s`,
+/// or the end of `s` when it is unbalanced. Quotes of both kinds (with
+/// doubled quotes inside), comments of both kinds, and nested parentheses
+/// are all opaque to the match.
+fn group_end(s: &str) -> usize {
+    let b = s.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+
+    while i < b.len() {
+        match b[i] {
+            b'\'' | b'"' => {
+                let q = b[i];
+                i += 1;
+                while i < b.len() {
+                    if b[i] == q {
+                        if b.get(i + 1) == Some(&q) {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let rest = skip_block_comment(&s[i..]);
+                i = s.len() - rest.len();
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    b.len()
 }
 
 /// The text after a `/* ... */` comment that starts `s`, nested as PostgreSQL
@@ -2020,6 +2074,39 @@ mod copy_direction_tests {
             CopyFormat::Binary
         );
         assert_eq!(copy_format("COPY t FROM STDIN/*binary*/"), CopyFormat::Text);
+    }
+
+    /// **A parenthesised group ends at its matching parenthesis.** The walker
+    /// took a group through the first literal `)`, ignoring quotes and
+    /// nesting, so `COPY t ("a)", b) FROM STDIN` ended the column list inside
+    /// the quoted name and the direction was never found -- the statement
+    /// fell through to `SELECT 0` and the client's CopyData then arrived
+    /// outside a COPY. PostgreSQL enters COPY with two columns.
+    #[test]
+    fn a_parenthesised_group_honours_quotes_and_nesting() {
+        for (sql, columns) in [
+            ("COPY t (\"a)\", b) FROM STDIN", 2),
+            ("COPY t (\"a)\") FROM STDIN", 1),
+            ("COPY t (\"a\"\")\", b) FROM STDIN", 2),
+            ("COPY t (a, \"b(\") FROM STDIN", 2),
+            ("COPY t (a, b /* ) */) FROM STDIN", 2),
+            ("COPY t (a, b) FROM STDIN WITH (FORMAT csv, QUOTE ')')", 2),
+        ] {
+            assert_eq!(
+                copy_direction(sql),
+                Some(CopyDirection::FromStdin),
+                "{sql:?}"
+            );
+            assert_eq!(super::count_copy_columns(sql), columns, "{sql:?}");
+        }
+        assert_eq!(
+            copy_format("COPY t (\"a)\") FROM STDIN WITH (FORMAT binary)"),
+            CopyFormat::Binary
+        );
+        assert_eq!(
+            copy_format("COPY t FROM STDIN WITH (DELIMITER ')', FORMAT csv)"),
+            CopyFormat::Csv
+        );
     }
 
     /// The format is an OPTION, read after the direction's target, not any
