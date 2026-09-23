@@ -793,7 +793,14 @@ impl Conn {
                     return Some(());
                 }
 
-                let params = crate::handler::parameter_types(sql, &declared);
+                let params = match crate::handler::parameter_types(sql, &declared) {
+                    Ok(params) => params,
+                    Err(e) => {
+                        self.refuse(true, out, e.sqlstate(), &e.message());
+
+                        return Some(());
+                    }
+                };
                 self.statements
                     .insert(name.to_string(), Statement { plan, params });
                 msg(out, b'1', |_| {});
@@ -3512,6 +3519,26 @@ mod tests {
         c.advance(&tagged(b'Q', |b| cstr(b, "")), &mut out, &v);
         assert_eq!(tags(&out), vec![b'I', b'Z']);
         assert_eq!(last_ready_status(&out), b'E');
+    }
+
+    /// A placeholder PostgreSQL would refuse is refused at Parse, with its
+    /// SQLSTATE, and skips to Sync like any other Parse error.
+    #[test]
+    fn an_invalid_placeholder_is_a_parse_error() {
+        for (sql, code) in [("select $0", "42P02"), ("select $5000000", "54000")] {
+            let (mut c, v) = connected();
+            let mut input = tagged(b'P', |b| {
+                cstr(b, "");
+                cstr(b, sql);
+                b.extend_from_slice(&0i16.to_be_bytes());
+            });
+            input.extend(tagged(b'S', |_| {}));
+
+            let mut out = Vec::new();
+            c.advance(&input, &mut out, &v);
+            assert_eq!(tags(&out), vec![b'E', b'Z'], "{sql}");
+            assert_eq!(first_sqlstate(&out), code, "{sql}");
+        }
     }
 
     #[test]

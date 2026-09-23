@@ -646,6 +646,37 @@ fn is_table_constraint_keyword(word: &str) -> bool {
     )
 }
 
+/// The most parameters a statement may declare: ParameterDescription carries
+/// the count as an int16, and PostgreSQL has the same ceiling.
+pub(crate) const MAX_PARAMETERS: usize = 65535;
+
+/// A placeholder PostgreSQL would refuse, with the SQLSTATE it uses.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PlaceholderError {
+    /// `$0`: parameters are numbered from 1.
+    Zero,
+    /// `$n` past `MAX_PARAMETERS`, or too long to be a number at all.
+    TooMany,
+}
+
+impl PlaceholderError {
+    pub(crate) fn sqlstate(&self) -> &'static str {
+        match self {
+            PlaceholderError::Zero => "42P02",
+            PlaceholderError::TooMany => "54000",
+        }
+    }
+
+    pub(crate) fn message(&self) -> String {
+        match self {
+            PlaceholderError::Zero => "there is no parameter $0".to_string(),
+            PlaceholderError::TooMany => {
+                format!("cannot use more than {MAX_PARAMETERS} parameters in a statement")
+            }
+        }
+    }
+}
+
 /// The parameter types a Parse declares, completed from the SQL text.
 ///
 /// `declared` is the Parse message's list, where 0 means "you decide". For
@@ -659,80 +690,145 @@ fn is_table_constraint_keyword(word: &str) -> bool {
 /// checks its arguments against before it binds, so it has to cover every
 /// placeholder.
 ///
+/// The count is BOUNDED before anything is allocated. `select $5000000`
+/// used to allocate and retain twenty megabytes on one unauthenticated
+/// connection; now it is refused at Parse, as `$0` is.
+///
 /// Text work, done once at Parse.
-pub(crate) fn parameter_types(sql: &str, declared: &[u32]) -> Vec<u32> {
-    let placeholders = highest_placeholder(sql);
-    let n = declared.len().max(placeholders);
+pub(crate) fn parameter_types(sql: &str, declared: &[u32]) -> Result<Vec<u32>, PlaceholderError> {
+    let found = placeholders(sql)?;
+    let highest = found.iter().map(|&(n, _)| n).max().unwrap_or(0);
+    let n = declared.len().max(highest).min(MAX_PARAMETERS);
 
-    (0..n)
+    Ok((0..n)
         .map(|i| match declared.get(i) {
             Some(&oid) if oid != 0 => oid,
-            _ => cast_on_placeholder(sql, i + 1)
+            _ => cast_on_placeholder(sql, &found, i + 1)
                 .map(|t| map_sql_type(t).oid())
                 .unwrap_or(0),
         })
-        .collect()
+        .collect())
 }
 
-/// The highest `$n` in the text, outside string literals. 0 when there is
-/// none.
-fn highest_placeholder(sql: &str) -> usize {
-    let mut highest = 0;
-
-    for (at, _) in placeholders(sql) {
-        highest = highest.max(at);
-    }
-
-    highest
-}
-
-/// Every `$n` outside string literals: its number and the index after it.
-fn placeholders(sql: &str) -> Vec<(usize, usize)> {
+/// Every `$n` where SQL would read one: its number and the index after it.
+///
+/// Skips what the SQL lexer skips -- `--` and `/* */` comments (nested, as
+/// PostgreSQL nests them), `'strings'` with `''` and the backslash escapes of
+/// `E'...'`, `"identifiers"`, and `$tag$ dollar quotes $tag$`. A `$1` inside
+/// any of those was counted, and pgx then refused a valid no-argument query
+/// with `expected 1 arguments, got 0`.
+fn placeholders(sql: &str) -> Result<Vec<(usize, usize)>, PlaceholderError> {
     let b = sql.as_bytes();
     let mut found = Vec::new();
     let mut i = 0;
 
     while i < b.len() {
-        match b[i] {
-            // A string literal: skip to its close, treating '' as one quote.
-            b'\'' => {
+        let c = b[i];
+
+        // -- to end of line.
+        if c == b'-' && b.get(i + 1) == Some(&b'-') {
+            i += 2;
+            while i < b.len() && b[i] != b'\n' {
                 i += 1;
-                while i < b.len() {
-                    if b[i] == b'\'' {
-                        if b.get(i + 1) == Some(&b'\'') {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
+            }
+            continue;
+        }
+
+        // /* ... */, nested.
+        if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            let mut depth = 1;
+            i += 2;
+            while i < b.len() && depth > 0 {
+                if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    i += 2;
+                } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    i += 2;
+                } else {
                     i += 1;
                 }
             }
-            b'$' if b.get(i + 1).is_some_and(u8::is_ascii_digit) => {
+            continue;
+        }
+
+        // 'string' and "identifier": doubled quotes are one quote. An E'...'
+        // string also escapes with a backslash.
+        if c == b'\'' || c == b'"' {
+            let escapes = c == b'\''
+                && i > 0
+                && matches!(b[i - 1], b'E' | b'e')
+                && (i == 1 || !is_ident_continue(b[i - 2]));
+            i += 1;
+            while i < b.len() {
+                if escapes && b[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b[i] == c {
+                    if b.get(i + 1) == Some(&c) {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        if c == b'$' {
+            // $n: the placeholder.
+            if b.get(i + 1).is_some_and(u8::is_ascii_digit) {
                 let start = i + 1;
                 let mut end = start;
+                let mut n: usize = 0;
                 while end < b.len() && b[end].is_ascii_digit() {
+                    n = n
+                        .saturating_mul(10)
+                        .saturating_add(usize::from(b[end] - b'0'));
                     end += 1;
                 }
-                if let Ok(n) = sql[start..end].parse::<usize>() {
-                    found.push((n, end));
+                if n == 0 {
+                    return Err(PlaceholderError::Zero);
                 }
+                if n > MAX_PARAMETERS {
+                    return Err(PlaceholderError::TooMany);
+                }
+                found.push((n, end));
                 i = end;
                 continue;
             }
-            _ => {}
+
+            // $tag$ ... $tag$: skip to the matching close. A tag is letters,
+            // digits and underscores -- not `$`, which `is_ident_continue`
+            // allows inside an identifier.
+            let tag_end = (i + 1..b.len())
+                .find(|&k| !(b[k].is_ascii_alphanumeric() || b[k] == b'_'))
+                .unwrap_or(b.len());
+            if b.get(tag_end) == Some(&b'$') {
+                let open = &sql[i..=tag_end];
+                let body = tag_end + 1;
+                match sql[body..].find(open) {
+                    Some(close) => i = body + close + open.len(),
+                    None => i = b.len(),
+                }
+                continue;
+            }
         }
+
         i += 1;
     }
 
-    found
+    Ok(found)
 }
 
 /// The type name after `$n::`, if the placeholder is cast directly.
-fn cast_on_placeholder(sql: &str, n: usize) -> Option<&str> {
+fn cast_on_placeholder<'a>(sql: &'a str, found: &[(usize, usize)], n: usize) -> Option<&'a str> {
     let b = sql.as_bytes();
 
-    for (at, after) in placeholders(sql) {
+    for &(at, after) in found {
         if at != n {
             continue;
         }
@@ -1815,5 +1911,64 @@ mod copy_direction_tests {
         for sql in ["COPY t FROM STDIN", "COPY t FROM STDIN WITH (FORMAT csv)"] {
             assert!(!copy_is_binary(sql), "{sql:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use super::*;
+
+    fn count(sql: &str) -> usize {
+        parameter_types(sql, &[]).expect(sql).len()
+    }
+
+    /// **`$n` is a placeholder only where SQL would read one.** The scanner
+    /// skipped single-quoted strings and nothing else, so a `$1` inside a
+    /// comment, a dollar-quoted string or a quoted identifier was counted, and
+    /// pgx refused the valid no-argument query with `expected 1 arguments, got
+    /// 0` where PostgreSQL reports zero and runs it.
+    #[test]
+    fn placeholders_in_comments_and_quotes_are_not_parameters() {
+        for sql in [
+            "select 1 -- $1",
+            "select 1 -- $1\n",
+            "select 1 /* $1 */",
+            "select 1 /* outer /* $1 */ still comment */",
+            "select $$literal $1$$",
+            "select $tag$ $1 $tag$",
+            "select $_x1$ $1 $_x1$",
+            "select \"$1\" from t",
+            "select '$1'",
+            "select 'it''s $1'",
+            "select E'\\' $1'",
+            "select e'\\\\' , 1",
+        ] {
+            assert_eq!(count(sql), 0, "{sql:?}");
+        }
+    }
+
+    /// And where SQL would read one, it still is -- after a comment, after a
+    /// string, and inside parentheses.
+    #[test]
+    fn real_placeholders_are_still_found() {
+        assert_eq!(count("select $1 -- $2"), 1);
+        assert_eq!(count("select /* a */ $1, /* b */ $2"), 2);
+        assert_eq!(count("select '$9', $1"), 1);
+        assert_eq!(count("select $$x$$, $3"), 3);
+        assert_eq!(count("select f($1,$2)"), 2);
+        assert_eq!(count("select $1::int8"), 1);
+        assert_eq!(count("select E'\\'' || $1"), 1);
+    }
+
+    /// `$0` is not a parameter in PostgreSQL, and the count is bounded BEFORE
+    /// anything is allocated: `select $5000000` used to allocate and retain
+    /// twenty megabytes on one unauthenticated connection.
+    #[test]
+    fn zero_and_oversized_indices_are_refused_before_allocating() {
+        assert!(parameter_types("select $0", &[]).is_err());
+        assert!(parameter_types("select $5000000", &[]).is_err());
+        assert!(parameter_types("select $99999999999999999999999", &[]).is_err());
+        assert!(parameter_types("select $65536", &[]).is_err());
+        assert_eq!(count("select $65535"), 65535);
     }
 }
