@@ -23,6 +23,7 @@
 //! from it must see its own column names back.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::handler::{CatalogView, CopyDirection, CopyFormat, PlanKind, PreparedPlan};
 
@@ -215,10 +216,17 @@ impl Formats {
     }
 }
 
-/// A portal: a bound statement, the result formats the Bind asked for, and
-/// how far it has been read.
+/// A portal: the statement it was bound to, the result formats the Bind
+/// asked for, and how far it has been read.
+///
+/// The statement itself, not its name. A portal used to look its statement
+/// up by name at Execute, so Close of the statement and a Parse reusing the
+/// name changed what an already-bound portal ran -- a SELECT portal became
+/// a BEGIN, or a COPY. PostgreSQL keeps the plan with the portal; the name
+/// is only how it was found at Bind. Shared, not cloned: a plan carries the
+/// SQL and its parsed pieces, and Bind is on the hot path.
 struct Portal {
-    statement: String,
+    statement: Arc<Statement>,
     formats: Formats,
     /// Whether the portal has been read to its end. A plan answers at most
     /// one row, so this is the whole cursor: Execute of a consumed portal
@@ -231,7 +239,7 @@ pub struct Conn {
     phase: Phase,
     /// Prepared statements by name. "" is the unnamed statement, which clients
     /// reuse constantly, so it is a normal entry rather than a special case.
-    statements: HashMap<String, Statement>,
+    statements: HashMap<String, Arc<Statement>>,
     /// Portals by name. "" is the unnamed portal, rebound by every query.
     portals: HashMap<String, Portal>,
     /// Bytes of a binary COPY stream that did not yet form a whole tuple.
@@ -938,7 +946,7 @@ impl Conn {
                     }
                 };
                 self.statements
-                    .insert(name.to_string(), Statement { plan, params });
+                    .insert(name.to_string(), Arc::new(Statement { plan, params }));
                 msg(out, b'1', |_| {});
             }
 
@@ -954,7 +962,7 @@ impl Conn {
                 // not bound to; it is reported. Answering BindComplete here
                 // let a driver with a stale statement cache run against a
                 // statement the server did not have.
-                let Some(Statement { plan, params }) = self.statements.get(stmt) else {
+                let Some(statement) = self.statements.get(stmt) else {
                     self.refuse(
                         true,
                         out,
@@ -964,6 +972,8 @@ impl Conn {
 
                     return Some(());
                 };
+
+                let Statement { plan, params } = &**statement;
 
                 if self.failed() && !ends_transaction(&plan.kind) {
                     self.refuse(true, out, "25P02", ABORTED);
@@ -1046,11 +1056,10 @@ impl Conn {
                 // forever. The formats are replaced in place: for every
                 // driver's usual shapes that is a copy of an enum, not an
                 // allocation.
+                let statement = Arc::clone(statement);
                 match self.portals.get_mut(portal) {
                     Some(cur) => {
-                        if cur.statement != stmt {
-                            cur.statement = stmt.to_string();
-                        }
+                        cur.statement = statement;
                         cur.formats = bind.formats;
                         cur.consumed = false;
                     }
@@ -1058,7 +1067,7 @@ impl Conn {
                         self.portals.insert(
                             portal.to_string(),
                             Portal {
-                                statement: stmt.to_string(),
+                                statement,
                                 formats: bind.formats,
                                 consumed: false,
                             },
@@ -1128,17 +1137,10 @@ impl Conn {
                 // stay borrowed out of `self`. It used to be a method, which made
                 // the borrow checker demand `.cloned()` -- a DEEP copy of the sql
                 // String and the parsed table/column Vecs, on every Execute.
-                // The portal is borrowed mutably and the statement immutably,
-                // from two different fields, which the borrow checker allows.
-                let statement = self
-                    .portals
-                    .get_mut(name)
-                    .and_then(|portal| self.statements.get(&portal.statement).map(|s| (portal, s)));
-
-                // Executing a portal that was never bound used to fabricate
-                // `SELECT 0`. PostgreSQL reports it, and so does this. A portal
-                // whose statement was closed is closed with it.
-                let Some((portal, Statement { plan: p, .. })) = statement else {
+                // The plan is the portal's own, so one lookup finds both.
+                let Some(portal) = self.portals.get_mut(name) else {
+                    // Executing a portal that was never bound used to fabricate
+                    // `SELECT 0`. PostgreSQL reports it, and so does this.
                     self.refuse(
                         true,
                         out,
@@ -1148,6 +1150,8 @@ impl Conn {
 
                     return Some(());
                 };
+                let statement = Arc::clone(&portal.statement);
+                let p = &statement.plan;
 
                 if failed && !ends_transaction(&p.kind) {
                     self.refuse(true, out, "25P02", ABORTED);
@@ -1168,16 +1172,6 @@ impl Conn {
                     _ => None,
                 };
 
-                // The extended protocol's Execute is where a statement actually
-                // runs, so it is where the transaction state changes. `SYNC` is
-                // what asks for the byte, later. Copied out, because
-                // `note_transaction` needs `self` mutably and `p` is borrowed
-                // from it.
-                let touched_tx = matches!(
-                    p.kind,
-                    PlanKind::Begin | PlanKind::Commit | PlanKind::Rollback
-                );
-
                 // Execute does NOT re-send RowDescription; Describe did.
                 portal.consumed = answer(
                     p,
@@ -1192,10 +1186,10 @@ impl Conn {
                     },
                 );
 
-                if touched_tx {
-                    let kind = p.kind.clone();
-                    self.note_transaction(&kind);
-                }
+                // The extended protocol's Execute is where a statement actually
+                // runs, so it is where the transaction state changes. `SYNC` is
+                // what asks for the byte, later.
+                self.note_transaction(&p.kind);
 
                 if let Some(format) = streams_rows {
                     self.copy_carry.clear();
@@ -1360,11 +1354,9 @@ impl Conn {
     /// formats: PostgreSQL reports text there, whatever a later Bind asks.
     fn described(&self, kind: u8, name: &str) -> Option<(&Statement, &Formats)> {
         if kind == b'S' {
-            self.statements.get(name).map(|s| (s, &Formats::TEXT))
+            self.statements.get(name).map(|s| (&**s, &Formats::TEXT))
         } else {
-            self.portals
-                .get(name)
-                .and_then(|p| self.statements.get(&p.statement).map(|s| (s, &p.formats)))
+            self.portals.get(name).map(|p| (&*p.statement, &p.formats))
         }
     }
 }
@@ -4118,6 +4110,78 @@ mod tests {
             c.advance(&tagged(b'c', |_| {}), &mut out, &v);
             assert_eq!(copy_tag(&out), "COPY 1", "{sql:?}");
         }
+    }
+
+    /// **A portal keeps the plan it was bound to.** The portal stored its
+    /// statement's NAME and looked the plan up at Execute, so Close of the
+    /// statement followed by a Parse reusing the name changed what an
+    /// already-bound portal ran: Parse s as SELECT 1, Bind p, Close s, Parse s
+    /// as BEGIN, Execute p answered `BEGIN` with status `T`. PostgreSQL keeps
+    /// the plan with the portal and answers the row and `I`.
+    #[test]
+    fn a_portal_keeps_its_plan_when_the_statement_name_is_reused() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        let parse = |name: &str, sql: &str| {
+            tagged(b'P', |b| {
+                cstr(b, name);
+                cstr(b, sql);
+                b.extend_from_slice(&0i16.to_be_bytes());
+            })
+        };
+        let close_s = |name: &str| {
+            tagged(b'C', |b| {
+                b.push(b'S');
+                cstr(b, name);
+            })
+        };
+
+        c.advance(&parse("s", "select 1"), &mut out, &v);
+        bind_only(&mut c, &v, "p", "s");
+        c.advance(&close_s("s"), &mut out, &v);
+        c.advance(&parse("s", "BEGIN"), &mut out, &v);
+
+        let out = execute(&mut c, &v, "p", 0);
+        assert_eq!(tags(&out), vec![b'D', b'C', b'Z'], "the row, not BEGIN");
+        assert_eq!(copy_tag(&out), "SELECT 1");
+        assert_eq!(last_ready_status(&out), b'I');
+
+        // And a portal survives the Close of its statement on its own: the
+        // plan is the portal's, and the name was only how it was found.
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        c.advance(&parse("s", "select 1"), &mut out, &v);
+        bind_only(&mut c, &v, "p", "s");
+        c.advance(&close_s("s"), &mut out, &v);
+        let out = execute(&mut c, &v, "p", 0);
+        assert_eq!(tags(&out), vec![b'D', b'C', b'Z']);
+
+        // Reusing the name for a COPY does not turn the old portal into one.
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        c.advance(&parse("s", "select 1"), &mut out, &v);
+        bind_only(&mut c, &v, "p", "s");
+        c.advance(&close_s("s"), &mut out, &v);
+        c.advance(&parse("s", "COPY t FROM STDIN"), &mut out, &v);
+        let out = execute(&mut c, &v, "p", 0);
+        assert_eq!(tags(&out), vec![b'D', b'C', b'Z']);
+    }
+
+    /// Bind `portal` to `stmt`, text formats, no Sync.
+    fn bind_only(c: &mut Conn, v: &CatalogView, portal: &str, stmt: &str) {
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'B', |b| {
+                cstr(b, portal);
+                cstr(b, stmt);
+                b.extend_from_slice(&0i16.to_be_bytes());
+                b.extend_from_slice(&0i16.to_be_bytes());
+                b.extend_from_slice(&0i16.to_be_bytes());
+            }),
+            &mut out,
+            v,
+        );
+        assert_eq!(tags(&out), vec![b'2'], "{portal} -> {stmt}");
     }
 
     #[test]
