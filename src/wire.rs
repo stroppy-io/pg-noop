@@ -864,7 +864,10 @@ impl Conn {
             }
 
             tag::QUERY => {
-                let sql = cstr_read(body).unwrap_or("");
+                // A Query without its NUL is malformed, not empty: this was
+                // `unwrap_or("")`, and `select 1` with no terminator answered
+                // EmptyQueryResponse where PostgreSQL answers 08P01.
+                let (sql, _) = cstr_at(body, 0)?;
                 let plan = PreparedPlan::build(sql);
 
                 // A failed transaction runs nothing until it is ended. This
@@ -1780,10 +1783,6 @@ fn ddl_tag(sql: &str) -> &'static str {
 }
 
 // ------------------------------------------------------------------ decoding
-
-fn cstr_read(body: &[u8]) -> Option<&str> {
-    cstr_at(body, 0).map(|(s, _)| s)
-}
 
 /// An int16 count at `from` followed by that many int32 OIDs, as Parse
 /// declares its parameter types. A count that outruns the body is malformed.
@@ -4322,6 +4321,21 @@ mod tests {
         );
         assert_eq!(tags(&out), vec![b'G']);
         assert_eq!(i16::from_be_bytes([out[6], out[7]]), 2, "two columns");
+    }
+
+    /// **A Query without its terminating NUL is malformed, not empty.** The
+    /// body was read with `unwrap_or("")`, so `select 1` with no NUL became
+    /// the empty query and answered EmptyQueryResponse. PostgreSQL answers
+    /// 08P01, then ReadyForQuery since Query is a simple-protocol message.
+    #[test]
+    fn a_query_without_a_nul_is_malformed() {
+        let (mut c, v) = connected();
+        let mut input = Vec::new();
+        msg(&mut input, b'Q', |b| b.extend_from_slice(b"select 1"));
+        let mut out = Vec::new();
+        c.advance(&input, &mut out, &v);
+        assert_eq!(tags(&out), vec![b'E', b'Z']);
+        assert_eq!(first_sqlstate(&out), "08P01");
     }
 
     #[test]
