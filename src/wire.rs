@@ -116,6 +116,58 @@ enum Phase {
     Closed,
 }
 
+/// Where a binary COPY stream is, carried across CopyData messages: a
+/// position in the framing plus, where a length was declared, how much of it
+/// is still to arrive. Never the bytes themselves.
+#[derive(Debug, Clone, Copy)]
+struct BinaryState {
+    stage: BinaryStage,
+    /// A header, field count or field length that straddles two messages.
+    prefix: [u8; 19],
+    prefix_len: usize,
+}
+
+impl Default for BinaryState {
+    fn default() -> Self {
+        BinaryState {
+            stage: BinaryStage::Header,
+            prefix: [0; 19],
+            prefix_len: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryStage {
+    /// Gathering the 19-byte signature, flags and extension length.
+    Header,
+    /// Discarding the header extension.
+    Extension { remaining: u32 },
+    /// At a tuple boundary: the next int16 is a field count or the trailer.
+    FieldCount,
+    /// Expecting a field's int32 length.
+    FieldLength { fields_left: u16 },
+    /// Discarding a field's payload.
+    Payload { fields_left: u16, remaining: u32 },
+    /// The trailer was seen; nothing more may arrive.
+    Done,
+}
+
+impl BinaryStage {
+    /// The stage after one field of a tuple with `fields_left` to go, counting
+    /// the tuple when it was the last.
+    fn after_field(fields_left: u16, rows: &mut u64) -> BinaryStage {
+        if fields_left <= 1 {
+            *rows += 1;
+            BinaryStage::FieldCount
+        } else {
+            BinaryStage::FieldLength {
+                fields_left: fields_left - 1,
+            }
+        }
+    }
+}
+
 /// Where a text or CSV COPY stream is within its current line, carried
 /// across CopyData messages.
 #[derive(Debug, Default, Clone, Copy)]
@@ -242,19 +294,14 @@ pub struct Conn {
     statements: HashMap<String, Arc<Statement>>,
     /// Portals by name. "" is the unnamed portal, rebound by every query.
     portals: HashMap<String, Portal>,
-    /// Bytes of a binary COPY stream that did not yet form a whole tuple.
+    /// Where a binary COPY stream is, between CopyData messages.
     ///
     /// A `CopyData` message is a slice of the stream, not a row: pgx fills a
     /// 64 KiB buffer and sends whatever fits, so a tuple can straddle two
-    /// messages and a message can end mid-field. Counting therefore has to carry
-    /// state, which is what this is.
-    copy_carry: Vec<u8>,
-    /// Whether the binary COPY header has been consumed.
-    copy_header_seen: bool,
-    /// Whether the binary COPY trailer has been seen. After it, more data is
-    /// a violation, and at CopyDone it is what makes a partial tuple an error
-    /// rather than a tail still to come.
-    copy_trailer_seen: bool,
+    /// messages and a message can end mid-field. Counting therefore has to
+    /// carry state -- a position in the framing and a count of bytes still to
+    /// discard, never the bytes themselves.
+    copy_binary: BinaryState,
     /// Where a text or CSV COPY stream is within its current line.
     copy_lines: LineState,
     /// The state `ReadyForQuery` reports, which is not a constant.
@@ -279,9 +326,7 @@ impl Conn {
             phase: Phase::Startup,
             statements: HashMap::new(),
             portals: HashMap::new(),
-            copy_carry: Vec::new(),
-            copy_header_seen: false,
-            copy_trailer_seen: false,
+            copy_binary: BinaryState::default(),
             copy_lines: LineState::default(),
             tx_status: TxStatus::Idle,
         }
@@ -310,9 +355,7 @@ impl Conn {
         out: &mut Vec<u8>,
     ) {
         copy_in_response(out, columns, format == CopyFormat::Binary);
-        self.copy_carry.clear();
-        self.copy_header_seen = false;
-        self.copy_trailer_seen = false;
+        self.copy_binary = BinaryState::default();
         self.copy_lines = LineState::default();
         self.phase = Phase::CopyIn {
             rows: 0,
@@ -323,9 +366,7 @@ impl Conn {
 
     /// Back to ordinary statements, with the framing state dropped.
     fn leave_copy_in(&mut self) {
-        self.copy_carry.clear();
-        self.copy_header_seen = false;
-        self.copy_trailer_seen = false;
+        self.copy_binary = BinaryState::default();
         self.copy_lines = LineState::default();
         self.phase = Phase::Query;
     }
@@ -448,7 +489,7 @@ impl Conn {
         }
     }
 
-    /// Count complete tuples in a binary COPY stream, carrying the tail.
+    /// Count tuples in a binary COPY stream, without buffering it.
     ///
     /// The framing is PostgreSQL's: an 11-byte signature, an int32 of flags,
     /// an int32 extension length and that many bytes of extension, then per
@@ -458,161 +499,156 @@ impl Conn {
     /// payload are just bytes, which is exactly why counting them reported 2
     /// for a 3-row load.
     ///
-    /// The header is checked, not skipped. The signature is what says this
-    /// is a binary COPY at all; bits 16..31 of the flags are critical, and a
-    /// reader that does not know one must refuse; and the extension length
-    /// decides where the first tuple begins -- a fixed 19 was reading a
-    /// four-byte extension as a tuple and answering `COPY 3` for one row.
+    /// The stream is walked as a stage machine over a count of bytes still to
+    /// discard. It used to be gathered a whole tuple at a time behind a 1 MiB
+    /// ceiling, which refused a valid 2 MiB bytea field and closed the
+    /// connection with no ErrorResponse. Field lengths are int32 and a valid
+    /// row may exceed any ceiling, so nothing is gathered but a partial
+    /// length prefix: payload and extension alike are skipped as they arrive.
     ///
     /// `Err` is a framing violation: the COPY is over and the caller says so
     /// with PostgreSQL's SQLSTATE for a bad COPY file.
-    fn count_binary_copy_rows(&mut self, body: &[u8]) -> Result<(), &'static str> {
-        /// The signature, its flags and the header-extension length.
-        const HEADER: usize = 19;
-
+    fn count_binary(&mut self, body: &[u8]) -> Result<(), &'static str> {
         const SIGNATURE: &[u8; 11] = b"PGCOPY\n\xff\r\n\0";
 
-        /// How much unparsed stream to hold before calling it a violation. A
-        /// whole tuple has to fit for any progress to be possible; past this the
-        /// client is not sending tuples and the buffer would grow without bound.
-        const MAX_CARRY: usize = 1 << 20;
-
-        // The trailer ended the stream; a writer that keeps going is not
-        // writing this format.
-        if self.copy_trailer_seen && !body.is_empty() {
-            return Err("received copy data after EOF marker");
-        }
-
-        self.copy_carry.extend_from_slice(body);
-
-        let mut buf = std::mem::take(&mut self.copy_carry);
-        let n = buf.len();
-        let mut pos = 0usize;
+        let st = &mut self.copy_binary;
         let mut rows = 0u64;
+        let mut i = 0usize;
 
-        if !self.copy_header_seen {
-            if n < HEADER {
-                self.copy_carry = buf;
+        while i < body.len() {
+            match st.stage {
+                BinaryStage::Header => {
+                    let take = (19 - st.prefix_len).min(body.len() - i);
+                    st.prefix[st.prefix_len..st.prefix_len + take]
+                        .copy_from_slice(&body[i..i + take]);
+                    st.prefix_len += take;
+                    i += take;
 
-                return Ok(());
-            }
-
-            if &buf[..11] != SIGNATURE {
-                return Err("COPY file signature not recognized");
-            }
-
-            let flags = i32::from_be_bytes([buf[11], buf[12], buf[13], buf[14]]);
-            if flags & !0xffff != 0 {
-                return Err("unrecognized critical flags in COPY file header");
-            }
-
-            let extension = i32::from_be_bytes([buf[15], buf[16], buf[17], buf[18]]);
-            if extension < 0 {
-                return Err("invalid COPY file header (wrong length)");
-            }
-
-            // The extension is client-controlled up to 2 GB, and it is waited
-            // for whole -- so the wait has to be bounded by the same ceiling
-            // as a tuple, or it is the unbounded carry the ceiling exists to
-            // prevent. No writer declares one at all today.
-            if extension as usize > MAX_CARRY {
-                return Err("COPY file header extension too large");
-            }
-
-            // The extension is skipped whole, so it has to be here whole.
-            let first_tuple = HEADER + extension as usize;
-            if n < first_tuple {
-                self.copy_carry = buf;
-
-                return Ok(());
-            }
-
-            pos = first_tuple;
-            self.copy_header_seen = true;
-        }
-
-        loop {
-            if n - pos < 2 {
-                break;
-            }
-
-            let fields = i16::from_be_bytes([buf[pos], buf[pos + 1]]);
-
-            // The trailer: an int16 -1 ends the stream. Not a row. Any other
-            // negative count is not a trailer, it is a malformed stream.
-            if fields == -1 {
-                pos += 2;
-                self.copy_trailer_seen = true;
-
-                if pos < n {
-                    return Err("received copy data after EOF marker");
-                }
-
-                break;
-            }
-
-            if fields < -1 {
-                return Err("invalid field count in COPY data");
-            }
-
-            let mut p = pos + 2;
-            let mut whole = true;
-
-            for _ in 0..fields {
-                if n - p < 4 {
-                    whole = false;
-
-                    break;
-                }
-
-                let len = i32::from_be_bytes([buf[p], buf[p + 1], buf[p + 2], buf[p + 3]]);
-
-                p += 4;
-
-                // -1 is NULL: a length with no bytes after it. Below that is
-                // not a length at all.
-                if len < -1 {
-                    return Err("invalid field size in COPY data");
-                }
-
-                if len >= 0 {
-                    if (n - p) < len as usize {
-                        whole = false;
-
+                    if st.prefix_len < 19 {
                         break;
                     }
 
-                    p += len as usize;
+                    let h = st.prefix;
+                    if &h[..11] != SIGNATURE {
+                        return Err("COPY file signature not recognized");
+                    }
+                    let flags = i32::from_be_bytes([h[11], h[12], h[13], h[14]]);
+                    if flags & !0xffff != 0 {
+                        return Err("unrecognized critical flags in COPY file header");
+                    }
+                    let extension = i32::from_be_bytes([h[15], h[16], h[17], h[18]]);
+                    if extension < 0 {
+                        return Err("invalid COPY file header (wrong length)");
+                    }
+
+                    st.prefix_len = 0;
+                    st.stage = if extension == 0 {
+                        BinaryStage::FieldCount
+                    } else {
+                        BinaryStage::Extension {
+                            remaining: extension as u32,
+                        }
+                    };
                 }
-            }
 
-            if !whole {
-                break;
-            }
+                BinaryStage::Extension { remaining } => {
+                    let take = (remaining as usize).min(body.len() - i);
+                    i += take;
+                    let left = remaining - take as u32;
+                    st.stage = if left == 0 {
+                        BinaryStage::FieldCount
+                    } else {
+                        BinaryStage::Extension { remaining: left }
+                    };
+                }
 
-            pos = p;
-            rows += 1;
+                BinaryStage::FieldCount => {
+                    let take = (2 - st.prefix_len).min(body.len() - i);
+                    st.prefix[st.prefix_len..st.prefix_len + take]
+                        .copy_from_slice(&body[i..i + take]);
+                    st.prefix_len += take;
+                    i += take;
+
+                    if st.prefix_len < 2 {
+                        break;
+                    }
+
+                    let fields = i16::from_be_bytes([st.prefix[0], st.prefix[1]]);
+                    st.prefix_len = 0;
+
+                    // The trailer: an int16 -1 ends the stream. Not a row. Any
+                    // other negative count is not a trailer, it is malformed.
+                    if fields == -1 {
+                        st.stage = BinaryStage::Done;
+                        continue;
+                    }
+                    if fields < -1 {
+                        return Err("invalid field count in COPY data");
+                    }
+                    if fields == 0 {
+                        rows += 1;
+                        continue;
+                    }
+                    st.stage = BinaryStage::FieldLength {
+                        fields_left: fields as u16,
+                    };
+                }
+
+                BinaryStage::FieldLength { fields_left } => {
+                    let take = (4 - st.prefix_len).min(body.len() - i);
+                    st.prefix[st.prefix_len..st.prefix_len + take]
+                        .copy_from_slice(&body[i..i + take]);
+                    st.prefix_len += take;
+                    i += take;
+
+                    if st.prefix_len < 4 {
+                        break;
+                    }
+
+                    let p = st.prefix;
+                    let len = i32::from_be_bytes([p[0], p[1], p[2], p[3]]);
+                    st.prefix_len = 0;
+
+                    // -1 is NULL: a length with no bytes after it. Below that
+                    // is not a length at all.
+                    if len < -1 {
+                        return Err("invalid field size in COPY data");
+                    }
+                    if len <= 0 {
+                        st.stage = BinaryStage::after_field(fields_left, &mut rows);
+                    } else {
+                        st.stage = BinaryStage::Payload {
+                            fields_left,
+                            remaining: len as u32,
+                        };
+                    }
+                }
+
+                BinaryStage::Payload {
+                    fields_left,
+                    remaining,
+                } => {
+                    let take = (remaining as usize).min(body.len() - i);
+                    i += take;
+                    let left = remaining - take as u32;
+                    st.stage = if left == 0 {
+                        BinaryStage::after_field(fields_left, &mut rows)
+                    } else {
+                        BinaryStage::Payload {
+                            fields_left,
+                            remaining: left,
+                        }
+                    };
+                }
+
+                // The trailer ended the stream; a writer that keeps going is
+                // not writing this format.
+                BinaryStage::Done => return Err("received copy data after EOF marker"),
+            }
         }
 
         if let Phase::CopyIn { rows: counted, .. } = &mut self.phase {
             *counted += rows;
-        }
-
-        if pos < n {
-            buf.drain(..pos);
-
-            if buf.len() > MAX_CARRY {
-                // A client that has sent a megabyte without completing a tuple
-                // is not sending tuples. Answering an error and closing is the
-                // only ending that does not end in the shard's own allocation.
-                self.phase = Phase::Closed;
-                buf.clear();
-            }
-
-            self.copy_carry = buf;
-        } else {
-            buf.clear();
-            self.copy_carry = buf;
         }
 
         Ok(())
@@ -1211,9 +1247,7 @@ impl Conn {
                 self.note_transaction(&p.kind);
 
                 if let Some(format) = streams_rows {
-                    self.copy_carry.clear();
-                    self.copy_header_seen = false;
-                    self.copy_trailer_seen = false;
+                    self.copy_binary = BinaryState::default();
                     self.copy_lines = LineState::default();
                     self.phase = Phase::CopyIn {
                         rows: 0,
@@ -1272,7 +1306,7 @@ impl Conn {
         match t {
             tag::COPY_DATA => {
                 if binary {
-                    if let Err(violation) = self.count_binary_copy_rows(body) {
+                    if let Err(violation) = self.count_binary(body) {
                         // A stream that is not PostgreSQL's binary framing is
                         // not counted, it is refused -- with the SQLSTATE the
                         // server uses for a bad COPY file, and the recovery
@@ -1286,20 +1320,24 @@ impl Conn {
             }
 
             tag::COPY_DONE => {
-                // The end of a binary stream is checked against its framing.
-                // PostgreSQL's reader takes a clean EOF at a tuple boundary
-                // as the end (`CopyFromBinaryOneRow`: "end of file, or
-                // trailer"), so a missing trailer is complete; a stream with
-                // no header is not a binary COPY at all, and one that ends
-                // mid-tuple is `unexpected EOF`. This used to answer `COPY n`
-                // for all three.
+                // The end of a binary stream is checked against its framing;
+                // this used to answer `COPY n` whatever state it was in.
                 if binary {
-                    let violation = if !self.copy_header_seen {
-                        Some("COPY file signature not recognized")
-                    } else if !self.copy_carry.is_empty() {
-                        Some("unexpected EOF in COPY data")
-                    } else {
-                        None
+                    // PostgreSQL's reader takes a clean EOF at a tuple
+                    // boundary as the end (`CopyFromBinaryOneRow`: "end of
+                    // file, or trailer"), so a missing trailer is complete;
+                    // no header is not a binary COPY at all; and an end
+                    // inside the header's extension or inside a tuple is
+                    // what it says.
+                    let violation = match self.copy_binary.stage {
+                        BinaryStage::FieldCount | BinaryStage::Done => None,
+                        BinaryStage::Header => Some("COPY file signature not recognized"),
+                        BinaryStage::Extension { .. } => {
+                            Some("invalid COPY file header (wrong length)")
+                        }
+                        BinaryStage::FieldLength { .. } | BinaryStage::Payload { .. } => {
+                            Some("unexpected EOF in COPY data")
+                        }
                     };
 
                     if let Some(violation) = violation {
@@ -2510,42 +2548,73 @@ mod tests {
         );
     }
 
-    /// A client that never completes a tuple must not grow the carry buffer
-    /// without bound. A megabyte of unterminated stream is a violation, and the
-    /// connection is closed rather than held.
+    /// **A field is skipped, not buffered.** The walker used to gather a
+    /// whole tuple before counting it, behind a 1 MiB ceiling -- so a single
+    /// 2 MiB bytea, a valid binary field, closed the connection with no
+    /// ErrorResponse where PostgreSQL answers `COPY 1`. Payload is now
+    /// discarded as it arrives against a remaining-length count, whatever
+    /// the field declares, and nothing is retained between messages beyond
+    /// a partial length prefix.
     #[test]
-    fn binary_copy_closes_a_client_that_never_completes_a_tuple() {
+    fn binary_copy_skips_a_large_field_without_buffering() {
+        let mut stream = binary_header(0, &[]);
+        stream.extend_from_slice(&2i16.to_be_bytes());
+        stream.extend_from_slice(&8i32.to_be_bytes());
+        stream.extend_from_slice(&1i64.to_be_bytes());
+        stream.extend_from_slice(&(2 * 1024 * 1024i32).to_be_bytes());
+        let payload = vec![0xabu8; 2 * 1024 * 1024];
+
         let (mut c, v) = connected();
         let mut out = Vec::new();
-
         c.advance(
             &tagged(b'Q', |b| cstr(b, "COPY t FROM STDIN BINARY")),
             &mut out,
             &v,
         );
+        out.clear();
+        c.advance(
+            &tagged(b'd', |b| b.extend_from_slice(&stream)),
+            &mut out,
+            &v,
+        );
+        for chunk in payload.chunks(64 * 1024) {
+            c.advance(&tagged(b'd', |b| b.extend_from_slice(chunk)), &mut out, &v);
+            assert!(!c.is_closed());
+            assert!(out.is_empty());
+        }
+        c.advance(
+            &tagged(b'd', |b| b.extend_from_slice(&(-1i16).to_be_bytes())),
+            &mut out,
+            &v,
+        );
+        c.advance(&tagged(b'c', |_| {}), &mut out, &v);
+        assert_eq!(copy_tag(&out), "COPY 1");
 
-        // A field header promising far more bytes than will ever arrive, sent
-        // until the carry exceeds its ceiling.
-        let mut stuck = Vec::new();
-        stuck.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
-        stuck.extend_from_slice(&0i32.to_be_bytes());
-        stuck.extend_from_slice(&0i32.to_be_bytes());
+        // A field declaring a gigabyte that never arrives holds no memory
+        // either: it is a count, and CopyDone inside it is unexpected EOF.
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'Q', |b| cstr(b, "COPY t FROM STDIN BINARY")),
+            &mut out,
+            &v,
+        );
+        out.clear();
+        let mut stuck = binary_header(0, &[]);
         stuck.extend_from_slice(&1i16.to_be_bytes());
         stuck.extend_from_slice(&(1i32 << 30).to_be_bytes());
-
-        // 1 MiB / 25 bytes per message, and a little past it.
-        for _ in 0..50_000 {
-            c.advance(&tagged(b'd', |b| b.extend_from_slice(&stuck)), &mut out, &v);
-
-            if c.is_closed() {
-                break;
-            }
+        c.advance(&tagged(b'd', |b| b.extend_from_slice(&stuck)), &mut out, &v);
+        for _ in 0..1000 {
+            c.advance(
+                &tagged(b'd', |b| b.extend_from_slice(&[0u8; 4096])),
+                &mut out,
+                &v,
+            );
         }
-
-        assert!(
-            c.is_closed(),
-            "an unterminated tuple must not be held forever"
-        );
+        assert!(!c.is_closed());
+        assert!(out.is_empty());
+        c.advance(&tagged(b'c', |_| {}), &mut out, &v);
+        assert_eq!(first_sqlstate(&out), "22P04");
     }
 
     /// The same stall, one packet earlier: the STARTUP length is client-controlled
@@ -3865,14 +3934,21 @@ mod tests {
         }
     }
 
-    /// **The header extension is bounded like everything else the client
-    /// declares.** The extension length is client-controlled up to 2 GB, and
-    /// the wait for it returned before the carry bound was checked: a declared
-    /// 2 GB extension let the carry grow without limit, one CopyData at a
-    /// time, with the connection open. An extension past the carry bound is
-    /// refused at once, and one within it is waited for as before.
+    /// **A header extension is skipped like a field, not waited for.** It
+    /// used to be gathered whole, which needed a ceiling; now it is a count
+    /// of bytes to discard, so any declared length -- 2 GB included -- costs
+    /// nothing to hold, and the tuples after a real one are counted.
     #[test]
-    fn a_binary_copy_header_extension_past_the_carry_bound_is_refused() {
+    fn a_binary_copy_header_extension_is_skipped_not_buffered() {
+        let ext = vec![0xabu8; 100 * 1024];
+        let mut stream = binary_header(0, &ext);
+        stream.extend(binary_tuple(&[1]));
+        let (_, out) = binary_copy(&[&stream[..50_000], &stream[50_000..]]);
+        assert_eq!(copy_tag(&out), "COPY 1");
+
+        // A 2 GB extension is a count too. Nothing arrives after the header
+        // here, so CopyDone inside it is unexpected EOF, and the connection
+        // was never asked to hold anything.
         let (mut c, v) = connected();
         let mut out = Vec::new();
         c.advance(
@@ -3881,58 +3957,25 @@ mod tests {
             &v,
         );
         out.clear();
-
         let mut header = b"PGCOPY\n\xff\r\n\0".to_vec();
         header.extend_from_slice(&0i32.to_be_bytes());
         header.extend_from_slice(&i32::MAX.to_be_bytes());
-
         c.advance(
             &tagged(b'd', |b| b.extend_from_slice(&header)),
             &mut out,
             &v,
         );
-        assert_eq!(tags(&out), vec![b'E', b'Z'], "refused on the header alone");
-        assert_eq!(first_sqlstate(&out), "22P04");
-
-        // Feeding it more afterwards is COPY data outside a COPY, not growth.
-        out.clear();
-        c.advance(
-            &tagged(b'd', |b| b.extend_from_slice(&[0u8; 4096])),
-            &mut out,
-            &v,
-        );
-        assert_eq!(first_sqlstate(&out), "08P01");
-        assert!(c.copy_carry.is_empty(), "nothing is retained");
-
-        // Within the bound, an extension arriving in pieces is still waited
-        // for and the tuple after it counted.
-        let ext = vec![0xabu8; 100 * 1024];
-        let mut stream = binary_header(0, &ext);
-        stream.extend(binary_tuple(&[1]));
-        let (_, out) = binary_copy(&[&stream[..50_000], &stream[50_000..]]);
-        let text = String::from_utf8_lossy(&out);
-        assert!(text.contains("COPY 1"), "{text}");
-    }
-
-    /// The reviewer's end-to-end case: a comment naming the binary format
-    /// must not make text rows fail the binary signature check.
-    #[test]
-    fn a_comment_does_not_change_the_copy_format() {
-        let (mut c, v) = connected();
-        let mut out = Vec::new();
-        c.advance(
-            &tagged(b'Q', |b| cstr(b, "COPY t FROM STDIN /* binary */")),
-            &mut out,
-            &v,
-        );
-        assert_eq!(out[0], b'G');
-        assert_eq!(out[5], 0, "text format announced");
-
-        out.clear();
-        c.advance(&tagged(b'd', |b| b.extend_from_slice(b"1\n")), &mut out, &v);
+        for _ in 0..1000 {
+            c.advance(
+                &tagged(b'd', |b| b.extend_from_slice(&[0u8; 4096])),
+                &mut out,
+                &v,
+            );
+        }
+        assert!(out.is_empty());
+        assert!(!c.is_closed());
         c.advance(&tagged(b'c', |_| {}), &mut out, &v);
-        let text = String::from_utf8_lossy(&out);
-        assert!(text.contains("COPY 1"), "{text}");
+        assert_eq!(first_sqlstate(&out), "22P04");
     }
 
     /// Start a COPY with `options` after STDIN, feed `chunks`, CopyDone; the
