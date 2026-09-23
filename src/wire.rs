@@ -392,6 +392,14 @@ impl Conn {
                 return Err("invalid COPY file header (wrong length)");
             }
 
+            // The extension is client-controlled up to 2 GB, and it is waited
+            // for whole -- so the wait has to be bounded by the same ceiling
+            // as a tuple, or it is the unbounded carry the ceiling exists to
+            // prevent. No writer declares one at all today.
+            if extension as usize > MAX_CARRY {
+                return Err("COPY file header extension too large");
+            }
+
             // The extension is skipped whole, so it has to be here whole.
             let first_tuple = HEADER + extension as usize;
             if n < first_tuple {
@@ -3539,6 +3547,55 @@ mod tests {
             assert_eq!(tags(&out), vec![b'E', b'Z'], "{sql}");
             assert_eq!(first_sqlstate(&out), code, "{sql}");
         }
+    }
+
+    /// **The header extension is bounded like everything else the client
+    /// declares.** The extension length is client-controlled up to 2 GB, and
+    /// the wait for it returned before the carry bound was checked: a declared
+    /// 2 GB extension let the carry grow without limit, one CopyData at a
+    /// time, with the connection open. An extension past the carry bound is
+    /// refused at once, and one within it is waited for as before.
+    #[test]
+    fn a_binary_copy_header_extension_past_the_carry_bound_is_refused() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'Q', |b| cstr(b, "COPY t FROM STDIN BINARY")),
+            &mut out,
+            &v,
+        );
+        out.clear();
+
+        let mut header = b"PGCOPY\n\xff\r\n\0".to_vec();
+        header.extend_from_slice(&0i32.to_be_bytes());
+        header.extend_from_slice(&i32::MAX.to_be_bytes());
+
+        c.advance(
+            &tagged(b'd', |b| b.extend_from_slice(&header)),
+            &mut out,
+            &v,
+        );
+        assert_eq!(tags(&out), vec![b'E', b'Z'], "refused on the header alone");
+        assert_eq!(first_sqlstate(&out), "22P04");
+
+        // Feeding it more afterwards is COPY data outside a COPY, not growth.
+        out.clear();
+        c.advance(
+            &tagged(b'd', |b| b.extend_from_slice(&[0u8; 4096])),
+            &mut out,
+            &v,
+        );
+        assert_eq!(first_sqlstate(&out), "08P01");
+        assert!(c.copy_carry.is_empty(), "nothing is retained");
+
+        // Within the bound, an extension arriving in pieces is still waited
+        // for and the tuple after it counted.
+        let ext = vec![0xabu8; 100 * 1024];
+        let mut stream = binary_header(0, &ext);
+        stream.extend(binary_tuple(&[1]));
+        let (_, out) = binary_copy(&[&stream[..50_000], &stream[50_000..]]);
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("COPY 1"), "{text}");
     }
 
     #[test]
