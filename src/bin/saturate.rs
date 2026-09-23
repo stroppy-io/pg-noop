@@ -43,6 +43,10 @@ struct Reservoir {
     samples: Vec<u64>,
     /// How many values were offered, which is what the samples stand for.
     seen: u64,
+    /// The largest value offered, kept exactly. P100 of the sample is only
+    /// the largest value the reservoir happened to keep, and a late isolated
+    /// stall is exactly the value it is likeliest to drop.
+    max: u64,
     cap: usize,
     rng: u64,
 }
@@ -52,6 +56,7 @@ impl Reservoir {
         Reservoir {
             samples: Vec::with_capacity(cap.min(1 << 16)),
             seen: 0,
+            max: 0,
             cap,
             // xorshift needs a nonzero state; the seed is a worker index.
             rng: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
@@ -60,6 +65,7 @@ impl Reservoir {
 
     fn push(&mut self, v: u64) {
         self.seen += 1;
+        self.max = self.max.max(v);
 
         if self.samples.len() < self.cap {
             self.samples.push(v);
@@ -86,13 +92,13 @@ impl Reservoir {
     }
 
     fn into_parts(self) -> WorkerSamples {
-        (self.samples, self.seen)
+        (self.samples, self.seen, self.max)
     }
 }
 
-/// What one worker hands back: its reservoir, and how many batches it stands
-/// for.
-type WorkerSamples = (Vec<u64>, u64);
+/// What one worker hands back: its reservoir, how many batches it stands
+/// for, and the exact maximum among them.
+type WorkerSamples = (Vec<u64>, u64, u64);
 
 /// Percentiles over every worker's reservoir, weighted by what each worker
 /// saw: a sample from a worker that completed a thousand batches stands for
@@ -103,20 +109,25 @@ struct Percentiles {
     weighted: Vec<(u64, f64)>,
     total: f64,
     seen: u64,
+    /// The exact maximum across workers: a maximum of maxima, not a
+    /// weighted anything.
+    max: u64,
 }
 
 impl Percentiles {
     fn from_workers(workers: Vec<WorkerSamples>) -> Self {
         let mut weighted = Vec::new();
         let mut seen = 0u64;
+        let mut max = 0u64;
 
-        for (samples, count) in workers {
+        for (samples, count, worker_max) in workers {
             if samples.is_empty() {
                 continue;
             }
             let weight = count as f64 / samples.len() as f64;
             weighted.extend(samples.into_iter().map(|v| (v, weight)));
             seen += count;
+            max = max.max(worker_max);
         }
 
         weighted.sort_unstable_by_key(|&(v, _)| v);
@@ -126,6 +137,7 @@ impl Percentiles {
             weighted,
             total,
             seen,
+            max,
         }
     }
 
@@ -153,6 +165,10 @@ impl Percentiles {
 
     fn seen(&self) -> u64 {
         self.seen
+    }
+
+    fn max(&self) -> u64 {
+        self.max
     }
 }
 
@@ -512,7 +528,7 @@ fn main() {
         pct(0.90),
         pct(0.99),
         pct(0.999),
-        pct(1.0),
+        percentiles.max() as f64 / 1e6,
         percentiles.samples(),
         percentiles.seen(),
     );
@@ -574,8 +590,8 @@ mod tests {
     /// count as much as a fast one's and the percentiles would drift high.
     #[test]
     fn percentiles_weight_each_worker_by_what_it_saw() {
-        let fast = (vec![1u64; 10], 1000u64);
-        let slow = (vec![100u64; 10], 100u64);
+        let fast = (vec![1u64; 10], 1000u64, 1u64);
+        let slow = (vec![100u64; 10], 100u64, 100u64);
         let p = Percentiles::from_workers(vec![fast, slow]);
 
         assert_eq!(p.samples(), 20);
@@ -584,6 +600,32 @@ mod tests {
         assert_eq!(p.at(0.90), 1);
         assert_eq!(p.at(0.95), 100);
         assert_eq!(p.at(1.0), 100);
+    }
+
+    /// **The maximum is a scalar, not a percentile of a sample.** `pct(1.0)`
+    /// was printed as `max`, but P100 of a reservoir is the largest value the
+    /// reservoir happened to keep: in this very stream the sampled maximum
+    /// was 199944 while the true one, 199999, was not retained. A late
+    /// isolated stall can vanish that way while the output claims an exact
+    /// maximum. The reservoir tracks the exact maximum separately.
+    #[test]
+    fn the_maximum_is_exact_whatever_the_reservoir_kept() {
+        let mut r = Reservoir::new(1000, 7);
+        for v in 0..200_000u64 {
+            r.push(v);
+        }
+        assert_eq!(r.max, 199_999);
+        assert!(
+            r.samples.iter().copied().max().unwrap() < 199_999,
+            "the point of the test: the reservoir did not keep the maximum"
+        );
+
+        // And it is merged as a maximum across workers, not by weight.
+        let fast = (vec![1u64; 10], 1000u64, 50u64);
+        let slow = (vec![100u64; 10], 100u64, 7_000u64);
+        let p = Percentiles::from_workers(vec![fast, slow]);
+        assert_eq!(p.max(), 7_000);
+        assert_eq!(p.at(1.0), 100, "P100 of the sample is still just that");
     }
 
     #[test]
