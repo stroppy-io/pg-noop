@@ -984,6 +984,33 @@ impl Conn {
                     return Some(());
                 }
 
+                // A per-column result-format list has to be one per column.
+                // Two codes for a one-column query answered BindComplete;
+                // PostgreSQL refuses it. Only a list longer than one is
+                // checked, so the shapes every driver sends never resolve the
+                // columns here.
+                if bind.result_formats > 1 {
+                    let columns = match plan.kind {
+                        PlanKind::SelectMeta { .. } | PlanKind::SelectStub { .. } => {
+                            resolve_columns(plan, catalog).len()
+                        }
+                        _ => 0,
+                    };
+                    if bind.result_formats != columns {
+                        self.refuse(
+                            true,
+                            out,
+                            "08P01",
+                            &format!(
+                                "bind message has {} result formats but query has {columns} columns",
+                                bind.result_formats
+                            ),
+                        );
+
+                        return Some(());
+                    }
+                }
+
                 // Two String allocations per query if done unconditionally, and
                 // a driver binds the SAME portal to the SAME statement forever.
                 // The formats are replaced in place: for every driver's usual
@@ -1686,6 +1713,9 @@ struct BindTail {
     params: usize,
     /// The parameter-format count, when it is not 0, 1 or `params`.
     format_mismatch: Option<usize>,
+    /// How many result-format codes it carries, which must be 0, 1 or the
+    /// statement's column count -- checked by the caller, who has the plan.
+    result_formats: usize,
     /// The result formats it asks for.
     formats: Formats,
 }
@@ -1714,6 +1744,10 @@ fn bind_tail(body: &[u8], from: usize) -> Option<BindTail> {
     for _ in 0..params {
         let len = i32::from_be_bytes(body.get(at..at + 4)?.try_into().ok()?);
         at += 4;
+        // -1 is NULL. Below that is not a length; it used to be read as NULL.
+        if len < -1 {
+            return None;
+        }
         if len >= 0 {
             at += len as usize;
             body.get(..at)?;
@@ -1755,6 +1789,7 @@ fn bind_tail(body: &[u8], from: usize) -> Option<BindTail> {
     Some(BindTail {
         params,
         format_mismatch,
+        result_formats: n_rformats,
         formats,
     })
 }
@@ -3829,6 +3864,107 @@ mod tests {
         let (_, out) = text_copy("CSV", &[b"1,\"open\n2\n"]);
         assert_eq!(tags(&out), vec![b'E', b'Z']);
         assert_eq!(first_sqlstate(&out), "22P04");
+    }
+
+    /// **Two more Bind shapes PostgreSQL rejects.** A result-format count
+    /// that is neither 0, 1 nor the statement's column count answered
+    /// BindComplete; PostgreSQL says `bind message has 2 result formats but
+    /// query has 1 columns`. A parameter length below -1 was taken as NULL;
+    /// only -1 is NULL and PostgreSQL rejects the message. Both 08P01.
+    #[test]
+    fn bind_result_format_count_must_match_the_columns() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'P', |b| {
+                cstr(b, "one");
+                cstr(b, "select 1");
+                b.extend_from_slice(&0i16.to_be_bytes());
+            }),
+            &mut out,
+            &v,
+        );
+        c.advance(
+            &tagged(b'P', |b| {
+                cstr(b, "two");
+                cstr(b, "select 1, 2");
+                b.extend_from_slice(&0i16.to_be_bytes());
+            }),
+            &mut out,
+            &v,
+        );
+        c.advance(
+            &tagged(b'P', |b| {
+                cstr(b, "none");
+                cstr(b, "INSERT INTO t VALUES (1)");
+                b.extend_from_slice(&0i16.to_be_bytes());
+            }),
+            &mut out,
+            &v,
+        );
+
+        let bind = |stmt: &str, formats: &[i16]| {
+            let mut input = tagged(b'B', |b| {
+                cstr(b, "");
+                cstr(b, stmt);
+                b.extend_from_slice(&0i16.to_be_bytes());
+                b.extend_from_slice(&0i16.to_be_bytes());
+                b.extend_from_slice(&(formats.len() as i16).to_be_bytes());
+                for f in formats {
+                    b.extend_from_slice(&f.to_be_bytes());
+                }
+            });
+            input.extend(tagged(b'S', |_| {}));
+            input
+        };
+
+        for (stmt, formats, ok) in [
+            ("one", &[][..], true),
+            ("one", &[1][..], true),
+            ("one", &[0, 1][..], false),
+            ("two", &[0, 1][..], true),
+            ("two", &[0, 1, 0][..], false),
+            ("none", &[1][..], true),
+            ("none", &[0, 0][..], false),
+        ] {
+            out.clear();
+            c.advance(&bind(stmt, formats), &mut out, &v);
+            if ok {
+                assert_eq!(tags(&out), vec![b'2', b'Z'], "{stmt} {formats:?}");
+            } else {
+                assert_eq!(tags(&out), vec![b'E', b'Z'], "{stmt} {formats:?}");
+                assert_eq!(first_sqlstate(&out), "08P01", "{stmt} {formats:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn bind_parameter_length_below_minus_one_is_malformed() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'P', |b| {
+                cstr(b, "s");
+                cstr(b, "select $1::int8");
+                b.extend_from_slice(&0i16.to_be_bytes());
+            }),
+            &mut out,
+            &v,
+        );
+
+        let mut input = tagged(b'B', |b| {
+            cstr(b, "");
+            cstr(b, "s");
+            b.extend_from_slice(&0i16.to_be_bytes());
+            b.extend_from_slice(&1i16.to_be_bytes());
+            b.extend_from_slice(&(-2i32).to_be_bytes());
+            b.extend_from_slice(&0i16.to_be_bytes());
+        });
+        input.extend(tagged(b'S', |_| {}));
+        out.clear();
+        c.advance(&input, &mut out, &v);
+        assert_eq!(tags(&out), vec![b'E', b'Z']);
+        assert_eq!(first_sqlstate(&out), "08P01");
     }
 
     #[test]
