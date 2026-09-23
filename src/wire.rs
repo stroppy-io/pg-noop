@@ -867,7 +867,8 @@ impl Conn {
                 // A Query without its NUL is malformed, not empty: this was
                 // `unwrap_or("")`, and `select 1` with no terminator answered
                 // EmptyQueryResponse where PostgreSQL answers 08P01.
-                let (sql, _) = cstr_at(body, 0)?;
+                let (sql, end) = cstr_at(body, 0)?;
+                exhausted(body, end)?;
                 let plan = PreparedPlan::build(sql);
 
                 // A failed transaction runs nothing until it is ended. This
@@ -969,7 +970,8 @@ impl Conn {
                 // [stmt_name][query][n_params:i16][types...]
                 let (name, after) = cstr_at(body, 0)?;
                 let (sql, after) = cstr_at(body, after)?;
-                let declared = oid_list(body, after)?;
+                let (declared, end) = oid_list(body, after)?;
+                exhausted(body, end)?;
                 let plan = PreparedPlan::build(sql);
 
                 if self.failed() && !ends_transaction(&plan.kind) {
@@ -1139,7 +1141,8 @@ impl Conn {
                 // ['S'|'P'][name]. Anything else used to be read as a portal;
                 // PostgreSQL refuses it.
                 let kind = subtype(body)?;
-                let (name, _) = cstr_at(body, 1)?;
+                let (name, end) = cstr_at(body, 1)?;
+                exhausted(body, end)?;
 
                 let Some((Statement { plan, params }, formats)) = self.described(kind, name) else {
                     let (code, what) = if kind == b'S' {
@@ -1190,6 +1193,7 @@ impl Conn {
                 // [portal][max_rows:i32]. Zero is no limit.
                 let (name, after) = cstr_at(body, 0)?;
                 let max_rows = i32::from_be_bytes(body.get(after..after + 4)?.try_into().ok()?);
+                exhausted(body, after + 4)?;
                 let failed = self.failed();
 
                 // No clone: `answer` is a free function precisely so the plan can
@@ -1271,7 +1275,8 @@ impl Conn {
                 // ['S'|'P'][name], strictly: Close `X` answered CloseComplete
                 // where PostgreSQL answers 08P01.
                 let kind = subtype(body)?;
-                let (name, _) = cstr_at(body, 1)?;
+                let (name, end) = cstr_at(body, 1)?;
+                exhausted(body, end)?;
                 if kind == b'S' {
                     self.statements.remove(name);
                 } else {
@@ -1796,17 +1801,27 @@ fn subtype(body: &[u8]) -> Option<u8> {
 }
 
 /// An int16 count at `from` followed by that many int32 OIDs, as Parse
-/// declares its parameter types. A count that outruns the body is malformed.
-fn oid_list(body: &[u8], from: usize) -> Option<Vec<u32>> {
+/// declares its parameter types, and the index after them. A count that
+/// outruns the body is malformed.
+fn oid_list(body: &[u8], from: usize) -> Option<(Vec<u32>, usize)> {
     let n = i16::from_be_bytes(body.get(from..from + 2)?.try_into().ok()?);
     let n = usize::try_from(n).ok()?;
-    let bytes = body.get(from + 2..from + 2 + 4 * n)?;
+    let end = from + 2 + 4 * n;
+    let bytes = body.get(from + 2..end)?;
 
-    Some(
+    Some((
         (0..n)
             .map(|i| u32::from_be_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap()))
             .collect(),
-    )
+        end,
+    ))
+}
+
+/// A body is its fields and nothing after them. Every decoder ends with this:
+/// a valid prefix followed by trailing bytes used to be accepted by Query,
+/// Parse, Describe, Close and Execute, where PostgreSQL answers 08P01.
+fn exhausted(body: &[u8], end: usize) -> Option<()> {
+    (end == body.len()).then_some(())
 }
 
 /// What a Bind says after its two names.
@@ -4385,6 +4400,83 @@ mod tests {
             c.advance(&input, &mut out, &v);
             let t = tags(&out);
             assert!(t == vec![ok_tag, b'Z'] || t == vec![b'E', b'Z'], "{:?}", t);
+        }
+    }
+
+    /// **A body is its fields and nothing after them.** Query, Parse,
+    /// Describe, Close and Execute accepted a valid prefix plus trailing
+    /// bytes; PostgreSQL answers 08P01 for each. Bind already checked.
+    #[test]
+    fn trailing_bytes_after_a_body_are_malformed() {
+        let cases: Vec<(&str, Vec<u8>, bool)> = vec![
+            (
+                "Query",
+                tagged(b'Q', |b| {
+                    cstr(b, "select 1");
+                    b.extend_from_slice(b"junk");
+                }),
+                false,
+            ),
+            (
+                "Parse",
+                tagged(b'P', |b| {
+                    cstr(b, "");
+                    cstr(b, "select 1");
+                    b.extend_from_slice(&0i16.to_be_bytes());
+                    b.push(7);
+                }),
+                true,
+            ),
+            (
+                "Describe",
+                tagged(b'D', |b| {
+                    b.push(b'S');
+                    cstr(b, "");
+                    b.push(7);
+                }),
+                true,
+            ),
+            (
+                "Close",
+                tagged(b'C', |b| {
+                    b.push(b'S');
+                    cstr(b, "");
+                    b.push(7);
+                }),
+                true,
+            ),
+            (
+                "Execute",
+                tagged(b'E', |b| {
+                    cstr(b, "");
+                    b.extend_from_slice(&0i32.to_be_bytes());
+                    b.push(7);
+                }),
+                true,
+            ),
+        ];
+
+        for (name, message, is_extended) in cases {
+            let (mut c, v) = connected();
+            // Something to describe, close and execute, so the refusal is for
+            // the trailing bytes and not for a missing object.
+            let mut out = Vec::new();
+            c.advance(&extended("select 1"), &mut out, &v);
+
+            let mut input = message;
+            input.extend(tagged(b'S', |_| {}));
+            out.clear();
+            c.advance(&input, &mut out, &v);
+            if is_extended {
+                assert_eq!(tags(&out), vec![b'E', b'Z'], "{name}");
+            } else {
+                assert_eq!(
+                    tags(&out),
+                    vec![b'E', b'Z', b'Z'],
+                    "{name}: simple, then the Sync"
+                );
+            }
+            assert_eq!(first_sqlstate(&out), "08P01", "{name}");
         }
     }
 
