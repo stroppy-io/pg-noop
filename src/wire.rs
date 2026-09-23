@@ -89,9 +89,9 @@ enum Phase {
     /// answers `COPY n`, and a client that loads 10000 rows and is told `COPY 0`
     /// has been lied to in a way it can see.
     ///
-    /// `binary` travels because the count depends on it. In text format a row
-    /// ends at a newline, so newlines are the rows; in binary format there are no
-    /// newlines at all -- `pgx.CopyFrom` encodes field lengths and payload bytes,
+    /// `format` travels because the count depends on it. In text format a row
+    /// is a line, in CSV a line outside quotes, and in binary there are no
+    /// lines at all -- `pgx.CopyFrom` encodes field lengths and payload bytes,
     /// and `0x0a` appears wherever a value happens to contain it.
     ///
     /// `extended` travels because it decides how the COPY ENDS. Entered from a
@@ -101,7 +101,7 @@ enum Phase {
     /// first and answers the second, so CopyDone gets the tag alone.
     CopyIn {
         rows: u64,
-        binary: bool,
+        format: CopyFormat,
         extended: bool,
     },
     /// After an error in an extended-protocol message. PostgreSQL discards
@@ -113,6 +113,43 @@ enum Phase {
     /// malformed Parse executed and both it and the Sync reported ready.
     AwaitingSync,
     Closed,
+}
+
+/// Where a text or CSV COPY stream is within its current line, carried
+/// across CopyData messages.
+#[derive(Debug, Default, Clone, Copy)]
+struct LineState {
+    /// Bytes have arrived since the last row end: the last row, if the data
+    /// ends here, is this unterminated line.
+    line_open: bool,
+    /// CSV: inside a quoted field, where a newline is data.
+    in_quotes: bool,
+    /// Text: the previous byte was an unescaped backslash, so this one is
+    /// data whatever it is.
+    escaped: bool,
+    /// A `\.` line was seen: the data is over and what follows is ignored.
+    ended: bool,
+    /// The current line's length so far, and its first three bytes -- enough
+    /// to recognise `\.`, with or without a carriage return before the
+    /// newline.
+    line_len: usize,
+    head: [u8; 3],
+}
+
+impl LineState {
+    fn note(&mut self, b: u8) {
+        self.line_open = true;
+        if self.line_len < self.head.len() {
+            self.head[self.line_len] = b;
+        }
+        self.line_len = self.line_len.saturating_add(1);
+    }
+
+    /// Whether the line ending now is the end-of-data marker.
+    fn is_end_marker(&self) -> bool {
+        (self.line_len == 2 && &self.head[..2] == b"\\.")
+            || (self.line_len == 3 && &self.head == b"\\.\r")
+    }
 }
 
 /// The transaction state `ReadyForQuery` advertises, one byte on the wire.
@@ -210,6 +247,8 @@ pub struct Conn {
     /// a violation, and at CopyDone it is what makes a partial tuple an error
     /// rather than a tail still to come.
     copy_trailer_seen: bool,
+    /// Where a text or CSV COPY stream is within its current line.
+    copy_lines: LineState,
     /// The state `ReadyForQuery` reports, which is not a constant.
     ///
     /// pgxpool reads it: a connection that reports idle while a transaction is
@@ -235,6 +274,7 @@ impl Conn {
             copy_carry: Vec::new(),
             copy_header_seen: false,
             copy_trailer_seen: false,
+            copy_lines: LineState::default(),
             tx_status: TxStatus::Idle,
         }
     }
@@ -254,14 +294,21 @@ impl Conn {
     }
 
     /// Answer a `COPY ... FROM STDIN` and wait for rows.
-    fn enter_copy_in(&mut self, columns: usize, binary: bool, extended: bool, out: &mut Vec<u8>) {
-        copy_in_response(out, columns, binary);
+    fn enter_copy_in(
+        &mut self,
+        columns: usize,
+        format: CopyFormat,
+        extended: bool,
+        out: &mut Vec<u8>,
+    ) {
+        copy_in_response(out, columns, format == CopyFormat::Binary);
         self.copy_carry.clear();
         self.copy_header_seen = false;
         self.copy_trailer_seen = false;
+        self.copy_lines = LineState::default();
         self.phase = Phase::CopyIn {
             rows: 0,
-            binary,
+            format,
             extended,
         };
     }
@@ -271,6 +318,7 @@ impl Conn {
         self.copy_carry.clear();
         self.copy_header_seen = false;
         self.copy_trailer_seen = false;
+        self.copy_lines = LineState::default();
         self.phase = Phase::Query;
     }
 
@@ -327,6 +375,69 @@ impl Conn {
     /// COMMIT and ROLLBACK is refused.
     fn failed(&self) -> bool {
         self.tx_status == TxStatus::Failed
+    }
+
+    /// Count rows in a text or CSV COPY stream, carrying the line state.
+    ///
+    /// A row is a line. Newline bytes were counted, which is wrong at both
+    /// ends: the final line need not be terminated -- `a\nb\nc` is three
+    /// rows to PostgreSQL and was two here -- and in CSV a newline inside
+    /// quotes is field data -- `1,"hello\nworld"\n2,x\n` is two rows and was
+    /// three. In text format a backslash escapes the byte after it, a newline
+    /// included, and a line of exactly `\.` ends the data. All of that state
+    /// crosses CopyData boundaries, because a message is a slice of the
+    /// stream and not a row.
+    fn count_lines(&mut self, body: &[u8], csv: bool) {
+        let ls = &mut self.copy_lines;
+        let mut rows = 0u64;
+
+        for &b in body {
+            if ls.ended {
+                break;
+            }
+
+            if csv && ls.in_quotes {
+                if b == b'"' {
+                    ls.in_quotes = false;
+                }
+                ls.note(b);
+
+                continue;
+            }
+
+            if !csv && ls.escaped {
+                ls.escaped = false;
+                ls.note(b);
+
+                continue;
+            }
+
+            match b {
+                b'\n' => {
+                    if ls.is_end_marker() {
+                        ls.ended = true;
+
+                        break;
+                    }
+                    rows += 1;
+                    ls.line_open = false;
+                    ls.line_len = 0;
+                }
+                b'"' if csv => {
+                    ls.in_quotes = true;
+                    ls.note(b);
+                }
+                b'\\' if !csv => {
+                    ls.escaped = true;
+                    ls.note(b);
+                }
+                _ => ls.note(b),
+            }
+        }
+
+        if let Phase::CopyIn { rows: counted, .. } = &mut self.phase {
+            *counted += rows;
+        }
     }
 
     /// Count complete tuples in a binary COPY stream, carrying the tail.
@@ -678,10 +789,10 @@ impl Conn {
         // A COPY in flight has its own vocabulary, and everything outside it is
         // a violation rather than a statement to run.
         if let Phase::CopyIn {
-            binary, extended, ..
+            format, extended, ..
         } = self.phase
         {
-            return self.copy_message(t, body, binary, extended, out);
+            return self.copy_message(t, body, format, extended, out);
         }
 
         match t {
@@ -733,7 +844,7 @@ impl Conn {
                 {
                     match direction {
                         CopyDirection::FromStdin => {
-                            self.enter_copy_in(columns, format == CopyFormat::Binary, false, out);
+                            self.enter_copy_in(columns, format, false, out);
 
                             return Some(());
                         }
@@ -995,7 +1106,7 @@ impl Conn {
                         direction: CopyDirection::FromStdin,
                         format,
                         ..
-                    } => Some(*format == CopyFormat::Binary),
+                    } => Some(*format),
                     _ => None,
                 };
 
@@ -1028,13 +1139,14 @@ impl Conn {
                     self.note_transaction(&kind);
                 }
 
-                if let Some(binary) = streams_rows {
+                if let Some(format) = streams_rows {
                     self.copy_carry.clear();
                     self.copy_header_seen = false;
                     self.copy_trailer_seen = false;
+                    self.copy_lines = LineState::default();
                     self.phase = Phase::CopyIn {
                         rows: 0,
-                        binary,
+                        format,
                         extended: true,
                     };
                 }
@@ -1080,10 +1192,12 @@ impl Conn {
         &mut self,
         t: u8,
         body: &[u8],
-        binary: bool,
+        format: CopyFormat,
         extended: bool,
         out: &mut Vec<u8>,
     ) -> Option<()> {
+        let binary = format == CopyFormat::Binary;
+
         match t {
             tag::COPY_DATA => {
                 if binary {
@@ -1095,14 +1209,8 @@ impl Conn {
                         self.leave_copy_in();
                         self.refuse(extended, out, "22P04", violation);
                     }
-                } else if let Phase::CopyIn { rows, .. } = &mut self.phase {
-                    // One CopyData message is one or more rows of text, newline
-                    // separated. Counting newlines is what PostgreSQL reports and
-                    // is right even when a driver batches many rows per message
-                    // and even when a row straddles two: every newline the client
-                    // sends is counted exactly once, in whichever message carried
-                    // it.
-                    *rows += body.iter().filter(|&&b| b == b'\n').count() as u64;
+                } else {
+                    self.count_lines(body, format == CopyFormat::Csv);
                 }
             }
 
@@ -1128,6 +1236,22 @@ impl Conn {
                         self.refuse(extended, out, "22P04", violation);
 
                         return Some(());
+                    }
+                } else {
+                    // A quote still open at the end is PostgreSQL's error for
+                    // it; a line still open is the last row, terminated by
+                    // the end of the data rather than a newline.
+                    if self.copy_lines.in_quotes {
+                        self.leave_copy_in();
+                        self.refuse(extended, out, "22P04", "unterminated CSV quoted field");
+
+                        return Some(());
+                    }
+
+                    if self.copy_lines.line_open && !self.copy_lines.ended {
+                        if let Phase::CopyIn { rows, .. } = &mut self.phase {
+                            *rows += 1;
+                        }
                     }
                 }
 
@@ -3619,6 +3743,92 @@ mod tests {
         c.advance(&tagged(b'c', |_| {}), &mut out, &v);
         let text = String::from_utf8_lossy(&out);
         assert!(text.contains("COPY 1"), "{text}");
+    }
+
+    /// Start a COPY with `options` after STDIN, feed `chunks`, CopyDone; the
+    /// reply after CopyInResponse.
+    fn text_copy(options: &str, chunks: &[&[u8]]) -> (Conn, Vec<u8>) {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        let sql = format!("COPY t FROM STDIN {options}");
+        c.advance(&tagged(b'Q', |b| cstr(b, &sql)), &mut out, &v);
+        assert_eq!(out[0], b'G', "{sql}");
+        out.clear();
+        for chunk in chunks {
+            c.advance(&tagged(b'd', |b| b.extend_from_slice(chunk)), &mut out, &v);
+        }
+        c.advance(&tagged(b'c', |_| {}), &mut out, &v);
+        (c, out)
+    }
+
+    fn copy_tag(out: &[u8]) -> String {
+        let body = first_body(out, b'C').expect("a CommandComplete");
+        String::from_utf8_lossy(&body[..body.len() - 1]).into_owned()
+    }
+
+    /// **Text rows are lines, and the last line need not be terminated.**
+    /// Newlines were counted, so `a\nb\nc` answered `COPY 2` where PostgreSQL
+    /// reads the final unterminated line as a row and answers `COPY 3`.
+    #[test]
+    fn a_text_copy_counts_an_unterminated_final_line() {
+        assert_eq!(copy_tag(&text_copy("", &[b"a\nb\nc"]).1), "COPY 3");
+        assert_eq!(copy_tag(&text_copy("", &[b"a\nb\n"]).1), "COPY 2");
+        assert_eq!(copy_tag(&text_copy("", &[b"a\nb", b"\nc"]).1), "COPY 3");
+        assert_eq!(copy_tag(&text_copy("", &[b"a\r\nb\r\n"]).1), "COPY 2");
+        assert_eq!(copy_tag(&text_copy("", &[]).1), "COPY 0");
+        assert_eq!(copy_tag(&text_copy("", &[b"\n"]).1), "COPY 1");
+    }
+
+    /// In text format a backslash escapes the byte after it, including a
+    /// newline, which is then data and not a row end; a doubled backslash is
+    /// one backslash and the newline after it ends the row. And a line of
+    /// exactly `\.` ends the data: what follows is not counted.
+    #[test]
+    fn a_text_copy_honours_escapes_and_the_end_marker() {
+        assert_eq!(copy_tag(&text_copy("", &[b"a\\\nb\n"]).1), "COPY 1");
+        assert_eq!(copy_tag(&text_copy("", &[b"a\\", b"\nb\n"]).1), "COPY 1");
+        assert_eq!(copy_tag(&text_copy("", &[b"a\\\\\nb\n"]).1), "COPY 2");
+        assert_eq!(
+            copy_tag(&text_copy("", &[b"a\n\\.\nignored\n"]).1),
+            "COPY 1"
+        );
+        assert_eq!(
+            copy_tag(&text_copy("", &[b"a\n\\.", b"\nignored\n"]).1),
+            "COPY 1"
+        );
+        assert_eq!(copy_tag(&text_copy("", &[b"a\n\\.x\n"]).1), "COPY 2");
+    }
+
+    /// **CSV rows are lines outside quotes.** A quoted newline is field data;
+    /// `1,"hello\nworld"\n2,x\n` answered `COPY 3` where PostgreSQL answers
+    /// `COPY 2`. Quote state carries across CopyData boundaries, `""` inside
+    /// a quoted field is one quote, and a quote left open at CopyDone is the
+    /// error PostgreSQL raises for it.
+    #[test]
+    fn a_csv_copy_counts_lines_outside_quotes() {
+        let csv = b"1,\"hello\nworld\"\n2,x\n";
+        assert_eq!(copy_tag(&text_copy("CSV", &[csv]).1), "COPY 2");
+        assert_eq!(
+            copy_tag(&text_copy("WITH (FORMAT csv)", &[csv]).1),
+            "COPY 2"
+        );
+        assert_eq!(
+            copy_tag(&text_copy("CSV", &[&csv[..9], &csv[9..]]).1),
+            "COPY 2"
+        );
+        assert_eq!(
+            copy_tag(&text_copy("CSV", &[b"1,\"a\"\"b\nc\"\n"]).1),
+            "COPY 1"
+        );
+        assert_eq!(
+            copy_tag(&text_copy("CSV", &[b"1,\"a\"\"\"\n2\n3"]).1),
+            "COPY 3"
+        );
+        assert_eq!(copy_tag(&text_copy("CSV", &[b"a\n\\.\nb\n"]).1), "COPY 1");
+
+        let (_, out) = text_copy("CSV", &[b"1,\"open\n2\n"]);
+        assert_eq!(tags(&out), vec![b'E', b'Z']);
+        assert_eq!(first_sqlstate(&out), "22P04");
     }
 
     #[test]
