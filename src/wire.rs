@@ -838,9 +838,13 @@ impl Conn {
         // already stopped counting on them.
         if self.phase == Phase::AwaitingSync {
             match t {
-                tag::SYNC => {
+                tag::SYNC if body.is_empty() => {
                     self.phase = Phase::Query;
                     self.ready(out);
+                }
+                tag::SYNC => {
+                    self.phase = Phase::Query;
+                    return None;
                 }
                 tag::TERMINATE => self.phase = Phase::Closed,
                 _ => {}
@@ -1265,11 +1269,14 @@ impl Conn {
                 }
             }
 
-            tag::SYNC => self.ready(out),
+            tag::SYNC => {
+                exhausted(body, 0)?;
+                self.ready(out);
+            }
 
             // Flush means "send what you have". The caller writes `out` after
             // this call returns, so there is nothing to do but not swallow it.
-            tag::FLUSH => {}
+            tag::FLUSH => exhausted(body, 0)?,
 
             tag::CLOSE => {
                 // ['S'|'P'][name], strictly: Close `X` answered CloseComplete
@@ -4478,6 +4485,36 @@ mod tests {
             }
             assert_eq!(first_sqlstate(&out), "08P01", "{name}");
         }
+    }
+
+    #[test]
+    fn sync_and_flush_require_empty_bodies() {
+        for (tag, want) in [(b'S', vec![b'E', b'Z', b'Z']), (b'H', vec![b'E', b'Z'])] {
+            let (mut c, v) = connected();
+            let mut input = tagged(tag, |b| b.extend_from_slice(b"junk"));
+            input.extend(tagged(b'S', |_| {}));
+
+            let mut out = Vec::new();
+            c.advance(&input, &mut out, &v);
+            assert_eq!(tags(&out), want, "tag {}", tag as char);
+            assert_eq!(first_sqlstate(&out), "08P01");
+        }
+    }
+
+    #[test]
+    fn malformed_sync_ends_awaiting_sync_with_an_error() {
+        let (mut c, v) = connected();
+        let mut input = tagged(b'P', |b| b.extend_from_slice(b"malformed"));
+        input.extend(tagged(b'S', |b| b.extend_from_slice(b"junk")));
+
+        let mut out = Vec::new();
+        c.advance(&input, &mut out, &v);
+        assert_eq!(tags(&out), vec![b'E', b'E', b'Z']);
+        assert_eq!(first_sqlstate(&out), "08P01");
+
+        out.clear();
+        c.advance(&tagged(b'Q', |b| cstr(b, "select 1")), &mut out, &v);
+        assert_eq!(tags(&out), vec![b'T', b'D', b'C', b'Z']);
     }
 
     #[test]
