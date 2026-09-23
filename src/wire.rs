@@ -4099,6 +4099,27 @@ mod tests {
         assert_eq!(first_sqlstate(&out), "08P01");
     }
 
+    /// The reviewer's end-to-end case: a comment glued to the direction must
+    /// still enter COPY, or the client's rows land outside one.
+    #[test]
+    fn a_comment_glued_to_a_token_still_enters_copy() {
+        for sql in [
+            "COPY t/*x*/FROM STDIN",
+            "COPY t FROM/*x*/STDIN",
+            "COPY/*x*/t FROM STDIN",
+        ] {
+            let (mut c, v) = connected();
+            let mut out = Vec::new();
+            c.advance(&tagged(b'Q', |b| cstr(b, sql)), &mut out, &v);
+            assert_eq!(tags(&out), vec![b'G'], "{sql:?}");
+
+            out.clear();
+            c.advance(&tagged(b'd', |b| b.extend_from_slice(b"1\n")), &mut out, &v);
+            c.advance(&tagged(b'c', |_| {}), &mut out, &v);
+            assert_eq!(copy_tag(&out), "COPY 1", "{sql:?}");
+        }
+    }
+
     #[test]
     fn an_unknown_message_is_consumed_rather_than_desynchronising() {
         let (mut c, v) = connected();

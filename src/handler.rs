@@ -528,11 +528,23 @@ impl<'a> SqlWords<'a> {
             return Some(word);
         }
 
-        let end = self
-            .rest
-            .find(|c: char| c.is_ascii_whitespace() || c == '(' || c == ';')
-            .unwrap_or(self.rest.len());
+        // A word ends at whitespace, a parenthesis, a semicolon -- or the
+        // start of a comment. `/` used to be an ordinary byte, so `t/*x*/FROM`
+        // was one word and the direction inside it was never found; the next
+        // call skips the comment before reading `FROM`.
+        let b = self.rest.as_bytes();
+        let end = (0..b.len())
+            .find(|&i| {
+                b[i].is_ascii_whitespace()
+                    || b[i] == b'('
+                    || b[i] == b';'
+                    || (b[i] == b'-' && b.get(i + 1) == Some(&b'-'))
+                    || (b[i] == b'/' && b.get(i + 1) == Some(&b'*'))
+            })
+            .unwrap_or(b.len());
 
+        // Never an empty word: a lone `/` or `-` at the start is itself.
+        let end = end.max(1).min(self.rest.len());
         let word = &self.rest[..end];
         self.rest = &self.rest[end..];
 
@@ -1971,6 +1983,43 @@ mod copy_direction_tests {
             CopyFormat::Text
         );
         assert_eq!(copy_format("COPY t FROM STDIN -- csv\n"), CopyFormat::Text);
+    }
+
+    /// **A comment glued to a token is still a comment.** Comments were
+    /// skipped only between words: while a word was being read, `/` was not
+    /// a boundary, so `t/*x*/FROM` was one word and the direction was never
+    /// found. `COPY t/*x*/FROM STDIN` answered CommandComplete where
+    /// PostgreSQL enters COPY, and the CopyFrom client behind it then wrote
+    /// rows into a connection that never entered it.
+    #[test]
+    fn a_comment_adjacent_to_a_token_ends_the_token() {
+        for sql in [
+            "COPY t/*x*/FROM STDIN",
+            "COPY t FROM/*x*/STDIN",
+            "COPY/*x*/t FROM STDIN",
+            "COPY t FROM STDIN/*x*/",
+            "COPY t--x\nFROM STDIN",
+            "COPY t FROM--x\nSTDIN",
+        ] {
+            assert_eq!(
+                copy_direction(sql),
+                Some(CopyDirection::FromStdin),
+                "{sql:?}"
+            );
+        }
+        assert_eq!(
+            copy_direction("COPY t/*x*/TO/*y*/STDOUT"),
+            Some(CopyDirection::ToStdout)
+        );
+        assert_eq!(
+            copy_format("COPY t FROM STDIN/*x*/BINARY"),
+            CopyFormat::Binary
+        );
+        assert_eq!(
+            copy_format("COPY t FROM STDIN BINARY/*x*/"),
+            CopyFormat::Binary
+        );
+        assert_eq!(copy_format("COPY t FROM STDIN/*binary*/"), CopyFormat::Text);
     }
 
     /// The format is an OPTION, read after the direction's target, not any
