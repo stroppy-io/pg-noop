@@ -695,6 +695,25 @@ impl Conn {
                 self.phase = Phase::Closed;
                 Some(len)
             }
+            // A StartupMessage: its code is the protocol version, major in
+            // the high half. Every code that was not SSL, GSS or Cancel used
+            // to be welcomed -- 4.0, 1.0, an arbitrary 123 -- straight to
+            // AuthenticationOk. PostgreSQL speaks 3.x and refuses the rest
+            // with a FATAL before anyone is authenticated. A newer 3.x minor
+            // is accepted as 3.0, which is what PostgreSQL negotiates it
+            // down to.
+            code if code >> 16 != 3 => {
+                let (major, minor) = (code >> 16, code & 0xffff);
+                fatal_response(
+                    out,
+                    "0A000",
+                    &format!(
+                        "unsupported frontend protocol {major}.{minor}: server supports 3.0 to 3.2"
+                    ),
+                );
+                self.phase = Phase::Closed;
+                Some(len)
+            }
             _ => {
                 // AuthenticationOk
                 msg(out, b'R', |b| b.extend_from_slice(&0i32.to_be_bytes()));
@@ -1549,9 +1568,21 @@ fn copy_done(out: &mut Vec<u8>) {
 
 /// A minimal ErrorResponse: severity, SQLSTATE, message, terminator.
 fn error_response(out: &mut Vec<u8>, code: &str, message: &str) {
+    error_with_severity(out, "ERROR", code, message);
+}
+
+/// An ErrorResponse that ends the connection: PostgreSQL's severity for a
+/// startup the server will not continue.
+fn fatal_response(out: &mut Vec<u8>, code: &str, message: &str) {
+    error_with_severity(out, "FATAL", code, message);
+}
+
+fn error_with_severity(out: &mut Vec<u8>, severity: &str, code: &str, message: &str) {
     msg(out, b'E', |b| {
         b.push(b'S');
-        cstr(b, "ERROR");
+        cstr(b, severity);
+        b.push(b'V');
+        cstr(b, severity);
         b.push(b'C');
         cstr(b, code);
         b.push(b'M');
@@ -4182,6 +4213,57 @@ mod tests {
             v,
         );
         assert_eq!(tags(&out), vec![b'2'], "{portal} -> {stmt}");
+    }
+
+    /// A startup packet with the given protocol code and the usual params.
+    fn startup_with_code(code: i32) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&0i32.to_be_bytes());
+        b.extend_from_slice(&code.to_be_bytes());
+        cstr(&mut b, "user");
+        cstr(&mut b, "bench");
+        b.push(0);
+        let len = b.len() as i32;
+        b[0..4].copy_from_slice(&len.to_be_bytes());
+        b
+    }
+
+    /// **The protocol version is checked before anyone is authenticated.**
+    /// Every startup code other than SSL, GSS and Cancel fell through to
+    /// AuthenticationOk: protocol 4.0, 1.0 and an arbitrary 123 were all
+    /// welcomed. PostgreSQL refuses a major version it does not speak with a
+    /// FATAL 0A000 and closes.
+    #[test]
+    fn an_unsupported_protocol_version_is_refused_at_startup() {
+        for code in [262144, 65536, 123, 0, -1] {
+            let (mut c, v) = (Conn::new(), view());
+            let mut out = Vec::new();
+            let input = startup_with_code(code);
+            let used = c.advance(&input, &mut out, &v);
+            assert_eq!(used, input.len(), "code {code} consumed");
+            assert_eq!(
+                tags(&out),
+                vec![b'E'],
+                "code {code}: an error and nothing else"
+            );
+            assert_eq!(first_sqlstate(&out), "0A000", "code {code}");
+            assert!(c.is_closed(), "code {code} must close");
+            let text = String::from_utf8_lossy(&out);
+            assert!(text.contains("FATAL"), "{text}");
+        }
+    }
+
+    /// Any 3.x is spoken: 3.0 is what every driver sends, and a newer minor
+    /// is what PostgreSQL 18 negotiates down rather than refuses.
+    #[test]
+    fn protocol_three_is_accepted_whatever_the_minor() {
+        for code in [196608, 196609, 196610] {
+            let (mut c, v) = (Conn::new(), view());
+            let mut out = Vec::new();
+            c.advance(&startup_with_code(code), &mut out, &v);
+            assert_eq!(tags(&out).first(), Some(&b'R'), "code {code}");
+            assert!(!c.is_closed(), "code {code}");
+        }
     }
 
     #[test]
