@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 
-use crate::handler::{CatalogView, CopyDirection, PlanKind, PreparedPlan};
+use crate::handler::{CatalogView, CopyDirection, CopyFormat, PlanKind, PreparedPlan};
 
 /// Frontend messages the blackhole understands. Anything else is consumed and
 /// answered as though it succeeded, which is the whole contract.
@@ -728,12 +728,12 @@ impl Conn {
                 if let PlanKind::Copy {
                     direction,
                     columns,
-                    binary,
+                    format,
                 } = plan.kind
                 {
                     match direction {
                         CopyDirection::FromStdin => {
-                            self.enter_copy_in(columns, binary, false, out);
+                            self.enter_copy_in(columns, format == CopyFormat::Binary, false, out);
 
                             return Some(());
                         }
@@ -993,9 +993,9 @@ impl Conn {
                 let streams_rows = match &p.kind {
                     PlanKind::Copy {
                         direction: CopyDirection::FromStdin,
-                        binary,
+                        format,
                         ..
-                    } => Some(*binary),
+                    } => Some(*format == CopyFormat::Binary),
                     _ => None,
                 };
 
@@ -1247,9 +1247,11 @@ fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Ru
         PlanKind::Copy {
             direction,
             columns,
-            binary,
+            format,
         } => match direction {
-            CopyDirection::FromStdin => copy_in_response(out, *columns, *binary),
+            CopyDirection::FromStdin => {
+                copy_in_response(out, *columns, *format == CopyFormat::Binary)
+            }
             CopyDirection::ToStdout => {
                 copy_out_response(out);
                 copy_done(out);
@@ -3594,6 +3596,27 @@ mod tests {
         let mut stream = binary_header(0, &ext);
         stream.extend(binary_tuple(&[1]));
         let (_, out) = binary_copy(&[&stream[..50_000], &stream[50_000..]]);
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("COPY 1"), "{text}");
+    }
+
+    /// The reviewer's end-to-end case: a comment naming the binary format
+    /// must not make text rows fail the binary signature check.
+    #[test]
+    fn a_comment_does_not_change_the_copy_format() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'Q', |b| cstr(b, "COPY t FROM STDIN /* binary */")),
+            &mut out,
+            &v,
+        );
+        assert_eq!(out[0], b'G');
+        assert_eq!(out[5], 0, "text format announced");
+
+        out.clear();
+        c.advance(&tagged(b'd', |b| b.extend_from_slice(b"1\n")), &mut out, &v);
+        c.advance(&tagged(b'c', |_| {}), &mut out, &v);
         let text = String::from_utf8_lossy(&out);
         assert!(text.contains("COPY 1"), "{text}");
     }

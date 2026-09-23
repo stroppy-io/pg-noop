@@ -280,6 +280,20 @@ fn count_select_columns(sql: &str) -> usize {
     cols
 }
 
+/// The row format a COPY declares in its options.
+///
+/// Read from the OPTIONS -- what follows the direction's target -- and not
+/// from any `BINARY` or `CSV` token in the statement: a column named
+/// `binary`, or the word inside a comment, is not a format. The format
+/// decides how rows are counted, which is the difference between counting
+/// tuples, counting lines, and counting lines outside quotes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyFormat {
+    Text,
+    Csv,
+    Binary,
+}
+
 /// Which way a COPY moves rows, decided from the statement text.
 ///
 /// One matcher, used by every caller that needs to know. The alternative was
@@ -344,35 +358,90 @@ pub(crate) fn copy_direction(sql: &str) -> Option<CopyDirection> {
     }
 }
 
-/// Whether the statement asks for the binary COPY format.
+/// The format the statement's options declare.
 ///
 /// pgx sends `copy t ( a ) from stdin binary`; libpq sends `... WITH (FORMAT
-/// binary)`. Both are the same request, and the format decides how the rows are
-/// framed -- which is the difference between counting rows and counting
-/// newlines.
-pub(crate) fn copy_is_binary(sql: &str) -> bool {
-    fn contains_binary(sql: &str) -> bool {
-        let mut words = SqlWords::new(sql);
+/// binary)`; the old syntax allows `WITH BINARY` and `CSV HEADER`. All are
+/// read after the direction's target (`STDIN`, `STDOUT` or a file), where the
+/// options live. This used to accept a `BINARY` token anywhere, including a
+/// comment, and text rows then failed the binary signature check.
+pub(crate) fn copy_format(sql: &str) -> CopyFormat {
+    let mut words = SqlWords::new(sql);
 
-        while let Some(word) = words.next() {
-            if word.eq_ignore_ascii_case("BINARY") {
-                return true;
+    if !words.next_is("COPY") {
+        return CopyFormat::Text;
+    }
+
+    // Past the direction and its target.
+    loop {
+        let Some(word) = words.next() else {
+            return CopyFormat::Text;
+        };
+        if word.eq_ignore_ascii_case("FROM") || word.eq_ignore_ascii_case("TO") {
+            if words.next().is_none() {
+                return CopyFormat::Text;
             }
+            break;
+        }
+    }
 
-            // A parenthesised group is walked in turn: libpq's spelling is
-            // `WITH (FORMAT binary)`, which arrives here as one word.
-            if let Some(inner) = word.strip_prefix('(') {
-                let inner = inner.strip_suffix(')').unwrap_or(inner);
-                if contains_binary(inner) {
-                    return true;
+    // The options: bare keywords, or a parenthesised list of `name value`.
+    while let Some(word) = words.next() {
+        if word.eq_ignore_ascii_case("BINARY") {
+            return CopyFormat::Binary;
+        }
+        if word.eq_ignore_ascii_case("CSV") {
+            return CopyFormat::Csv;
+        }
+        if let Some(inner) = word.strip_prefix('(') {
+            let inner = inner.strip_suffix(')').unwrap_or(inner);
+            for option in split_top_level_commas(inner) {
+                let mut kv = SqlWords::new(option);
+                if kv.next_is("FORMAT") {
+                    return match kv.next().map(|v| v.trim_matches('\'')) {
+                        Some(v) if v.eq_ignore_ascii_case("binary") => CopyFormat::Binary,
+                        Some(v) if v.eq_ignore_ascii_case("csv") => CopyFormat::Csv,
+                        _ => CopyFormat::Text,
+                    };
                 }
             }
         }
-
-        false
     }
 
-    contains_binary(sql)
+    CopyFormat::Text
+}
+
+/// The comma-separated pieces of an option list, ignoring commas inside
+/// quotes and nested parentheses.
+fn split_top_level_commas(inner: &str) -> Vec<&str> {
+    let b = inner.as_bytes();
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+
+    for (i, &c) in b.iter().enumerate() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                b',' if depth == 0 => {
+                    pieces.push(&inner[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    pieces.push(&inner[start..]);
+
+    pieces
 }
 
 /// Walks a SQL statement and yields one word at a time.
@@ -395,9 +464,26 @@ impl<'a> SqlWords<'a> {
     }
 
     fn next(&mut self) -> Option<&'a str> {
-        self.rest = self
-            .rest
-            .trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ';');
+        // Whitespace, statement separators and COMMENTS are all between
+        // words. A comment used to be read as words: `COPY t /* FROM STDIN */
+        // TO STDOUT` found its direction inside the comment.
+        loop {
+            self.rest = self
+                .rest
+                .trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ';');
+
+            if let Some(after) = self.rest.strip_prefix("--") {
+                self.rest = after.find('\n').map_or("", |i| &after[i + 1..]);
+                continue;
+            }
+
+            if self.rest.starts_with("/*") {
+                self.rest = skip_block_comment(self.rest);
+                continue;
+            }
+
+            break;
+        }
 
         let mut chars = self.rest.char_indices();
 
@@ -452,6 +538,31 @@ impl<'a> SqlWords<'a> {
 
         Some(word)
     }
+}
+
+/// The text after a `/* ... */` comment that starts `s`, nested as PostgreSQL
+/// nests them. An unterminated comment swallows the rest, as it does there.
+fn skip_block_comment(s: &str) -> &str {
+    let b = s.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+
+    while i < b.len() {
+        if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+            depth += 1;
+            i += 2;
+        } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                return &s[i..];
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    ""
 }
 
 /// Counts columns in `COPY table (col1, col2) FROM STDIN` by finding the
@@ -1344,9 +1455,9 @@ pub enum PlanKind {
         /// Columns announced in `CopyInResponse`; the format code count has to
         /// match the client's.
         columns: usize,
-        /// Whether the rows arrive in PostgreSQL's binary COPY framing, which
-        /// is what decides how they are counted.
-        binary: bool,
+        /// How the rows are framed, which is what decides how they are
+        /// counted.
+        format: CopyFormat,
     },
     /// Nothing at all: `""`, `";"`, or whitespace and semicolons. PostgreSQL
     /// answers EmptyQueryResponse, and a client that sends one -- some do, as
@@ -1396,7 +1507,7 @@ impl PreparedPlan {
             PlanKind::Copy {
                 direction,
                 columns: count_copy_columns(sql),
-                binary: copy_is_binary(sql),
+                format: copy_format(sql),
             }
         } else if sql.bytes().all(|b| b.is_ascii_whitespace() || b == b';') {
             PlanKind::Empty
@@ -1494,10 +1605,10 @@ fn respond_to_plan(handler: &NoopHandler, plan: &PreparedPlan) -> Response {
         PlanKind::Copy {
             direction,
             columns,
-            binary,
+            format,
         } => match direction {
             CopyDirection::FromStdin => Response::CopyIn(CopyResponse::new(
-                i8::from(*binary),
+                i8::from(*format == CopyFormat::Binary),
                 *columns,
                 stream::empty::<PgWireResult<CopyData>>(),
             )),
@@ -1556,7 +1667,7 @@ fn classify_simple(handler: &NoopHandler, sql: &str) -> Vec<Response> {
 /// path; the codec path builds its own bytes from the same direction.
 fn vector_for_copy(sql: &str) -> Vec<Response> {
     let columns = count_copy_columns(sql);
-    let binary = copy_is_binary(sql);
+    let binary = copy_format(sql) == CopyFormat::Binary;
 
     match copy_direction(sql) {
         Some(CopyDirection::FromStdin) => vec![Response::CopyIn(CopyResponse::new(
@@ -1829,7 +1940,78 @@ mod copy_columns {
 
 #[cfg(test)]
 mod copy_direction_tests {
-    use super::{copy_direction, copy_is_binary, CopyDirection};
+    use super::{copy_direction, copy_format, CopyDirection, CopyFormat};
+
+    /// **A comment is not syntax.** The word walker read `FROM STDIN` inside
+    /// a comment as the direction, and `binary` inside one as the format:
+    /// `COPY t /* FROM STDIN */ TO STDOUT` got CopyInResponse where
+    /// PostgreSQL sends CopyOutResponse, and `COPY t FROM STDIN /* binary */`
+    /// was read as binary, so ordinary text rows failed with `22P04 COPY file
+    /// signature not recognized` where PostgreSQL answers `COPY 1`.
+    #[test]
+    fn comments_are_skipped_by_the_copy_walker() {
+        assert_eq!(
+            copy_direction("COPY t /* FROM STDIN */ TO STDOUT"),
+            Some(CopyDirection::ToStdout)
+        );
+        assert_eq!(
+            copy_direction("COPY t /* TO STDOUT */ FROM STDIN"),
+            Some(CopyDirection::FromStdin)
+        );
+        assert_eq!(
+            copy_direction("COPY t -- TO STDOUT\n FROM STDIN"),
+            Some(CopyDirection::FromStdin)
+        );
+        assert_eq!(
+            copy_direction("/* leading */ COPY t FROM STDIN"),
+            Some(CopyDirection::FromStdin)
+        );
+        assert_eq!(
+            copy_format("COPY t FROM STDIN /* binary */"),
+            CopyFormat::Text
+        );
+        assert_eq!(copy_format("COPY t FROM STDIN -- csv\n"), CopyFormat::Text);
+    }
+
+    /// The format is an OPTION, read after the direction's target, not any
+    /// `BINARY` or `CSV` token anywhere in the statement.
+    #[test]
+    fn format_is_read_from_the_options_clause() {
+        for (sql, want) in [
+            ("copy t ( a, b ) from stdin binary;", CopyFormat::Binary),
+            ("COPY t FROM STDIN BINARY", CopyFormat::Binary),
+            ("COPY t FROM STDIN WITH BINARY", CopyFormat::Binary),
+            ("COPY t FROM STDIN WITH (FORMAT binary)", CopyFormat::Binary),
+            (
+                "COPY t FROM STDIN WITH (FORMAT 'binary')",
+                CopyFormat::Binary,
+            ),
+            (
+                "COPY t FROM STDIN (FORMAT BINARY, FREEZE)",
+                CopyFormat::Binary,
+            ),
+            ("COPY t FROM STDIN CSV", CopyFormat::Csv),
+            ("COPY t FROM STDIN WITH CSV HEADER", CopyFormat::Csv),
+            (
+                "COPY t FROM STDIN WITH (FORMAT csv, HEADER true)",
+                CopyFormat::Csv,
+            ),
+            (
+                "COPY t FROM STDIN WITH (DELIMITER ',', FORMAT csv)",
+                CopyFormat::Csv,
+            ),
+            ("COPY t FROM STDIN", CopyFormat::Text),
+            ("COPY t FROM STDIN WITH (FORMAT text)", CopyFormat::Text),
+            ("COPY t (a, binary, csv) FROM STDIN", CopyFormat::Text),
+            ("COPY \"binary\" FROM STDIN", CopyFormat::Text),
+            (
+                "COPY t FROM STDIN WITH (DELIMITER 'binary')",
+                CopyFormat::Text,
+            ),
+        ] {
+            assert_eq!(copy_format(sql), want, "{sql:?}");
+        }
+    }
 
     /// **The reviewer's case.** `COPY t FROM    STDIN` used to answer `SELECT 0`
     /// because the match allowed one or two spaces, and the following `CopyData`
@@ -1905,11 +2087,11 @@ mod copy_direction_tests {
             "COPY t FROM STDIN WITH (FORMAT binary)",
             "COPY t FROM STDIN WITH (FORMAT BINARY)",
         ] {
-            assert!(copy_is_binary(sql), "{sql:?}");
+            assert_eq!(copy_format(sql), CopyFormat::Binary, "{sql:?}");
         }
 
         for sql in ["COPY t FROM STDIN", "COPY t FROM STDIN WITH (FORMAT csv)"] {
-            assert!(!copy_is_binary(sql), "{sql:?}");
+            assert_ne!(copy_format(sql), CopyFormat::Binary, "{sql:?}");
         }
     }
 }
