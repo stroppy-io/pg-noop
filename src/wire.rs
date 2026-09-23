@@ -912,6 +912,23 @@ impl Conn {
                     return Some(());
                 }
 
+                // A named statement is not replaced in place: PostgreSQL
+                // answers 42P05, and a driver that wants the name back closes
+                // it first. Only the unnamed statement, which every driver
+                // reuses for every query, is overwritten. Replacing silently
+                // also changed what an already-bound portal would execute,
+                // since a portal refers to its statement by name.
+                if !name.is_empty() && self.statements.contains_key(name) {
+                    self.refuse(
+                        true,
+                        out,
+                        "42P05",
+                        &format!("prepared statement \"{name}\" already exists"),
+                    );
+
+                    return Some(());
+                }
+
                 let params = match crate::handler::parameter_types(sql, &declared) {
                     Ok(params) => params,
                     Err(e) => {
@@ -1011,10 +1028,24 @@ impl Conn {
                     }
                 }
 
-                // Two String allocations per query if done unconditionally, and
-                // a driver binds the SAME portal to the SAME statement forever.
-                // The formats are replaced in place: for every driver's usual
-                // shapes that is a copy of an enum, not an allocation.
+                // A named portal is not rebound in place either: 42P03, as
+                // PostgreSQL answers, until it is closed.
+                if !portal.is_empty() && self.portals.contains_key(portal) {
+                    self.refuse(
+                        true,
+                        out,
+                        "42P03",
+                        &format!("portal \"{portal}\" already exists"),
+                    );
+
+                    return Some(());
+                }
+
+                // One String allocation per query if done unconditionally, and
+                // a driver binds the unnamed portal to the SAME statement
+                // forever. The formats are replaced in place: for every
+                // driver's usual shapes that is a copy of an enum, not an
+                // allocation.
                 match self.portals.get_mut(portal) {
                     Some(cur) => {
                         if cur.statement != stmt {
@@ -3226,10 +3257,12 @@ mod tests {
         panic!("no ParameterDescription in the reply")
     }
 
-    /// Parse with declared parameter types, Describe the statement, Sync.
+    /// Parse the unnamed statement with declared parameter types, Describe
+    /// it, Sync. Unnamed, so one connection can do it repeatedly: a named
+    /// statement cannot be re-parsed without a Close.
     fn parse_and_describe(c: &mut Conn, v: &CatalogView, sql: &str, oids: &[u32]) -> Vec<u8> {
         let mut input = tagged(b'P', |b| {
-            cstr(b, "s");
+            cstr(b, "");
             cstr(b, sql);
             b.extend_from_slice(&(oids.len() as i16).to_be_bytes());
             for oid in oids {
@@ -3238,7 +3271,7 @@ mod tests {
         });
         input.extend(tagged(b'D', |b| {
             b.push(b'S');
-            cstr(b, "s");
+            cstr(b, "");
         }));
         input.extend(tagged(b'S', |_| {}));
 
@@ -3631,10 +3664,109 @@ mod tests {
         assert_eq!(tags(&out), vec![b'C', b'Z']);
         assert!(String::from_utf8_lossy(&out).contains("SELECT 0"));
 
-        // Binding again is a new portal, with its row.
-        bind_p1(&mut c, &v, "select 1");
+        // Closed and bound again, it is a new portal, with its row. (A named
+        // portal cannot be rebound in place: that is 42P03.)
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'C', |b| {
+                b.push(b'P');
+                cstr(b, "p1");
+            }),
+            &mut out,
+            &v,
+        );
+        c.advance(
+            &tagged(b'B', |b| {
+                cstr(b, "p1");
+                cstr(b, "s1");
+                b.extend_from_slice(&0i16.to_be_bytes());
+                b.extend_from_slice(&0i16.to_be_bytes());
+                b.extend_from_slice(&0i16.to_be_bytes());
+            }),
+            &mut out,
+            &v,
+        );
+        assert_eq!(tags(&out), vec![b'3', b'2']);
         let out = execute(&mut c, &v, "p1", 0);
         assert_eq!(tags(&out), vec![b'D', b'C', b'Z']);
+    }
+
+    /// **A named object is not silently replaced.** Parsing named statement
+    /// `s` twice answered ParseComplete twice; PostgreSQL answers 42P05 the
+    /// second time. Binding named portal `p` twice answered BindComplete
+    /// twice; PostgreSQL answers 42P03. Since a portal refers to its
+    /// statement by name, replacing the statement also changed what an
+    /// already-bound portal would execute. Only the unnamed statement and
+    /// portal are replaceable, and a Close makes a name free again.
+    #[test]
+    fn named_statements_and_portals_are_not_overwritten() {
+        let (mut c, v) = connected();
+        let parse = |name: &str, sql: &str| {
+            let mut input = tagged(b'P', |b| {
+                cstr(b, name);
+                cstr(b, sql);
+                b.extend_from_slice(&0i16.to_be_bytes());
+            });
+            input.extend(tagged(b'S', |_| {}));
+            input
+        };
+        let bind = |portal: &str, stmt: &str| {
+            let mut input = tagged(b'B', |b| {
+                cstr(b, portal);
+                cstr(b, stmt);
+                b.extend_from_slice(&0i16.to_be_bytes());
+                b.extend_from_slice(&0i16.to_be_bytes());
+                b.extend_from_slice(&0i16.to_be_bytes());
+            });
+            input.extend(tagged(b'S', |_| {}));
+            input
+        };
+        let close = |kind: u8, name: &str| {
+            let mut input = tagged(b'C', |b| {
+                b.push(kind);
+                cstr(b, name);
+            });
+            input.extend(tagged(b'S', |_| {}));
+            input
+        };
+
+        let mut out = Vec::new();
+        c.advance(&parse("s", "select 1"), &mut out, &v);
+        assert_eq!(tags(&out), vec![b'1', b'Z']);
+        out.clear();
+        c.advance(&parse("s", "select 2"), &mut out, &v);
+        assert_eq!(tags(&out), vec![b'E', b'Z'], "a second Parse of s");
+        assert_eq!(first_sqlstate(&out), "42P05");
+
+        out.clear();
+        c.advance(&bind("p", "s"), &mut out, &v);
+        assert_eq!(tags(&out), vec![b'2', b'Z']);
+        out.clear();
+        c.advance(&bind("p", "s"), &mut out, &v);
+        assert_eq!(tags(&out), vec![b'E', b'Z'], "a second Bind of p");
+        assert_eq!(first_sqlstate(&out), "42P03");
+
+        // Closed, the names are free again.
+        out.clear();
+        c.advance(&close(b'S', "s"), &mut out, &v);
+        c.advance(&parse("s", "select 3"), &mut out, &v);
+        assert_eq!(tags(&out), vec![b'3', b'Z', b'1', b'Z']);
+        out.clear();
+        c.advance(&close(b'P', "p"), &mut out, &v);
+        c.advance(&bind("p", "s"), &mut out, &v);
+        assert_eq!(tags(&out), vec![b'3', b'Z', b'2', b'Z']);
+
+        // The unnamed statement and portal are replaced freely: every driver
+        // reuses them for every query.
+        out.clear();
+        c.advance(&parse("", "select 1"), &mut out, &v);
+        c.advance(&parse("", "select 2"), &mut out, &v);
+        c.advance(&bind("", ""), &mut out, &v);
+        c.advance(&bind("", ""), &mut out, &v);
+        assert_eq!(
+            tags(&out),
+            vec![b'1', b'Z', b'1', b'Z', b'2', b'Z', b'2', b'Z']
+        );
     }
 
     /// An Execute without its `max_rows` is malformed, not "no limit".
