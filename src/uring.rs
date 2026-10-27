@@ -222,30 +222,7 @@ fn run_until(
             (a, b) => Some(a.into_iter().chain(b).min().expect("one is Some")),
         };
 
-        match deadline {
-            None => {
-                ring.submit_and_wait(1)?;
-            }
-            Some(at) => {
-                let wait = at.saturating_duration_since(std::time::Instant::now());
-                let ts = types::Timespec::new()
-                    .sec(wait.as_secs())
-                    .nsec(wait.subsec_nanos());
-
-                // ETIME is the bound running out, which is one of the two things
-                // this wait is for; anything else is the ring failing and belongs
-                // to the caller. The syscall is not asked which of the two
-                // happened -- `expired` below reads that from the clock.
-                match ring
-                    .submitter()
-                    .submit_with_args(1, &types::SubmitArgs::new().timespec(&ts))
-                {
-                    Ok(_) => {}
-                    Err(e) if e.raw_os_error() == Some(libc::ETIME) => {}
-                    Err(e) => return Err(e),
-                }
-            }
-        }
+        wait_for_work(&mut ring, deadline)?;
 
         // **A deadline's arrival is read from the clock, never from the wait.**
         //
@@ -496,6 +473,83 @@ fn run_until(
 
             earliest_startup = next;
         }
+    }
+}
+
+/// Wait for one completion, or until `deadline`, without ever ending the shard
+/// over something that is not a failure.
+///
+/// **EINTR is not a shard's death.** `io_uring_enter` is an ordinary
+/// interruptible wait: any signal delivered to this thread -- a profiler's
+/// sample, a `SIGCHLD`, a supervisor's nudge -- brings it back as EINTR. That
+/// used to be `?`'d straight out of the loop, so the shard stopped serving,
+/// silently, on a signal that means nothing to it. An interrupted wait leaves
+/// the submission queue untouched, so the retry resubmits exactly the work that
+/// was there.
+///
+/// **EBUSY means the completions are already here.** The kernel answers it when
+/// the completion ring is full of entries it could not flush from its overflow
+/// list: the wait cannot wait, and the loop's next step -- draining the
+/// completion queue -- is the retry.
+///
+/// ETIME is the deadline arriving, which is one of the two things this wait is
+/// for. Whether a deadline has actually passed is read from the clock by the
+/// caller, never from this function's return.
+fn wait_for_work(ring: &mut IoUring, deadline: Option<std::time::Instant>) -> io::Result<()> {
+    loop {
+        let waited = match deadline {
+            None => ring.submit_and_wait(1).map(drop),
+            Some(at) => {
+                let wait = at.saturating_duration_since(std::time::Instant::now());
+                let ts = types::Timespec::new()
+                    .sec(wait.as_secs())
+                    .nsec(wait.subsec_nanos());
+
+                match ring
+                    .submitter()
+                    .submit_with_args(1, &types::SubmitArgs::new().timespec(&ts))
+                {
+                    Ok(_) => Ok(()),
+                    Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            }
+        };
+
+        match waited {
+            Ok(()) => return Ok(()),
+            Err(e) => match retry_after(&e) {
+                Retry::Again => continue,
+                Retry::Drain => return Ok(()),
+                Retry::Stop => return Err(e),
+            },
+        }
+    }
+}
+
+/// What a failed wait means for the shard.
+#[derive(Debug, PartialEq, Eq)]
+enum Retry {
+    /// The kernel was interrupted before it could wait. Nothing about the ring
+    /// changed, so the same wait is submitted again.
+    Again,
+    /// The completions the wait is for are already here: return to the loop and
+    /// drain them.
+    Drain,
+    /// The ring itself is failing, and the shard cannot go on.
+    Stop,
+}
+
+fn retry_after(e: &io::Error) -> Retry {
+    match e.raw_os_error() {
+        // Some kernels report the interruption as a bare errno rather than
+        // letting it reach `ErrorKind::Interrupted`.
+        Some(libc::EINTR) => Retry::Again,
+        // The completion ring is full with overflow entries the kernel could
+        // not flush: there is nothing to wait for, only something to reap.
+        Some(libc::EBUSY) => Retry::Drain,
+        _ if e.kind() == io::ErrorKind::Interrupted => Retry::Again,
+        _ => Retry::Stop,
     }
 }
 
@@ -866,5 +920,101 @@ mod tests {
             "an accept paused by EMFILE must resume once fds are free, even while \
              the shard is busy; a new connection got {reply:?}"
         );
+    }
+
+    extern "C" fn ignore_signal(_: libc::c_int) {}
+
+    /// A no-op handler, installed WITHOUT `SA_RESTART`, so the syscall it
+    /// interrupts returns EINTR instead of being restarted invisibly.
+    fn install_noop_handler(signal: libc::c_int) {
+        // SAFETY: a zeroed sigaction is a valid empty disposition; the handler
+        // is a plain `extern "C" fn`, and handles one `int`.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = ignore_signal as *const () as libc::sighandler_t;
+            action.sa_flags = 0;
+            libc::sigemptyset(&mut action.sa_mask);
+
+            assert_eq!(
+                libc::sigaction(signal, &action, std::ptr::null_mut()),
+                0,
+                "sigaction: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+
+    /// **B2: a signal is not a shard's death.**
+    ///
+    /// `io_uring_enter` is an ordinary interruptible wait. A signal delivered to
+    /// the shard thread while it waits -- a profiler's sample, a `SIGCHLD` from
+    /// a child process, a supervisor's nudge -- brings it back as EINTR, and
+    /// that used to end the shard thread: no message, no accept, no serving, on
+    /// a signal that means nothing to it.
+    #[test]
+    fn a_signal_interrupting_the_wait_does_not_end_the_shard() {
+        install_noop_handler(libc::SIGUSR1);
+
+        let Some((addr, tid)) = spawn_shard(None) else {
+            return;
+        };
+
+        // Let the loop settle into the blocking wait before interrupting it.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let pid = unsafe { libc::getpid() };
+        for _ in 0..20 {
+            let shard = tid.load(Ordering::SeqCst);
+            assert!(shard > 0, "the shard thread published its tid");
+
+            // SAFETY: `tgkill` with a tid this process published for itself,
+            // with a handler installed for the signal.
+            let sent = unsafe { libc::syscall(libc::SYS_tgkill, pid, shard, libc::SIGUSR1) };
+            assert_eq!(sent, 0, "tgkill: {}", io::Error::last_os_error());
+
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let reply = round_trip(addr);
+
+        assert!(
+            matches!(reply, Ok(n) if n > 0),
+            "a shard interrupted by a signal must keep serving; a client got {reply:?}"
+        );
+    }
+
+    /// **B2: a failed wait is classified, not fatal by default.**
+    ///
+    /// EINTR is a signal, so the wait is submitted again; EBUSY is the kernel
+    /// saying the completions are already in the ring, so the loop returns to
+    /// drain them; anything else is the ring failing and ends the shard.
+    ///
+    /// EINTR is also covered end to end by the test above. EBUSY has no
+    /// reproducer on this kernel -- `io_uring_enter` flushes the overflow list
+    /// before it waits, so a wait for ONE completion never reaches the branch
+    /// that answers EBUSY -- so what is pinned here is the mapping that would
+    /// otherwise be silently wrong.
+    #[test]
+    fn a_transient_wait_failure_is_not_a_dead_shard() {
+        assert_eq!(
+            retry_after(&io::Error::from(io::ErrorKind::Interrupted)),
+            Retry::Again
+        );
+        assert_eq!(
+            retry_after(&io::Error::from_raw_os_error(libc::EINTR)),
+            Retry::Again
+        );
+        assert_eq!(
+            retry_after(&io::Error::from_raw_os_error(libc::EBUSY)),
+            Retry::Drain
+        );
+
+        for fatal in [libc::EBADF, libc::EINVAL, libc::ENOMEM, libc::ECANCELED] {
+            assert_eq!(
+                retry_after(&io::Error::from_raw_os_error(fatal)),
+                Retry::Stop,
+                "errno {fatal}"
+            );
+        }
     }
 }
