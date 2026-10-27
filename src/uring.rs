@@ -845,11 +845,19 @@ mod tests {
             .output()
             .expect("run the child test process");
 
+        let stderr = String::from_utf8_lossy(&child.stderr);
+
         assert!(
             child.status.success(),
-            "the fd-exhaustion scenario failed in its own process\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            "the fd-exhaustion scenario failed in its own process\n--- stdout ---\n{}\n--- stderr ---\n{stderr}",
             String::from_utf8_lossy(&child.stdout),
-            String::from_utf8_lossy(&child.stderr),
+        );
+
+        // What the pause is resumed FROM: a run whose accept never ran out of
+        // fds would pass the assertion above without testing anything.
+        assert!(
+            stderr.contains(&format!("accept failed with errno {}", libc::EMFILE)),
+            "the scenario must exhaust fds at the accept; the child said:\n{stderr}"
         );
     }
 
@@ -872,13 +880,19 @@ mod tests {
         std::thread::sleep(Duration::from_millis(400));
 
         // Leave the child a small budget: the ring, the listener, three
-        // connections and the bookkeeping are already open.
-        let limit = libc::rlimit {
-            rlim_cur: 48,
-            rlim_max: 48,
-        };
-        // SAFETY: a plain rlimit for this process; lowering both bounds is
-        // always allowed.
+        // connections and the bookkeeping are already open. The current limit is
+        // read first and only ever LOWERED, so a host that already runs with a
+        // small one does not make this fail on a raise.
+        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        // SAFETY: a plain kernel-filled struct.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0,
+            "getrlimit: {}",
+            io::Error::last_os_error()
+        );
+        limit.rlim_cur = limit.rlim_cur.min(48);
+        // SAFETY: lowering the soft limit is always allowed.
         assert_eq!(
             unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) },
             0,
