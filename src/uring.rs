@@ -107,6 +107,22 @@ pub fn probe() -> io::Result<()> {
 
 /// Run one shard's loop until the listener fails. Never returns in normal use.
 pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Result<()> {
+    run_until(listener, catalog, entries, crate::config::startup_timeout())
+}
+
+/// `run`, with the startup timeout supplied rather than read from the process.
+///
+/// The timeout in force is a process-wide `OnceLock` (`config::startup_timeout`),
+/// which is right for a server and unusable for a test: a test that had to set
+/// an environment variable would be sharing one decision with every other test
+/// in the binary. The loop itself takes it as an argument, and `run` is what
+/// reads the configured one.
+fn run_until(
+    listener: TcpListener,
+    catalog: CatalogView,
+    entries: u32,
+    startup_timeout: Option<std::time::Duration>,
+) -> io::Result<()> {
     // SQPOLL: a kernel thread drains the submission queue, so a submit becomes a
     // memory write and `io_uring_enter` leaves the hot path. Unprivileged since
     // Linux 5.11. It costs a kernel thread per ring that spins for `idle` ms
@@ -186,7 +202,6 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
     // a minimum rather than recomputed each pass: with either deadline pending
     // the loop does no more than compare an Option, and the scan that refreshes
     // this runs only when a deadline actually comes due.
-    let startup_timeout = crate::config::startup_timeout();
     let mut earliest_startup: Option<std::time::Instant> = None;
 
     push_accept(&mut ring)?;
@@ -196,12 +211,8 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
         // **Wait for a completion, or for the earliest deadline.**
         //
         // Two obligations of this shard are invisible to a completion: a paused
-        // accept, and a connection that has not completed startup. Both are
-        // reached only by the code below, and `submit_and_wait` never returns to
-        // it -- so a 100 ms accept backoff became a shard that never accepted
-        // again, and an idle client held its fd for as long as it liked. Bounding
-        // the wait is the whole mechanism: when a deadline passes, `io_uring_enter`
-        // returns ETIME and this loop keeps running.
+        // accept, and a connection that has not completed startup. Bounding the
+        // wait is what keeps the loop coming back to them.
         //
         // With neither deadline pending -- the steady state under load -- this is
         // the plain blocking wait it always was, and nothing is added to the hot
@@ -211,30 +222,19 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
             (a, b) => Some(a.into_iter().chain(b).min().expect("one is Some")),
         };
 
-        let expired = match deadline {
-            None => {
-                ring.submit_and_wait(1)?;
+        wait_for_work(&mut ring, deadline)?;
 
-                false
-            }
-            Some(at) => {
-                let wait = at.saturating_duration_since(std::time::Instant::now());
-                let ts = types::Timespec::new()
-                    .sec(wait.as_secs())
-                    .nsec(wait.subsec_nanos());
-
-                // ETIME is the deadline arriving, which is the point; anything
-                // else is the ring failing and belongs to the caller.
-                match ring
-                    .submitter()
-                    .submit_with_args(1, &types::SubmitArgs::new().timespec(&ts))
-                {
-                    Ok(_) => false,
-                    Err(e) if e.raw_os_error() == Some(libc::ETIME) => true,
-                    Err(e) => return Err(e),
-                }
-            }
-        };
+        // **A deadline's arrival is read from the clock, never from the wait.**
+        //
+        // This used to be `true` exactly when the wait returned ETIME, which is
+        // true only of an idle shard. Under load at least one completion is
+        // always ready, `io_uring_enter` returns the moment it has one, and ETIME
+        // never comes -- so a 100 ms accept backoff lasted until the shard next
+        // went idle, and a connection that never spoke kept its fd and its
+        // receive buffer for as long as traffic kept the loop away from the
+        // branch below. A deadline is a time, so the clock is what decides it,
+        // however the wait returned.
+        let expired = deadline.is_some_and(|at| std::time::Instant::now() >= at);
 
         let mut completions: Vec<(u64, i32)> = Vec::new();
         {
@@ -476,6 +476,83 @@ pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Res
     }
 }
 
+/// Wait for one completion, or until `deadline`, without ever ending the shard
+/// over something that is not a failure.
+///
+/// **EINTR is not a shard's death.** `io_uring_enter` is an ordinary
+/// interruptible wait: any signal delivered to this thread -- a profiler's
+/// sample, a `SIGCHLD`, a supervisor's nudge -- brings it back as EINTR. That
+/// used to be `?`'d straight out of the loop, so the shard stopped serving,
+/// silently, on a signal that means nothing to it. An interrupted wait leaves
+/// the submission queue untouched, so the retry resubmits exactly the work that
+/// was there.
+///
+/// **EBUSY means the completions are already here.** The kernel answers it when
+/// the completion ring is full of entries it could not flush from its overflow
+/// list: the wait cannot wait, and the loop's next step -- draining the
+/// completion queue -- is the retry.
+///
+/// ETIME is the deadline arriving, which is one of the two things this wait is
+/// for. Whether a deadline has actually passed is read from the clock by the
+/// caller, never from this function's return.
+fn wait_for_work(ring: &mut IoUring, deadline: Option<std::time::Instant>) -> io::Result<()> {
+    loop {
+        let waited = match deadline {
+            None => ring.submit_and_wait(1).map(drop),
+            Some(at) => {
+                let wait = at.saturating_duration_since(std::time::Instant::now());
+                let ts = types::Timespec::new()
+                    .sec(wait.as_secs())
+                    .nsec(wait.subsec_nanos());
+
+                match ring
+                    .submitter()
+                    .submit_with_args(1, &types::SubmitArgs::new().timespec(&ts))
+                {
+                    Ok(_) => Ok(()),
+                    Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            }
+        };
+
+        match waited {
+            Ok(()) => return Ok(()),
+            Err(e) => match retry_after(&e) {
+                Retry::Again => continue,
+                Retry::Drain => return Ok(()),
+                Retry::Stop => return Err(e),
+            },
+        }
+    }
+}
+
+/// What a failed wait means for the shard.
+#[derive(Debug, PartialEq, Eq)]
+enum Retry {
+    /// The kernel was interrupted before it could wait. Nothing about the ring
+    /// changed, so the same wait is submitted again.
+    Again,
+    /// The completions the wait is for are already here: return to the loop and
+    /// drain them.
+    Drain,
+    /// The ring itself is failing, and the shard cannot go on.
+    Stop,
+}
+
+fn retry_after(e: &io::Error) -> Retry {
+    match e.raw_os_error() {
+        // Some kernels report the interruption as a bare errno rather than
+        // letting it reach `ErrorKind::Interrupted`.
+        Some(libc::EINTR) => Retry::Again,
+        // The completion ring is full with overflow entries the kernel could
+        // not flush: there is nothing to wait for, only something to reap.
+        Some(libc::EBUSY) => Retry::Drain,
+        _ if e.kind() == io::ErrorKind::Interrupted => Retry::Again,
+        _ => Retry::Stop,
+    }
+}
+
 fn submit_recv(ring: &mut IoUring, slots: &mut [Option<Slot>], idx: usize) -> io::Result<()> {
     let Some(slot) = slots.get_mut(idx).and_then(|s| s.as_mut()) else {
         return Ok(());
@@ -548,4 +625,410 @@ fn reap(slots: &mut [Option<Slot>], free: &mut Vec<usize>, idx: usize) {
     unsafe { libc::close(slot.fd) };
     slots[idx] = None;
     free.push(idx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// How many clients keep the shard busy in the deadline tests, and how many
+    /// pipelined queries each writes per pass. Together they are what saturates
+    /// one shard from a test process: see `spawn_busy_client`.
+    const BUSY_CLIENTS: usize = 32;
+    const BUSY_BATCH: usize = 2048;
+
+    /// Set in the child process of `an_accept_paused_by_emfile_resumes_...`,
+    /// which is this same test binary re-entered with one test selected.
+    const EMFILE_CHILD: &str = "PGNOOP_URING_EMFILE_CHILD";
+
+    fn startup_message() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&196_608u32.to_be_bytes()); // protocol 3.0
+        body.extend_from_slice(b"user\0test\0\0");
+
+        let mut msg = ((body.len() + 4) as u32).to_be_bytes().to_vec();
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    fn query_message() -> Vec<u8> {
+        let body = b"select 1\0";
+        let mut msg = vec![b'Q'];
+        msg.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
+        msg.extend_from_slice(body);
+        msg
+    }
+
+    /// A shard on a fresh loopback port, and the tid of the thread running it.
+    ///
+    /// `None` when this box cannot create a ring at all -- the condition `probe`
+    /// reports and the server falls back to epoll for. A test that cannot serve
+    /// here is not a test that failed.
+    fn spawn_shard(startup_timeout: Option<Duration>) -> Option<(SocketAddr, Arc<AtomicI32>)> {
+        probe().ok()?;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+        let addr = listener.local_addr().ok()?;
+        let tid = Arc::new(AtomicI32::new(0));
+
+        let published = Arc::clone(&tid);
+        std::thread::spawn(move || {
+            // SAFETY: gettid has no arguments and no failure.
+            published.store(
+                unsafe { libc::syscall(libc::SYS_gettid) } as i32,
+                Ordering::SeqCst,
+            );
+
+            let catalog = CatalogView(Arc::new(crate::handler::NoopHandler::new()));
+            if let Err(e) = run_until(listener, catalog, 256, startup_timeout) {
+                eprintln!("test shard ended: {e}");
+            }
+        });
+
+        for _ in 0..1000 {
+            if tid.load(Ordering::SeqCst) != 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        Some((addr, tid))
+    }
+
+    /// A client that keeps its shard saturated until `stop` is set.
+    ///
+    /// **Saturated, not merely busy**, because that is the state the deadlines
+    /// were invisible in: the loop only ever asked the wait whether a deadline
+    /// had passed, and a shard with work always ready answers "a completion"
+    /// instead. A batch of pipelined queries per write is what makes the shard
+    /// the bottleneck rather than the clients -- each receive completion costs
+    /// the shard a whole batch of parsing and a whole batch of reply, and the
+    /// next completions have arrived by the time it is done.
+    ///
+    /// Reading happens on a second thread of the same socket: a client that
+    /// stopped reading would stall the shard's sends and idle it, which is the
+    /// one state these tests need never to reach.
+    fn spawn_busy_client(addr: SocketAddr, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let Ok(mut stream) = TcpStream::connect(addr) else {
+                return;
+            };
+            let _ = stream.set_nodelay(true);
+
+            // The handshake goes out ONCE: a startup message sent again after
+            // the first is a malformed query frame, and the codec would close
+            // the connection the shard is supposed to be busy with.
+            if stream.write_all(&startup_message()).is_err() {
+                return;
+            }
+
+            let mut batch = Vec::with_capacity(BUSY_BATCH * 14);
+            for _ in 0..BUSY_BATCH {
+                batch.extend_from_slice(&query_message());
+            }
+
+            let Ok(mut replies) = stream.try_clone() else {
+                return;
+            };
+            std::thread::spawn(move || {
+                let mut scratch = [0u8; 16 * 1024];
+                while let Ok(n) = replies.read(&mut scratch) {
+                    if n == 0 {
+                        return;
+                    }
+                }
+            });
+
+            while !stop.load(Ordering::SeqCst) {
+                if stream.write_all(&batch).is_err() {
+                    return;
+                }
+            }
+
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        })
+    }
+
+    /// Startup, one query, and however much of the reply arrives. An error is a
+    /// shard that did not take the connection.
+    fn round_trip(addr: SocketAddr) -> std::io::Result<usize> {
+        let mut stream = TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.write_all(&startup_message())?;
+        stream.write_all(&query_message())?;
+
+        let mut buf = [0u8; 256];
+        stream.read(&mut buf)
+    }
+
+    /// **B1: an expired deadline is decided by the clock, not by the wait's
+    /// return code.**
+    ///
+    /// Deadline handling used to run only when the bounded wait came back
+    /// ETIME. Under load at least one completion is always ready, the wait
+    /// returns as soon as it has one, and ETIME never comes -- so a connection
+    /// that never spoke kept its fd and its receive buffer for as long as other
+    /// traffic kept the shard busy. Here `BUSY_CLIENTS` clients keep it
+    /// saturated while one more connects and says nothing: it must still be
+    /// closed at its startup deadline.
+    #[test]
+    fn a_startup_deadline_expires_while_completions_keep_arriving() {
+        let Some((addr, _tid)) = spawn_shard(Some(Duration::from_millis(300))) else {
+            return;
+        };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let busy: Vec<_> = (0..BUSY_CLIENTS)
+            .map(|_| spawn_busy_client(addr, Arc::clone(&stop)))
+            .collect();
+
+        // The busy clients complete startup and settle into their loop.
+        std::thread::sleep(Duration::from_millis(400));
+
+        let mut idle = TcpStream::connect(addr).expect("connect");
+        idle.set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("read timeout");
+
+        let started = Instant::now();
+        let mut byte = [0u8; 1];
+        let read = idle.read(&mut byte);
+        let waited = started.elapsed();
+
+        stop.store(true, Ordering::SeqCst);
+        for client in busy {
+            let _ = client.join();
+        }
+
+        assert_eq!(
+            read.ok(),
+            Some(0),
+            "a connection silent past its 300ms startup deadline must be closed \
+             even while the shard is busy serving others (read returned after {waited:?})"
+        );
+        assert!(
+            waited < Duration::from_secs(2),
+            "the silent connection was closed only after {waited:?}"
+        );
+    }
+
+    /// **B1, the accept half: a paused accept resumes when fds come back.**
+    ///
+    /// `EMFILE` costs the accept a 100 ms backoff; the backoff is only ever
+    /// reached by the deadline handling at the end of the loop, which under
+    /// traffic used to be unreachable. The shard then never accepted again --
+    /// not late, never -- while continuing to serve what it already had.
+    ///
+    /// The fd limit is a property of the PROCESS, so the scenario runs in a
+    /// child of this test binary (see `EMFILE_CHILD`): lowering it here would
+    /// break every other test sharing this process.
+    #[test]
+    fn an_accept_paused_by_emfile_resumes_while_the_shard_is_busy() {
+        if std::env::var_os(EMFILE_CHILD).is_some() {
+            emfile_scenario();
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("the test binary's path");
+        let child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "uring::tests::an_accept_paused_by_emfile_resumes_while_the_shard_is_busy",
+                "--nocapture",
+            ])
+            .env(EMFILE_CHILD, "1")
+            .output()
+            .expect("run the child test process");
+
+        let stderr = String::from_utf8_lossy(&child.stderr);
+
+        assert!(
+            child.status.success(),
+            "the fd-exhaustion scenario failed in its own process\n--- stdout ---\n{}\n--- stderr ---\n{stderr}",
+            String::from_utf8_lossy(&child.stdout),
+        );
+
+        // What the pause is resumed FROM: a run whose accept never ran out of
+        // fds would pass the assertion above without testing anything.
+        assert!(
+            stderr.contains(&format!("accept failed with errno {}", libc::EMFILE)),
+            "the scenario must exhaust fds at the accept; the child said:\n{stderr}"
+        );
+    }
+
+    /// The body of `an_accept_paused_by_emfile_resumes_while_the_shard_is_busy`,
+    /// run in the child process where the fd limit can be lowered.
+    fn emfile_scenario() {
+        // Nothing here is about the startup deadline; connections here either
+        // speak or are closed by the test's own fds.
+        let Some((addr, _tid)) = spawn_shard(Some(Duration::from_secs(60))) else {
+            return;
+        };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let busy: Vec<_> = (0..3)
+            .map(|_| spawn_busy_client(addr, Arc::clone(&stop)))
+            .collect();
+
+        // The busy clients are connected and served before the fd budget is
+        // spent; from here on they need no new fds.
+        std::thread::sleep(Duration::from_millis(400));
+
+        // Leave the child a small budget: the ring, the listener, three
+        // connections and the bookkeeping are already open. The current limit is
+        // read first and only ever LOWERED, so a host that already runs with a
+        // small one does not make this fail on a raise.
+        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        // SAFETY: a plain kernel-filled struct.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0,
+            "getrlimit: {}",
+            io::Error::last_os_error()
+        );
+        limit.rlim_cur = limit.rlim_cur.min(48);
+        // SAFETY: lowering the soft limit is always allowed.
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) },
+            0,
+            "setrlimit: {}",
+            io::Error::last_os_error()
+        );
+
+        // Spend every fd this process may have.
+        let mut held = Vec::new();
+        loop {
+            match std::fs::File::open("/dev/null") {
+                Ok(f) => held.push(f),
+                Err(e) => {
+                    assert_eq!(e.raw_os_error(), Some(libc::EMFILE), "exhausting fds: {e}");
+                    break;
+                }
+            }
+        }
+        assert!(!held.is_empty(), "the limit left room to exhaust");
+
+        // Exactly one fd free: enough for a client socket, so the accept that
+        // follows it is the call that runs out.
+        held.truncate(held.len() - 1);
+        let _late = TcpStream::connect(addr).expect("connect with the last free fd");
+        std::thread::sleep(Duration::from_millis(200));
+
+        // fds come back -- a closing connection's worth -- while the busy
+        // clients keep the shard from ever going idle.
+        held.clear();
+
+        let reply = round_trip(addr);
+        stop.store(true, Ordering::SeqCst);
+        for client in busy {
+            let _ = client.join();
+        }
+
+        assert!(
+            matches!(reply, Ok(n) if n > 0),
+            "an accept paused by EMFILE must resume once fds are free, even while \
+             the shard is busy; a new connection got {reply:?}"
+        );
+    }
+
+    extern "C" fn ignore_signal(_: libc::c_int) {}
+
+    /// A no-op handler, installed WITHOUT `SA_RESTART`, so the syscall it
+    /// interrupts returns EINTR instead of being restarted invisibly.
+    fn install_noop_handler(signal: libc::c_int) {
+        // SAFETY: a zeroed sigaction is a valid empty disposition; the handler
+        // is a plain `extern "C" fn`, and handles one `int`.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = ignore_signal as *const () as libc::sighandler_t;
+            action.sa_flags = 0;
+            libc::sigemptyset(&mut action.sa_mask);
+
+            assert_eq!(
+                libc::sigaction(signal, &action, std::ptr::null_mut()),
+                0,
+                "sigaction: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
+
+    /// **B2: a signal is not a shard's death.**
+    ///
+    /// `io_uring_enter` is an ordinary interruptible wait. A signal delivered to
+    /// the shard thread while it waits -- a profiler's sample, a `SIGCHLD` from
+    /// a child process, a supervisor's nudge -- brings it back as EINTR, and
+    /// that used to end the shard thread: no message, no accept, no serving, on
+    /// a signal that means nothing to it.
+    #[test]
+    fn a_signal_interrupting_the_wait_does_not_end_the_shard() {
+        install_noop_handler(libc::SIGUSR1);
+
+        let Some((addr, tid)) = spawn_shard(None) else {
+            return;
+        };
+
+        // Let the loop settle into the blocking wait before interrupting it.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let pid = unsafe { libc::getpid() };
+        for _ in 0..20 {
+            let shard = tid.load(Ordering::SeqCst);
+            assert!(shard > 0, "the shard thread published its tid");
+
+            // SAFETY: `tgkill` with a tid this process published for itself,
+            // with a handler installed for the signal.
+            let sent = unsafe { libc::syscall(libc::SYS_tgkill, pid, shard, libc::SIGUSR1) };
+            assert_eq!(sent, 0, "tgkill: {}", io::Error::last_os_error());
+
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let reply = round_trip(addr);
+
+        assert!(
+            matches!(reply, Ok(n) if n > 0),
+            "a shard interrupted by a signal must keep serving; a client got {reply:?}"
+        );
+    }
+
+    /// **B2: a failed wait is classified, not fatal by default.**
+    ///
+    /// EINTR is a signal, so the wait is submitted again; EBUSY is the kernel
+    /// saying the completions are already in the ring, so the loop returns to
+    /// drain them; anything else is the ring failing and ends the shard.
+    ///
+    /// EINTR is also covered end to end by the test above. EBUSY has no
+    /// reproducer on this kernel -- `io_uring_enter` flushes the overflow list
+    /// before it waits, so a wait for ONE completion never reaches the branch
+    /// that answers EBUSY -- so what is pinned here is the mapping that would
+    /// otherwise be silently wrong.
+    #[test]
+    fn a_transient_wait_failure_is_not_a_dead_shard() {
+        assert_eq!(
+            retry_after(&io::Error::from(io::ErrorKind::Interrupted)),
+            Retry::Again
+        );
+        assert_eq!(
+            retry_after(&io::Error::from_raw_os_error(libc::EINTR)),
+            Retry::Again
+        );
+        assert_eq!(
+            retry_after(&io::Error::from_raw_os_error(libc::EBUSY)),
+            Retry::Drain
+        );
+
+        for fatal in [libc::EBADF, libc::EINVAL, libc::ENOMEM, libc::ECANCELED] {
+            assert_eq!(
+                retry_after(&io::Error::from_raw_os_error(fatal)),
+                Retry::Stop,
+                "errno {fatal}"
+            );
+        }
+    }
 }
