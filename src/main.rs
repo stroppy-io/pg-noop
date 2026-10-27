@@ -471,6 +471,14 @@ fn main() {
         shards
     );
 
+    // What the ring actually granted. Reported here as well as at startup
+    // because this is the line a run's log keeps, and a measurement is only
+    // reproducible if it says which ring produced it.
+    #[cfg(target_os = "linux")]
+    if io == Io::Uring {
+        eprintln!("pgnoop: io_uring {}", crate::uring::report());
+    }
+
     // A server whose every shard failed must not exit 0. Discarding the join
     // results means a fully dead process reports success to whatever
     // supervises it.
