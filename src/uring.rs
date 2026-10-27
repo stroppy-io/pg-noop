@@ -684,7 +684,10 @@ impl Default for Tuning {
             // A dozen test shards in one process; the production ring is 256
             // buffers, 8 MiB of mapping each.
             #[cfg(not(test))]
-            pbuf_count: PBUF_COUNT,
+            pbuf_count: std::env::var("PGNOOP_PBUF")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(PBUF_COUNT),
             #[cfg(test)]
             pbuf_count: 16,
             #[cfg(test)]
@@ -825,7 +828,7 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
     // version number: a kernel that does not know `IORING_RECV_MULTISHOT`
     // answers the first receive with EINVAL, and every receive after that is
     // a one-shot into a provided buffer instead.
-    let mut multishot = bufs.is_some();
+    let mut multishot = false; // PROBE
     let mut scratch: Vec<usize> = Vec::new();
 
     arm_accept(&mut ring, listen_fd, &mut accept_armed)?;

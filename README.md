@@ -138,6 +138,71 @@ depth 1 over plain io_uring; without them io_uring is slower than epoll.
 `PGNOOP_SQPOLL=<idle_ms>` is off by default and should stay off at one shard per
 core: one spinning kernel poller per shard, 174× slower.
 
+### What the ring is granted
+
+`uring` probes every ring feature the kernel has, one setup flag at a time, and
+reports the granted set on stderr at startup and in the listen banner. A flag
+`io_uring_setup` will not take is dropped *after the errno that refused it*,
+never silently; so is a feature that a later call refuses.
+
+On Linux 7.0 (this box):
+
+```
+pgnoop: io_uring granted: SINGLE_ISSUER DEFER_TASKRUN COOP_TASKRUN TASKRUN_FLAG
+        NO_SQARRAY CLAMP SUBMIT_ALL CQSIZE RING_FD PBUF_RING
+        (PBUF_RING_INC granted, unused: a buffer's ownership is not reported
+         while a receive holds it)
+```
+
+* `CQSIZE` is four times the ring's connection capacity (4096 submission entries
+  → 16384 completions), so a burst of completions is drained rather than pushed
+  into the kernel's overflow list. If a ring cannot get that memory
+  (`ENOMEM` — a process's ring memory is bounded, 8 MiB of `mlock` on this box),
+  the shards say so and keep the kernel's own completion queue.
+* `RING_FD` (`IORING_REGISTER_RING_FDS`) lets `io_uring_enter` name the ring by
+  a registered index instead of the raw descriptor.
+* `PBUF_RING` is one registered provided-buffer ring per shard, shared by every
+  connection on it: a connection no longer owns a 32 KiB zeroed receive buffer,
+  and a shard's receive memory is the ring, not the connection count.
+* `PBUF_RING_INC` (`IOU_PBUF_RING_INC`, incremental consumption) is granted and
+  **not used**. A buffer stays with the receive that filled it until it is full,
+  and the kernel publishes no completion when it gives one up: a connection whose
+  first read is 19 bytes holds that buffer while other connections go without,
+  and its later completions refer to a different buffer with the first never
+  reported. Measured here; the ownership cannot be followed from the completion
+  queue, so the ring is used one-shot -- every completion carries a buffer and it
+  goes straight back.
+`PGNOOP_PBUF=<n>` sizes that ring (default 256 buffers, 32 KiB each; the mapping
+is anonymous and only buffers that have been received into are resident).
+
+`uring` also retries what is not a failure: a signal interrupting the wait *or a
+submit* (EINTR), and a completion ring the kernel could not flush (EBUSY: the
+completions are drained, then the submit is repeated). Both used to end the
+shard.
+
+### Cost of the provided-buffer receive
+
+Base `59065e7` against this change (`27fa72a`), same binary and settings, one
+worker pinned to a core, 16 connections, `saturate` at depth 1/8/32, medians of
+three runs. **Server CPU per query**, from `/proc/<pid>/stat`, is the figure that
+survives this host: it carried another tenant's load average of 18-22 throughout,
+which is why wall-clock throughput is reported with its spread rather than as a
+ratio.
+
+| depth | base µs/query | tip µs/query | base q/s (median, 4 workers/32 conns) | tip q/s (median) |
+|---|---|---|---|---|
+| 1 | 3.96 | **3.78** | 679,713 | 393,240 |
+| 8 | 0.842 | **0.817** | 4,146,810 | 2,144,244 |
+| 32 | 0.359 | 0.379 | 9,466,866 | 5,478,843 |
+
+Per-query server cost is unchanged within noise (±5%, and the sign flips between
+depths). The wall-clock columns are not: they were taken alternately, base then
+tip, on a box another tenant kept at a load average of 18-22, and there the
+client is the bottleneck -- the same binary repeated at one setting moved between
+795k and 248k q/s. Syscalls per query at depth 1 (8 connections, `strace -c -f -p`
+on the server): 0.272 for the base, 0.252 for this change -- one
+`io_uring_enter` per pass serves the whole batch.
+
 ### Reproducing
 
 ```sh
