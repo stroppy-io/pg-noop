@@ -1,8 +1,6 @@
 //! Scripted-packet tests: one per command, plus the framing decisions.
-//!
-//! Every test writes the bytes a client would write and reads the packets back
-//! out, so what is pinned is the protocol a client parses rather than an
-//! internal shape.
+//! Every test writes the bytes a client would write and reads the packets back out, so
+//! what is pinned is the protocol a client parses rather than an internal shape.
 
 use super::handshake::{
     CACHING_SHA2, CLIENT_CONNECT_WITH_DB, CLIENT_DEPRECATE_EOF, CLIENT_MULTI_STATEMENTS,
@@ -11,8 +9,8 @@ use super::handshake::{
 };
 use super::*;
 
-/// The capabilities a test connection negotiates unless it says otherwise: what
-/// a current client asks for, EOF deprecated included.
+/// The capabilities a test connection negotiates unless it says otherwise: what a
+/// current client asks for, EOF deprecated included.
 const CAPS: u32 = CLIENT_PROTOCOL_41
     | CLIENT_SECURE_CONNECTION
     | CLIENT_CONNECT_WITH_DB
@@ -41,8 +39,8 @@ fn query(sql: &str) -> Vec<u8> {
     command(cmd::QUERY, sql.as_bytes())
 }
 
-/// `HandshakeResponse41`, with the auth response in whichever encoding the
-/// capabilities name.
+/// `HandshakeResponse41`, with the auth response in whichever encoding the capabilities
+/// name.
 fn handshake_response(caps: u32, plugin: &str) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&caps.to_le_bytes());
@@ -82,8 +80,8 @@ fn connected(caps: u32) -> Conn {
     c
 }
 
-/// The packets in `out`: each as a body, with its sequence number asserted to
-/// count up from `first` -- the sequence a pipelining client checks.
+/// The packets in `out`: each as a body, with its sequence number asserted to count up
+/// from `first` -- the sequence a pipelining client checks.
 fn packets_from(out: &[u8], first: u8) -> Vec<Vec<u8>> {
     let mut rest = out;
     let mut packets = Vec::new();
@@ -135,10 +133,8 @@ fn ok_status(packet: &[u8]) -> u16 {
 }
 
 /// The number of rows in a result set's packets, and the terminator's status.
-///
-/// A result set is the column count, one definition per column, then rows, then
-/// the terminator -- which, with `DEPRECATE_EOF`, is an OK packet whose header is
-/// `0xfe`.
+/// A result set is the column count, one definition per column, then rows, then the
+/// terminator -- which, with `DEPRECATE_EOF`, is an OK packet whose header is `0xfe`.
 fn result_set(packets: &[Vec<u8>]) -> (usize, usize, u16) {
     let mut r = Reader::new(&packets[0]);
     let columns = r.lenenc().expect("a column count") as usize;
@@ -161,7 +157,7 @@ fn result_set(packets: &[Vec<u8>]) -> (usize, usize, u16) {
     panic!("the result set has no terminator: {packets:?}");
 }
 
-/// **The handshake is answered, and only then are commands read.**
+/// The handshake is answered, and only then are commands read.
 #[test]
 fn a_handshake_is_answered_with_an_ok_packet() {
     let mut c = Conn::new();
@@ -182,8 +178,8 @@ fn a_handshake_is_answered_with_an_ok_packet() {
     assert_eq!(result_set(&packets).0, 1);
 }
 
-/// **`caching_sha2_password` gets the fast-auth success path**: the "proceed"
-/// byte, then the OK packet.
+/// `caching_sha2_password` gets the fast-auth success path: the "proceed" byte, then
+/// the OK packet.
 #[test]
 fn caching_sha2_is_answered_with_the_fast_auth_success() {
     let caps = CAPS | CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA;
@@ -198,9 +194,9 @@ fn caching_sha2_is_answered_with_the_fast_auth_success() {
     assert!(!c.awaiting_startup());
 }
 
-/// **An SSL request is refused with an error packet, and the connection
-/// closes.** There is no TLS to fall back to, and a client waiting for a
-/// greeting that will not come is worse than one told why.
+/// An SSL request is refused with an error packet, and the connection closes.
+/// There is no TLS to fall back to, and a client waiting for a greeting that will not
+/// come is worse than one told why.
 #[test]
 fn an_ssl_request_is_refused_with_an_error() {
     let mut c = Conn::new();
@@ -221,8 +217,8 @@ fn an_ssl_request_is_refused_with_an_error() {
     assert!(c.is_closed(), "and nothing else is expected of it");
 }
 
-/// **A SELECT answers a well-formed result set with no rows**: the column count,
-/// a definition per column, and the terminator, with the status a client reads.
+/// A SELECT answers a well-formed result set with no rows: the column count, a
+/// definition per column, and the terminator, with the status a client reads.
 #[test]
 fn a_select_answers_a_zero_row_result_set() {
     let mut c = connected(CAPS);
@@ -240,8 +236,8 @@ fn a_select_answers_a_zero_row_result_set() {
     }
 }
 
-/// **A SELECT's column names come from its select list, outside strings and
-/// nested calls** -- a comma inside a function call is not a column boundary.
+/// A SELECT's column names come from its select list, outside strings and nested calls
+/// -- a comma inside a function call is not a column boundary.
 #[test]
 fn a_select_list_is_split_at_its_own_commas() {
     let mut c = connected(CAPS);
@@ -271,7 +267,7 @@ fn a_select_list_is_split_at_its_own_commas() {
     );
 }
 
-/// **Everything that is not a SELECT answers an OK packet with zero rows.**
+/// Everything that is not a SELECT answers an OK packet with zero rows.
 #[test]
 fn dml_ddl_and_session_statements_answer_ok() {
     for sql in [
@@ -295,9 +291,9 @@ fn dml_ddl_and_session_statements_answer_ok() {
     }
 }
 
-/// **A transaction is tracked, and the status flags say so.** A pool that reads
-/// `IN_TRANS` clear while a transaction is open hands the connection to another
-/// query with the transaction still running underneath it.
+/// A transaction is tracked, and the status flags say so.
+/// A pool that reads `IN_TRANS` clear while a transaction is open hands the connection
+/// to another query with the transaction still running underneath it.
 #[test]
 fn a_transaction_shows_in_the_status_flags() {
     for begin in [
@@ -343,10 +339,8 @@ fn a_rollback_to_a_savepoint_keeps_the_transaction_open() {
     assert_eq!(ok_status(&packets[0]), AUTOCOMMIT | IN_TRANS);
 }
 
-/// **Multiple statements are answered one result at a time, in order, and only
-/// the last one clears `MORE_RESULTS_EXISTS`.** A client loops on that flag; set
-/// on the last answer it waits for a result that never comes, and missing on the
-/// first it stops reading too early.
+/// Multiple statements are answered one result at a time, in order, and only the last
+/// one clears `MORE_RESULTS_EXISTS`.
 #[test]
 fn multi_statement_query_answers_each_statement_with_more_results_except_the_last() {
     let mut c = connected(CAPS);
@@ -354,8 +348,8 @@ fn multi_statement_query_answers_each_statement_with_more_results_except_the_las
 
     // The first answer is an OK with MORE_RESULTS_EXISTS.
     assert_eq!(ok_status(&packets[0]), AUTOCOMMIT | MORE_RESULTS_EXISTS);
-    // The second is a result set, also with more to come: its column count is
-    // one, its definition follows, then the terminator.
+    // The second is a result set, also with more to come: its column count is one, its
+    // definition follows, then the terminator.
     let packets = round_trip(&mut c, &query("select 1; select 2; select 3"));
     let (columns, rows, status) = result_set(&packets[..4]);
     assert_eq!((columns, rows), (1, 1), "a constant select answers one row");
@@ -366,8 +360,8 @@ fn multi_statement_query_answers_each_statement_with_more_results_except_the_las
     );
 }
 
-/// **Every statement of a multi-statement query is answered, and exactly the
-/// last one is clear of the flag.**
+/// Every statement of a multi-statement query is answered, and exactly the last one is
+/// clear of the flag.
 #[test]
 fn every_statement_of_a_multi_statement_query_is_answered() {
     let mut c = connected(CAPS);
@@ -375,8 +369,8 @@ fn every_statement_of_a_multi_statement_query_is_answered() {
     c.advance(&query("select 1; set @x = 2; select 3"), &mut out);
 
     let packets = packets(&out);
-    // select -> count + definition + one row + terminator = 4 packets, set -> 1,
-    // select -> 4.
+    // select -> count + definition + one row + terminator = 4 packets, set -> 1, select
+    // -> 4.
     assert_eq!(packets.len(), 9, "{packets:?}");
     assert_eq!(
         result_set(&packets[..4]).2,
@@ -386,8 +380,8 @@ fn every_statement_of_a_multi_statement_query_is_answered() {
     assert_eq!(result_set(&packets[5..]).2, AUTOCOMMIT);
 }
 
-/// Empty statements between semicolons answer nothing at all: an answer the
-/// client is not counting on is a desynchronised stream.
+/// Empty statements between semicolons answer nothing at all: an answer the client is
+/// not counting on is a desynchronised stream.
 #[test]
 fn empty_statements_between_semicolons_answer_nothing() {
     let mut c = connected(CAPS);
@@ -402,8 +396,8 @@ fn empty_statements_between_semicolons_answer_nothing() {
     );
 }
 
-/// Without `CLIENT_MULTI_STATEMENTS` a query is one statement, semicolons and
-/// all: nothing was negotiated to make it two.
+/// Without `CLIENT_MULTI_STATEMENTS` a query is one statement, semicolons and all:
+/// nothing was negotiated to make it two.
 #[test]
 fn a_query_without_multi_statements_is_one_statement() {
     let mut c = connected(CAPS & !CLIENT_MULTI_STATEMENTS);
@@ -413,8 +407,8 @@ fn a_query_without_multi_statements_is_one_statement() {
     assert_eq!(ok_status(&packets[0]), AUTOCOMMIT);
 }
 
-/// `COM_SET_OPTION` turns multi-statement parsing on and off, and its reply is
-/// the EOF packet the protocol specifies.
+/// `COM_SET_OPTION` turns multi-statement parsing on and off, and its reply is the EOF
+/// packet the protocol specifies.
 #[test]
 fn com_set_option_toggles_multi_statements() {
     let mut c = connected(CAPS & !CLIENT_MULTI_STATEMENTS);
@@ -434,8 +428,8 @@ fn com_set_option_toggles_multi_statements() {
     assert_eq!(packets.len(), 1);
 }
 
-/// **A prepared statement's response carries its parameter and column counts**,
-/// and executing it answers the statement's result set.
+/// A prepared statement's response carries its parameter and column counts, and
+/// executing it answers the statement's result set.
 #[test]
 fn a_prepared_statement_is_prepared_and_executed() {
     let mut c = connected(CAPS);
@@ -451,11 +445,7 @@ fn a_prepared_statement_is_prepared_and_executed() {
     assert_eq!(r.u8(), Some(0x00), "reserved");
     assert_eq!(r.u16(), Some(0), "warnings");
 
-    // **The counts are in that header and nowhere else.** A prepare response is
-    // the OK packet, one definition per parameter, then one per column -- with
-    // no column-count packet in front of the columns, which is what a client
-    // would read as the start of the rows. EOF is deprecated here, so there is
-    // none between them either.
+    // The counts are in that header and nowhere else.
     assert_eq!(packets.len(), 1 + 2 + 2, "{packets:?}");
     assert!(
         packets[1..].iter().all(|p| p[0] == 3),
@@ -478,9 +468,8 @@ fn a_prepared_statement_is_prepared_and_executed() {
     assert_eq!(result_set(&packets).0, 2);
 }
 
-/// **The same response when EOF is not deprecated**: a definition per
-/// parameter, an EOF, a definition per column, an EOF -- and still no column
-/// count anywhere.
+/// The same response when EOF is not deprecated: a definition per parameter, an EOF, a
+/// definition per column, an EOF -- and still no column count anywhere.
 #[test]
 fn a_prepare_response_without_deprecated_eof_has_two_eofs() {
     let mut c = connected(CAPS & !CLIENT_DEPRECATE_EOF);
@@ -495,8 +484,8 @@ fn a_prepare_response_without_deprecated_eof_has_two_eofs() {
     );
 }
 
-/// **A statement that answers with an OK packet is prepared with no columns**,
-/// which is what tells a client there is no result set to read.
+/// A statement that answers with an OK packet is prepared with no columns, which is
+/// what tells a client there is no result set to read.
 #[test]
 fn a_prepared_dml_statement_has_no_columns() {
     let mut c = connected(CAPS);
@@ -520,8 +509,8 @@ fn a_prepared_dml_statement_has_no_columns() {
     assert_eq!(ok_status(&packets[0]), AUTOCOMMIT);
 }
 
-/// **`COM_STMT_CLOSE` has no reply, and a closed statement is gone.** Answering
-/// a close desynchronises a client that is not reading anything for it.
+/// `COM_STMT_CLOSE` has no reply, and a closed statement is gone.
+/// Answering a close desynchronises a client that is not reading anything for it.
 #[test]
 fn a_closed_prepared_statement_has_no_reply_and_is_unknown() {
     let mut c = connected(CAPS);
@@ -548,8 +537,8 @@ fn a_closed_prepared_statement_has_no_reply_and_is_unknown() {
     assert_eq!(r.u16(), Some(1243));
 }
 
-/// `COM_STMT_RESET` is answered with an OK for a statement that exists, and an
-/// error for one that does not.
+/// `COM_STMT_RESET` is answered with an OK for a statement that exists, and an error
+/// for one that does not.
 #[test]
 fn com_stmt_reset_answers_ok_or_an_error() {
     let mut c = connected(CAPS);
@@ -565,8 +554,8 @@ fn com_stmt_reset_answers_ok_or_an_error() {
     assert_eq!(packets[0][0], 0xff);
 }
 
-/// **`COM_STMT_SEND_LONG_DATA` has no reply**: the data is a fragment of a
-/// parameter this server never reads.
+/// `COM_STMT_SEND_LONG_DATA` has no reply: the data is a fragment of a parameter this
+/// server never reads.
 #[test]
 fn long_data_is_read_without_an_answer() {
     let mut c = connected(CAPS);
@@ -613,8 +602,8 @@ fn com_quit_closes_without_a_reply() {
     assert!(c.is_closed());
 }
 
-/// **`COM_RESET_CONNECTION` starts the session over**: no transaction, no
-/// prepared statements, an OK packet in reply.
+/// `COM_RESET_CONNECTION` starts the session over: no transaction, no prepared
+/// statements, an OK packet in reply.
 #[test]
 fn com_reset_connection_clears_the_session() {
     let mut c = connected(CAPS);
@@ -649,8 +638,8 @@ fn com_statistics_answers_a_string() {
     assert!(text.starts_with("Uptime: "), "{text}");
 }
 
-/// `COM_FIELD_LIST`, `COM_PROCESS_INFO`, `COM_DEBUG` and the rest of the
-/// administrative set are answered in their own shapes rather than by silence.
+/// `COM_FIELD_LIST`, `COM_PROCESS_INFO`, `COM_DEBUG` and the rest of the administrative
+/// set are answered in their own shapes rather than by silence.
 #[test]
 fn the_administrative_commands_are_answered() {
     let mut c = connected(CAPS);
@@ -667,8 +656,8 @@ fn the_administrative_commands_are_answered() {
     assert_eq!(ok_status(&packets[0]), AUTOCOMMIT);
 }
 
-/// **A command this server does not know is answered with an error, not with
-/// silence**: a client waiting for an answer it will not get hangs.
+/// A command this server does not know is answered with an error, not with silence: a
+/// client waiting for an answer it will not get hangs.
 #[test]
 fn an_unknown_command_is_refused() {
     let mut c = connected(CAPS);
@@ -679,10 +668,7 @@ fn an_unknown_command_is_refused() {
     assert!(!c.is_closed(), "and the connection survives it");
 }
 
-/// **Pipelined commands are answered in order, each reply numbered from one.**
-/// Every command packet starts at sequence zero, so every answer restarts at
-/// one; a client reads them one after another and would mis-frame a reply that
-/// continued another's count.
+/// Pipelined commands are answered in order, each reply numbered from one.
 #[test]
 fn pipelined_commands_are_answered_in_order() {
     let mut c = connected(CAPS);
@@ -695,9 +681,9 @@ fn pipelined_commands_are_answered_in_order() {
     let mut out = Vec::new();
     assert_eq!(c.advance(&input, &mut out), input.len());
 
-    // Three answers: a 4-packet result set (count, definition, row,
-    // terminator), a 1-packet OK, a 6-packet result set (three columns). Every
-    // answer restarts its sequence at one.
+    // Three answers: a 4-packet result set (count, definition, row, terminator), a
+    // 1-packet OK, a 6-packet result set (three columns).
+    // Every answer restarts its sequence at one.
     let mut rest = &out[..];
     let mut sizes = vec![0usize];
     let mut expected = 1u8;
@@ -715,13 +701,13 @@ fn pipelined_commands_are_answered_in_order() {
     assert_eq!(sizes, vec![0, 4, 1, 6], "4 + 1 + 6 packets");
 }
 
-/// **A command split across the protocol's 16 MiB packets is one command.**
+/// A command split across the protocol's 16 MiB packets is one command.
 #[test]
 fn a_command_split_across_packets_is_one_command() {
     let mut c = connected(CAPS);
 
-    // A query padded to exactly the largest payload, so it has to continue in a
-    // second packet: `select 1` inside a comment that runs to the end.
+    // A query padded to exactly the largest payload, so it has to continue in a second
+    // packet: `select 1` inside a comment that runs to the end.
     let mut payload = Vec::with_capacity(packet::MAX_PAYLOAD);
     payload.push(cmd::QUERY);
     payload.extend_from_slice(b"select 1 -- ");
@@ -731,8 +717,8 @@ fn a_command_split_across_packets_is_one_command() {
     let mut input = Vec::new();
     let mut seq = 0u8;
     packet::write(&mut input, &mut seq, &payload);
-    // The rest of the same command, in a packet of its own: the newline that
-    // ends the comment.
+    // The rest of the same command, in a packet of its own: the newline that ends the
+    // comment.
     packet::write(&mut input, &mut seq, b"\n");
 
     let mut out = Vec::new();
@@ -740,14 +726,14 @@ fn a_command_split_across_packets_is_one_command() {
     // The answer follows the command's LAST packet, which is the second one.
     let packets = packets_from(&out, 2);
     let (columns, rows, status) = result_set(&packets);
-    // `select 1` inside a comment is still the literal: one row, and the one
-    // piece it was split across did not become two statements.
+    // `select 1` inside a comment is still the literal: one row, and the one piece it
+    // was split across did not become two statements.
     assert_eq!((columns, rows, status), (1, 1, AUTOCOMMIT));
     assert_eq!(row_value(&packets[2]), "1");
 }
 
-/// A packet that is still incomplete is not consumed: the caller keeps it and
-/// calls again, which is what the read loops rely on.
+/// A packet that is still incomplete is not consumed: the caller keeps it and calls
+/// again, which is what the read loops rely on.
 #[test]
 fn an_incomplete_packet_is_left_for_the_next_read() {
     let mut c = connected(CAPS);
@@ -770,12 +756,12 @@ fn an_incomplete_packet_is_left_for_the_next_read() {
     assert!(!out.is_empty());
 }
 
-/// **A malformed handshake response is refused rather than guessed at.**
+/// A malformed handshake response is refused rather than guessed at.
 #[test]
 fn a_truncated_handshake_response_closes_the_connection() {
     let mut c = Conn::new();
-    // A complete packet whose body ends in the middle of the field it declared:
-    // the framing is fine, the handshake is not.
+    // A complete packet whose body ends in the middle of the field it declared: the
+    // framing is fine, the handshake is not.
     let full = handshake_response(CAPS, NATIVE);
     let body = &full[packet::HEADER..full.len() - 4];
     let mut out = Vec::new();
@@ -786,9 +772,9 @@ fn a_truncated_handshake_response_closes_the_connection() {
     assert!(c.is_closed());
 }
 
-/// A statement that is not UTF-8 is answered with an error and the connection
-/// stays usable: SQL is text, and a client that sends bytes has a bug of its
-/// own, not a dead connection.
+/// A statement that is not UTF-8 is answered with an error and the connection stays
+/// usable: SQL is text, and a client that sends bytes has a bug of its own, not a dead
+/// connection.
 #[test]
 fn a_statement_that_is_not_utf8_is_refused_without_closing() {
     let mut c = connected(CAPS);
@@ -800,9 +786,9 @@ fn a_statement_that_is_not_utf8_is_refused_without_closing() {
     assert_eq!(result_set(&packets).0, 1);
 }
 
-/// Every statement shape decides the same answer from the same text whether it
-/// arrives as a query or as a prepared statement: a client that prepares what
-/// another runs directly cannot see two different servers.
+/// Every statement shape decides the same answer from the same text whether it arrives
+/// as a query or as a prepared statement: a client that prepares what another runs
+/// directly cannot see two different servers.
 #[test]
 fn a_statement_is_classified_the_same_way_either_way() {
     for sql in [
@@ -860,8 +846,8 @@ fn row_values(packet: &[u8]) -> Vec<String> {
     values
 }
 
-/// The value of a one-column row packet: its body, without the length prefixes
-/// this server never has more than one of in a row.
+/// The value of a one-column row packet: its body, without the length prefixes this
+/// server never has more than one of in a row.
 fn row_value(packet: &[u8]) -> String {
     let mut r = Reader::new(packet);
     let value = r.lenenc_bytes().expect("a value");
@@ -869,13 +855,8 @@ fn row_value(packet: &[u8]) -> String {
     String::from_utf8(value.to_vec()).expect("utf-8")
 }
 
-/// **The TPC-C shapes are answered as the rules say**, and the counters behind
-/// them move when a transaction runs.
-///
-/// The counters are process-wide and other tests in this binary count
-/// transactions too, so what is pinned here is the shape and that the numbers
-/// only ever grow; the exact arithmetic is pinned in `tests/mysql_wire.rs`,
-/// where each test owns a server process.
+/// The TPC-C shapes are answered as the rules say, and the counters behind them move
+/// when a transaction runs.
 #[test]
 fn the_tpcc_rules_answer_with_numbers() {
     let _profile = tpcc::profile_guard(true);
@@ -911,12 +892,7 @@ fn the_tpcc_rules_answer_with_numbers() {
     assert_eq!(row_value(&packets[3]), "1", "the first variable");
 }
 
-/// **A constant SELECT answers one row, the way PostgreSQL answers one.**
-///
-/// `select 1` answered zero rows, so `mariadb -e 'select 1'` printed nothing --
-/// which reads as a broken server rather than as a no-op one, and is what turned
-/// up in review. A select list of literals has a value the server can state
-/// without knowing anything: itself.
+/// A constant SELECT answers one row, the way PostgreSQL answers one.
 #[test]
 fn a_constant_select_answers_one_row() {
     let mut c = connected(CAPS);
@@ -942,8 +918,8 @@ fn a_constant_select_answers_one_row() {
     assert_eq!(result_set(&packets).1, 0);
 }
 
-/// **The variables a client reads at connect answer plausible values**, rather
-/// than an empty result set a driver cannot parse.
+/// The variables a client reads at connect answer plausible values, rather than an
+/// empty result set a driver cannot parse.
 #[test]
 fn the_connect_variables_answer_plausible_values() {
     let mut c = connected(CAPS);
@@ -965,19 +941,13 @@ fn the_connect_variables_answer_plausible_values() {
         assert_eq!(row_value(&packets[2]), expected, "{sql}");
     }
 
-    // A variable nobody asked us about has a plausible number rather than
-    // nothing: a client that reads it at connect must not get zero rows.
+    // A variable nobody asked us about has a plausible number rather than nothing: a
+    // client that reads it at connect must not get zero rows.
     let packets = round_trip(&mut c, &query("select @@lower_case_table_names"));
     assert_eq!(result_set(&packets).1, 1);
 }
 
-/// **`COM_STMT_EXECUTE` answers BINARY rows.**
-///
-/// The binary protocol's row is not the text one: a `0x00` header, a NULL
-/// bitmap whose offset is two bits, and each value in its type's own binary form
-/// -- a LONGLONG is eight bytes little-endian, not "1". A client that asked for
-/// a prepared statement reads those bytes as numbers, so a text row makes it
-/// print nonsense or lose the stream.
+/// `COM_STMT_EXECUTE` answers BINARY rows.
 #[test]
 fn a_prepared_statement_answers_binary_rows() {
     let mut c = connected(CAPS);
@@ -1006,8 +976,8 @@ fn a_prepared_statement_answers_binary_rows() {
     );
 }
 
-/// **The district sum is binary too when it is executed as a prepared
-/// statement**, and its column is the LONGLONG a client decodes it as.
+/// The district sum is binary too when it is executed as a prepared statement, and its
+/// column is the LONGLONG a client decodes it as.
 #[test]
 fn a_prepared_district_sum_answers_a_binary_longe_long() {
     // The synthetic answers are the profile's; this is what a profile run reads.
@@ -1047,13 +1017,7 @@ fn a_prepared_district_sum_answers_a_binary_longe_long() {
     );
 }
 
-/// **A routine definition is one statement, whatever semicolons its body holds.**
-///
-/// A client that sends `CREATE PROCEDURE … BEGIN … ; … END` in a
-/// multi-statement query (which is how every driver sends it: no DELIMITER) got
-/// one answer per line of the body -- "Commands out of sync" to the client -- and
-/// the `BEGIN` piece was classified as a transaction, so `in_trans` stayed set
-/// for good and every later autocommit CALL stopped counting a commit.
+/// A routine definition is one statement, whatever semicolons its body holds.
 #[test]
 fn a_routine_body_is_one_statement() {
     let mut c = connected(CAPS);
@@ -1084,10 +1048,8 @@ fn a_routine_body_is_one_statement() {
     );
     assert_eq!(result_set(&packets[1..]).1, 1, "the select's row");
 
-    // And the session is not stuck in a transaction: a CALL answers with no
-    // transaction open, which is what makes it a commit of its own. The counter
-    // it then moves is process-wide and other tests in this binary count too, so
-    // the arithmetic is pinned in tests/wire.rs, where each test owns a server.
+    // And the session is not stuck in a transaction: a CALL answers with no transaction
+    // open, which is what makes it a commit of its own.
     let packets = round_trip(&mut c, &query("call PAYMENT(1, 2, 3)"));
     assert_eq!(
         ok_status(&packets[0]) & IN_TRANS,
@@ -1096,8 +1058,8 @@ fn a_routine_body_is_one_statement() {
     );
 }
 
-/// A statement that is only a routine definition answers one OK packet, and a
-/// trigger and a function are the same shape.
+/// A statement that is only a routine definition answers one OK packet, and a trigger
+/// and a function are the same shape.
 #[test]
 fn every_kind_of_routine_is_one_statement() {
     for sql in [
@@ -1113,8 +1075,8 @@ fn every_kind_of_routine_is_one_statement() {
     }
 }
 
-/// A semicolon that is not in a routine body still splits, and a CASE
-/// expression's `END` does not close a body it never opened.
+/// A semicolon that is not in a routine body still splits, and a CASE expression's
+/// `END` does not close a body it never opened.
 #[test]
 fn a_plain_query_still_splits_and_a_case_expression_closes_nothing() {
     let mut c = connected(CAPS);
@@ -1129,10 +1091,7 @@ fn a_plain_query_still_splits_and_a_case_expression_closes_nothing() {
     assert_eq!(packets.len(), 5, "the definition and one row: {packets:?}");
 }
 
-/// **A trailing `LIMIT` is a clause, not part of the select list.** The mariadb
-/// client asks `select @@version_comment limit 1` at connect, and a list that
-/// swallowed the `LIMIT` was neither a variable nor a literal, so the client got
-/// zero rows for a value it cannot start without.
+/// A trailing `LIMIT` is a clause, not part of the select list.
 #[test]
 fn a_trailing_limit_still_leaves_a_constant() {
     let mut c = connected(CAPS);

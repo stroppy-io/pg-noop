@@ -1,23 +1,6 @@
 //! The MySQL/MariaDB wire protocol, as a sans-io codec.
-//!
-//! `Conn::advance` takes bytes off a socket and appends packets to a buffer;
-//! nothing here touches a socket, so the same codec runs under the io_uring loop
-//! and under the tokio one. `handshake` is the greeting and the one exchange
-//! before commands; `result` writes the packet shapes; `packet` is the framing
-//! and the length encodings.
-//!
-//! # What this server answers
-//!
-//! A no-op cannot know what a query means, so the answer is decided by the
-//! statement's SHAPE and never by its data: a SELECT answers a well-formed
-//! result set with **zero rows** (the same choice the PostgreSQL codec makes --
-//! an empty result is what any driver can accept), and everything else answers
-//! an OK packet with zero affected rows. The exceptions are the TPC-C rules in
-//! `crate::tpcc`, which are explicit and documented there.
-//!
-//! Nothing is interpreted beyond what the reply's shape needs: the first word of
-//! a statement, where its statements end, how many placeholders it has, and, for
-//! a SELECT, its column count and names.
+//! An answer is decided by the statement's shape and never by its data, so a value
+//! that arrives is never interpreted.
 
 mod handshake;
 mod packet;
@@ -33,8 +16,8 @@ use crate::tpcc;
 
 pub use handshake::{greeting, SERVER_VERSION};
 
-// Server status flags, by their names in `include/mysql_com.h`. A client reads
-// them: `IN_TRANS` is how a pool knows a transaction is open, and
+// Server status flags, by their names in `include/mysql_com.h`.
+// A client reads them: `IN_TRANS` is how a pool knows a transaction is open, and
 // `MORE_RESULTS_EXISTS` is how it knows another result follows.
 pub const IN_TRANS: u16 = 0x0001;
 pub const AUTOCOMMIT: u16 = 0x0002;
@@ -67,16 +50,11 @@ mod cmd {
 }
 
 /// The most a command may accumulate across the protocol's 16 MiB packets.
-///
-/// One packet carries nearly 16 MiB, and a command larger than that is split
-/// across several; the pieces are buffered here, so the total is bounded the way
-/// PostgreSQL's `MAX_MESSAGE` is. MySQL's own `max_allowed_packet` defaults to
-/// 64 MiB, and a statement larger than this is one no benchmark sends.
 const MAX_COMMAND: usize = 32 * 1024 * 1024;
 
-/// The longest a column name taken from the SQL text may be. A select-list item
-/// is echoed as its column's name, and a client that reads the name should be
-/// able to use it: a 200-byte expression is not a name.
+/// The longest a column name taken from the SQL text may be.
+/// A select-list item is echoed as its column's name, and a client that reads the name
+/// should be able to use it: a 200-byte expression is not a name.
 const MAX_COLUMN_NAME: usize = 64;
 
 /// What a statement answers.
@@ -95,9 +73,9 @@ enum Shape {
     Failure(tpcc::Failure),
     /// A one-number answer the TPC-C profile states: its column name and value.
     Number(&'static str, u64),
-    /// A SELECT whose list is literals and variables: one row of exactly those
-    /// values, which is a row the server states rather than invents. The rule is
-    /// `crate::sql::constant_select`, the same one PostgreSQL uses.
+    /// A SELECT whose list is literals and variables: one row of exactly those values,
+    /// which is a row the server states rather than invents.
+    /// The rule is `crate::sql::constant_select`, the same one PostgreSQL uses.
     Constant(Vec<sql::Constant>),
 }
 
@@ -109,8 +87,8 @@ fn constant_kind(kind: sql::ConstantKind) -> Kind {
     }
 }
 
-/// What a statement does to the session, decided from its text and applied when
-/// it runs.
+/// What a statement does to the session, decided from its text and applied when it
+/// runs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tx {
     None,
@@ -119,14 +97,14 @@ enum Tx {
     Rollback,
 }
 
-/// Everything a statement's answer needs, decided once -- at prepare for a
-/// prepared statement, and at the command for everything else.
+/// Everything a statement's answer needs, decided once -- at prepare for a prepared
+/// statement, and at the command for everything else.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Answer {
     shape: Shape,
     tx: Tx,
-    /// The TPC-C transaction this statement is, when it is one: counted at
-    /// EXECUTION, so a prepared statement counts once per execution.
+    /// The TPC-C transaction this statement is, when it is one: counted at EXECUTION,
+    /// so a prepared statement counts once per execution.
     kind: Option<tpcc::Kind>,
 }
 
@@ -152,9 +130,9 @@ impl Answer {
     }
 }
 
-/// A prepared statement. Nothing about it depends on a parameter's value: this
-/// server never looks at one, which is why preparing one is the same work as
-/// running one.
+/// A prepared statement.
+/// Nothing about it depends on a parameter's value: this server never looks at one,
+/// which is why preparing one is the same work as running one.
 struct Prepared {
     answer: Answer,
 }
@@ -170,23 +148,24 @@ enum Phase {
 /// One connection's MySQL state.
 pub struct Conn {
     phase: Phase,
-    /// The capabilities the client negotiated. Zero until it has answered.
+    /// The capabilities the client negotiated.
+    /// Zero until it has answered.
     caps: u32,
-    /// The sequence number of the next packet this connection writes. Every
-    /// command restarts the count from its own sequence, which is what lets a
+    /// The sequence number of the next packet this connection writes.
+    /// Every command restarts the count from its own sequence, which is what lets a
     /// client pipeline commands.
     seq: u8,
     /// A command split across packets of 16 MiB, while its pieces arrive.
     partial: Vec<u8>,
     stmts: HashMap<u32, Prepared>,
-    /// The next statement id to hand out. Ids are not reused: a client that
-    /// closed one and executes it again gets "unknown statement" rather than
-    /// another statement's answer.
+    /// The next statement id to hand out.
+    /// Ids are not reused: a client that closed one and executes it again gets "unknown
+    /// statement" rather than another statement's answer.
     next_stmt: u32,
     /// `SERVER_STATUS_IN_TRANS`: a transaction is open.
     in_trans: bool,
-    /// What this connection has done in the open transaction, counted when it
-    /// commits and dropped if it rolls back.
+    /// What this connection has done in the open transaction, counted when it commits
+    /// and dropped if it rolls back.
     pending: tpcc::Pending,
 }
 
@@ -242,9 +221,8 @@ impl Conn {
     }
 
     /// Consume every COMPLETE packet in `input`, appending replies to `out`.
-    ///
-    /// Returns how many bytes were consumed; a partial packet at the end is left
-    /// alone for the caller to keep, exactly as the PostgreSQL codec does.
+    /// Returns how many bytes were consumed; a partial packet at the end is left alone
+    /// for the caller to keep, exactly as the PostgreSQL codec does.
     pub fn advance(&mut self, input: &[u8], out: &mut Vec<u8>) -> usize {
         let mut pos = 0usize;
 
@@ -265,9 +243,9 @@ impl Conn {
             let payload = &rest[packet::HEADER..total];
             pos += total;
 
-            // A payload of exactly the maximum length means the command
-            // continues in the next packet: the protocol's way of carrying
-            // something larger than its own length field.
+            // A payload of exactly the maximum length means the command continues in
+            // the next packet: the protocol's way of carrying something larger than its
+            // own length field.
             if len == packet::MAX_PAYLOAD {
                 if self.partial.len() + len > MAX_COMMAND {
                     self.phase = Phase::Closed;
@@ -291,17 +269,17 @@ impl Conn {
 
     /// One framed packet: the handshake response, or one command.
     fn frame(&mut self, request_seq: u8, payload: &[u8], out: &mut Vec<u8>) {
-        // The reply's first packet follows the request's own sequence number,
-        // which is what a pipelining client counts on: every command starts at
-        // zero again, and its answer starts at one.
+        // The reply's first packet follows the request's own sequence number, which is
+        // what a pipelining client counts on: every command starts at zero again, and
+        // its answer starts at one.
         self.seq = request_seq.wrapping_add(1);
 
         match self.phase {
             Phase::Handshake => self.hello(payload, out),
             Phase::Commands => {
                 let Some((&command, body)) = payload.split_first() else {
-                    // An empty command packet is a protocol error, not an idle
-                    // one: a client that sends it has lost the framing.
+                    // An empty command packet is a protocol error, not an idle one: a
+                    // client that sends it has lost the framing.
                     self.error(out, 1047, "42000", "empty command packet");
 
                     return;
@@ -316,10 +294,7 @@ impl Conn {
     fn hello(&mut self, payload: &[u8], out: &mut Vec<u8>) {
         match handshake::parse_response(payload) {
             Some(handshake::Response::Ssl) => {
-                // **No TLS, and the client is told so.** It asked for a TLS
-                // handshake this server cannot complete; an error packet is what
-                // a client can report, and closing afterwards stops it waiting
-                // for a greeting that will not come.
+                // No TLS, and the client is told so.
                 result::err(
                     out,
                     &mut self.seq,
@@ -332,12 +307,7 @@ impl Conn {
             Some(handshake::Response::Login { caps, plugin }) => {
                 self.caps = caps;
                 if plugin.as_deref() == Some(handshake::CACHING_SHA2) {
-                    // **The fast-auth success path.** `caching_sha2_password`
-                    // normally has the server check a hash; this server accepts
-                    // any credentials, so the answer is the "proceed" that ends
-                    // the exchange -- a full authentication would need an RSA
-                    // exchange, which has nothing to protect here and does not
-                    // work without TLS.
+                    // The fast-auth success path.
                     packet::write(out, &mut self.seq, &[0x01, 0x03]);
                 }
                 let status = self.status(false);
@@ -377,8 +347,7 @@ impl Conn {
             | cmd::SHUTDOWN => result::ok(out, &mut self.seq, 0, 0, status),
 
             // A connection that changes user or is reset starts over: no open
-            // transaction, no prepared statements. Both are answered with a
-            // plain OK, which a client accepts as "authenticated, and clean".
+            // transaction, no prepared statements.
             cmd::CHANGE_USER | cmd::RESET_CONNECTION => {
                 self.in_trans = false;
                 self.pending.discard();
@@ -389,12 +358,12 @@ impl Conn {
 
             cmd::QUERY => self.query(body, out),
 
-            // The old table-description command: this server has no fields to
-            // describe, and an EOF is how the protocol says so.
+            // The old table-description command: this server has no fields to describe,
+            // and an EOF is how the protocol says so.
             cmd::FIELD_LIST => result::eof(out, &mut self.seq, status),
 
-            // One human-readable packet, not an OK: a client that asks for
-            // statistics prints the string.
+            // One human-readable packet, not an OK: a client that asks for statistics
+            // prints the string.
             cmd::STATISTICS => packet::write(
                 out,
                 &mut self.seq,
@@ -418,10 +387,8 @@ impl Conn {
             }
 
             cmd::SET_OPTION => {
-                // `[option:u16]`: 0 is MULTI_STATEMENTS on, 1 off, and there is
-                // no other option. The reply is an EOF packet, which is what the
-                // protocol specifies for this command even where EOF is
-                // deprecated for result sets.
+                // `[option:u16]`: 0 is MULTI_STATEMENTS on, 1 off, and there is no
+                // other option.
                 if let Some(option) = Reader::new(body).u16() {
                     match option {
                         0 => self.caps |= handshake::CLIENT_MULTI_STATEMENTS,
@@ -436,14 +403,14 @@ impl Conn {
             cmd::STMT_EXECUTE => self.execute(body, out),
             cmd::STMT_CLOSE => {
                 if let Some(id) = Reader::new(body).u32() {
-                    // No reply at all: the client has already moved on, and a
-                    // packet it is not waiting for desynchronises the stream.
+                    // No reply at all: the client has already moved on, and a packet it
+                    // is not waiting for desynchronises the stream.
                     self.stmts.remove(&id);
                 }
             }
             cmd::STMT_SEND_LONG_DATA => {
-                // A parameter being streamed in. This server never looks at a
-                // parameter, and the command has no reply.
+                // A parameter being streamed in.
+                // This server never looks at a parameter, and the command has no reply.
             }
             cmd::STMT_RESET => match Reader::new(body).u32() {
                 Some(id) if self.stmts.contains_key(&id) => {
@@ -452,8 +419,8 @@ impl Conn {
                 _ => self.error(out, 1243, "HY000", "unknown prepared statement handler"),
             },
 
-            // Cursors: this server answers every row at execute time and has
-            // none left to fetch.
+            // Cursors: this server answers every row at execute time and has none left
+            // to fetch.
             cmd::STMT_FETCH => self.error(out, 1047, "42000", "cursors are not supported"),
 
             other => {
@@ -472,9 +439,8 @@ impl Conn {
         };
 
         // An empty segment -- `a;;b`, or a trailing `;` -- is not a statement:
-        // answering one would be a result the client is not counting on, and
-        // leaving `MORE_RESULTS_EXISTS` on it would make the client wait for a
-        // result that never comes.
+        // answering one would be a result the client is not counting on, and leaving
+        // `MORE_RESULTS_EXISTS` on it would make the client wait for a result that
         let statements: Vec<&str> = if self.multi_statements() {
             sql::split_statements(sql)
         } else {
@@ -486,8 +452,8 @@ impl Conn {
             .collect();
 
         if statements.is_empty() {
-            // A query of nothing but whitespace, or a lone `;`: MySQL answers an
-            // OK packet, and so does this.
+            // A query of nothing but whitespace, or a lone `;`: MySQL answers an OK
+            // packet, and so does this.
             let status = self.status(false);
             result::ok(out, &mut self.seq, 0, 0, status);
 
@@ -502,17 +468,17 @@ impl Conn {
         }
     }
 
-    /// Note what a statement does to the session, and to the counters, before it
-    /// is answered so that the packet cannot disagree with the state.
+    /// Note what a statement does to the session, and to the counters, before it is
+    /// answered so that the packet cannot disagree with the state.
     fn apply(&mut self, answer: &Answer) {
         match answer.tx {
             Tx::None => {}
             Tx::Begin => self.in_trans = true,
             Tx::Commit => {
                 self.in_trans = false;
-                // **Counted here, not when the statement ran**: a NewOrder that
-                // is rolled back raises no district's next order id, and counting
-                // it when it ran inflated NOPM by every failed transaction.
+                // Counted here, not when the statement ran: a NewOrder that is rolled
+                // back raises no district's next order id, and counting it when it ran
+                // inflated NOPM by every failed transaction.
                 self.pending.commit();
             }
             Tx::Rollback => {
@@ -524,9 +490,7 @@ impl Conn {
 
         if let Some(kind) = answer.kind {
             self.pending.note(kind);
-            // **Autocommit is a transaction per statement.** A client that never
-            // says BEGIN -- HammerDB's stored-procedure path does not -- still
-            // commits, and the TPM it reads is `Com_commit` plus `Com_rollback`.
+            // Autocommit is a transaction per statement.
             if !self.in_trans {
                 self.pending.commit();
             }
@@ -534,11 +498,6 @@ impl Conn {
     }
 
     /// Write one statement's answer.
-    ///
-    /// `more` is set when another answer follows in the same request, and
-    /// `binary` when the statement was EXECUTED rather than queried: a prepared
-    /// statement's rows are in the binary protocol, and its client decodes them
-    /// by the types the prepare response gave.
     fn answer(&mut self, answer: &Answer, out: &mut Vec<u8>, more: bool, binary: bool) {
         let status = self.status(more);
         let deprecate = self.deprecate_eof();
@@ -546,10 +505,9 @@ impl Conn {
         match &answer.shape {
             Shape::Ok => result::ok(out, &mut self.seq, 0, 0, status),
             Shape::Failure(failure) => {
-                // MySQL's numbers and states for the same three failures its
-                // clients inject: a signal carries its own state, a NULL into a
-                // NOT NULL column is 1048, and a CALL of something unknown is
-                // 1305.
+                // MySQL's numbers and states for the same three failures its clients
+                // inject: a signal carries its own state, a NULL into a NOT NULL column
+                // is 1048, and a CALL of something unknown is 1305.
                 let (code, state, message) = match failure {
                     tpcc::Failure::Signal(code) => (1644, code.as_str(), "injected failure"),
                     tpcc::Failure::Null => (1048, "23000", "column cannot be null"),
@@ -644,8 +602,8 @@ impl Conn {
         }
     }
 
-    /// `COM_STMT_PREPARE`: the statement id, its parameter and column counts,
-    /// and the definitions themselves.
+    /// `COM_STMT_PREPARE`: the statement id, its parameter and column counts, and the
+    /// definitions themselves.
     fn prepare(&mut self, body: &[u8], out: &mut Vec<u8>) {
         let Ok(sql) = std::str::from_utf8(body) else {
             self.error(out, 1064, "42000", "statement is not valid UTF-8");
@@ -675,10 +633,7 @@ impl Conn {
         out.extend_from_slice(&0u16.to_le_bytes()); // warnings
         packet::end(out, at);
 
-        // **Definitions, not a result set.** The counts are in the header above;
-        // what follows is one definition per parameter and one per column, with
-        // an EOF after each list unless the client deprecated EOF. A column
-        // count here would be a packet no driver is waiting for.
+        // Definitions, not a result set.
         let parameters: Vec<Column<'_>> = (0..params)
             .map(|_| Column {
                 // A parameter has no name and no type until it is bound.
@@ -693,11 +648,8 @@ impl Conn {
     }
 
     /// `COM_STMT_EXECUTE`: the statement's answer, with its parameters ignored.
-    ///
-    /// The body is `[id:u32][flags:u8][iteration:u32]` and then the bound
-    /// parameters in whichever types the client chose. This server never reads a
-    /// parameter, so the packet is framed and dispatched without being decoded
-    /// at all.
+    /// The body is `[id:u32][flags:u8][iteration:u32]` and then the bound parameters in
+    /// whichever types the client chose.
     fn execute(&mut self, body: &[u8], out: &mut Vec<u8>) {
         let Some(id) = Reader::new(body).u32() else {
             self.error(out, 1064, "42000", "malformed execute packet");
@@ -728,8 +680,8 @@ fn classify(sql: &str) -> Answer {
     } else if head.eq_ignore_ascii_case("COMMIT") {
         Tx::Commit
     } else if head.eq_ignore_ascii_case("ROLLBACK") {
-        // `ROLLBACK TO SAVEPOINT x` keeps the transaction open; only a plain
-        // rollback ends one.
+        // `ROLLBACK TO SAVEPOINT x` keeps the transaction open; only a plain rollback
+        // ends one.
         if mentions(trimmed, "SAVEPOINT") {
             Tx::None
         } else {
@@ -739,20 +691,13 @@ fn classify(sql: &str) -> Answer {
         Tx::None
     };
 
-    // **The TPC-C rules come first.** They are the only statements this server
-    // answers with a number, and each is checked before the shape the statement
-    // would otherwise get -- a district sum is a SELECT, a status query is a
-    // SHOW, and an OUT-parameter read is a select of variables.
+    // The TPC-C rules come first.
     let mut kind = None;
     let shape = if let Some(failure) = tpcc::failure(trimmed) {
-        // **The rollback path a client injects**: an error, so its own error
-        // handling runs and its rollback is counted -- an OK here turns the
-        // rollback into a commit.
+        // The rollback path a client injects: an error, so its own error handling runs
+        // and its rollback is counted -- an OK here turns the rollback into a commit.
         Shape::Failure(failure)
-    // **The synthetic answers are the profile's.** The district sum, the
-    // population counts and `show global status`'s values read like a
-    // database's; a server that states them without being asked is
-    // manufacturing a measurement.
+    // The synthetic answers are the profile's.
     } else if !tpcc::profile() && tpcc::number_query(trimmed).is_some() {
         Shape::Empty(select_columns(trimmed))
     } else if let Some((name, value)) = tpcc::number_query(trimmed) {
@@ -766,17 +711,14 @@ fn classify(sql: &str) -> Answer {
     } else if head.eq_ignore_ascii_case("SELECT") {
         Shape::Empty(select_columns(trimmed))
     } else if head.eq_ignore_ascii_case("SHOW") {
-        // Every SHOW this server answers has the two-column shape of
-        // `SHOW STATUS`, by far the one a benchmark client asks for.
+        // Every SHOW this server answers has the two-column shape of `SHOW STATUS`, by
+        // far the one a benchmark client asks for.
         Shape::Empty(vec!["Variable_name".to_string(), "Value".to_string()])
     } else if ["DESCRIBE", "DESC", "EXPLAIN", "WITH", "TABLE", "VALUES"]
         .iter()
         .any(|kw| head.eq_ignore_ascii_case(kw))
     {
-        // Statements that may return rows but have no `SELECT` to read the shape
-        // from. `CALL` is deliberately NOT here: a stored procedure call answers
-        // an OK packet, which is what a client that then reads its OUT
-        // parameters from `SELECT @...` expects -- and it is counted here.
+        // Statements that may return rows but have no `SELECT` to read the shape from.
         Shape::Empty(vec!["result".to_string()])
     } else {
         kind = tpcc::statement_kind(trimmed);
@@ -786,8 +728,8 @@ fn classify(sql: &str) -> Answer {
     Answer { shape, tx, kind }
 }
 
-/// One text column per name: everything this server sends as a result set is
-/// either a string or the district sum.
+/// One text column per name: everything this server sends as a result set is either a
+/// string or the district sum.
 fn text_columns<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<Column<'a>> {
     names
         .into_iter()
@@ -819,10 +761,6 @@ fn mentions(sql: &str, word: &str) -> bool {
 }
 
 /// The columns of a `SELECT`, named after the select-list items.
-///
-/// A name is the item's own text, trimmed and cut short: a client that reads a
-/// column name gets something it recognises from the statement it wrote, and
-/// nothing here tries to evaluate the expression.
 fn select_columns(sql: &str) -> Vec<String> {
     let Some(list) = sql::select_list(sql) else {
         return vec!["result".to_string()];
