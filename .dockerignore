@@ -1,0 +1,8 @@
+# What the build context does not need. `target/` is a host build's output and
+# is rebuilt inside the image; `dist/` is what the release script writes.
+/target
+/dist
+/.git
+/.github
+/.letibot
+/.letibot-remote
