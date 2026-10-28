@@ -67,6 +67,35 @@ const RECV_BUF: usize = 32 * 1024;
 #[cfg_attr(test, allow(dead_code))] // test shards use a smaller ring
 const PBUF_COUNT: u16 = 256;
 
+/// The most buffers a ring can describe. The ring's index is a `u16` mask, and
+/// `next_power_of_two` overflows to zero above half that range -- a
+/// `PGNOOP_PBUF` the operator picked too large used to panic a shard.
+const PBUF_MAX: u16 = 1 << 15;
+
+/// `PGNOOP_PBUF`, or the default. A value too large for the ring's index is
+/// clamped and said so: silently serving a different ring size is a measurement
+/// nobody can reproduce.
+fn pbuf_count_from_env() -> u16 {
+    let Some(value) = std::env::var("PGNOOP_PBUF").ok() else {
+        return PBUF_COUNT;
+    };
+    let Some(asked) = value.trim().parse::<u32>().ok() else {
+        eprintln!("pgnoop: PGNOOP_PBUF={value:?} is not a number of buffers; using {PBUF_COUNT}");
+        return PBUF_COUNT;
+    };
+    if asked > PBUF_MAX as u32 {
+        eprintln!(
+            "pgnoop: PGNOOP_PBUF={asked} is more than the {PBUF_MAX} buffers a ring \
+             can address; using {PBUF_MAX}"
+        );
+        return PBUF_MAX;
+    }
+
+    // Zero buffers is no ring at all, which is what the shard's own buffer is
+    // for.
+    (asked as u16).max(1)
+}
+
 /// The buffer group every receive on the shard draws from. One group is enough:
 /// the ring is shared by the connections, not owned by them.
 const PBUF_GROUP: u16 = 0;
@@ -808,10 +837,7 @@ impl Default for Tuning {
             // A dozen test shards in one process; the production ring is 256
             // buffers, 8 MiB of mapping each.
             #[cfg(not(test))]
-            pbuf_count: std::env::var("PGNOOP_PBUF")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(PBUF_COUNT),
+            pbuf_count: pbuf_count_from_env(),
             #[cfg(test)]
             pbuf_count: 16,
             #[cfg(test)]
@@ -968,12 +994,12 @@ fn passes(
     }
 
     *bufs = match plan.pbuf {
-        Some(_granted_incremental) => Some(BufRing::register(
+        Some(_granted_incremental) => register_buffers(
             &submit,
             tuning.pbuf_count,
             #[cfg(test)]
             tuning.stats.clone(),
-        )?),
+        ),
         None => None,
     };
 
@@ -1208,11 +1234,7 @@ fn passes(
                                 // completion is what resumes the read side, or by a
                                 // slot on its way out.
                                 r if r == -libc::ECANCELED => {
-                                    if slot.parked || slot.closing {
-                                        Next::Idle
-                                    } else {
-                                        Next::Arm
-                                    }
+                                    after_cancel(slot.parked, slot.closing)
                                 }
                                 // A kernel that does not know multishot receive (or
                                 // a provided buffer selected by the kernel) says so
@@ -1582,9 +1604,26 @@ fn set_nodelay(fd: RawFd) {
     }
 }
 
+/// What a receive that was cancelled does to its connection.
+///
+/// A park of ours: nothing, because the cancel's own completion is what resumes
+/// the read side. A slot on its way out: `Close`, because the receive it was
+/// waiting for is now over and a closing slot with nothing in flight is reaped
+/// -- `Idle` here left the descriptor open until the process exited. Anything
+/// else means the kernel dropped a receive this shard still wanted.
+fn after_cancel(parked: bool, closing: bool) -> Next {
+    if parked {
+        Next::Idle
+    } else if closing {
+        Next::Close
+    } else {
+        Next::Arm
+    }
+}
+
 /// What a connection needs next, decided while its slot is borrowed and acted
 /// on after the borrow ends -- arming a receive needs the slot table again.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Next {
     Send,
     Close,
@@ -1921,8 +1960,9 @@ impl BufRing {
     }
 
     fn alloc(count: u16) -> io::Result<BufRing> {
-        // The ring's index is a mask, so the count is a power of two.
-        let count = count.max(1).next_power_of_two();
+        // The ring's index is a mask, so the count is a power of two -- and a
+        // count above half the index's range has no power of two to round to.
+        let count = count.clamp(1, PBUF_MAX).next_power_of_two();
         let desc_len =
             (count as usize * std::mem::size_of::<types::BufRingEntry>()).next_multiple_of(4096);
         let data_len = (count as usize * RECV_BUF).next_multiple_of(4096);
@@ -2014,6 +2054,37 @@ impl BufRing {
                 self.in_use.iter().filter(|b| **b).count() as u16,
                 Ordering::Relaxed,
             );
+        }
+    }
+}
+
+/// Register the shard's provided-buffer ring, or serve without one.
+///
+/// Registration can fail for a reason that is nobody's bug: `RLIMIT_MEMLOCK`
+/// with many shards in one process (`ENOMEM`), or a seccomp profile that allows
+/// the ring but not the registration. Ending the shard over it is the one
+/// outcome that serves nothing -- each connection then keeps its own receive
+/// buffer, which is what a kernel without provided buffers does anyway -- and
+/// the shard says so rather than silently running a different loop.
+fn register_buffers(
+    submit: &io_uring::Submitter<'_>,
+    count: u16,
+    #[cfg(test)] stats: Option<std::sync::Arc<Stats>>,
+) -> Option<BufRing> {
+    match BufRing::register(
+        submit,
+        count,
+        #[cfg(test)]
+        stats,
+    ) {
+        Ok(b) => Some(b),
+        Err(e) => {
+            eprintln!(
+                "pgnoop: provided buffers could not be registered ({}); \
+                 each connection keeps its own receive buffer",
+                errno_name(e.raw_os_error().unwrap_or(0))
+            );
+            None
         }
     }
 }
@@ -2701,6 +2772,83 @@ mod tests {
         std::fs::read_dir("/proc/self/fd")
             .map(|d| d.count())
             .unwrap_or(0)
+    }
+
+    /// **A buffer ring the kernel refuses is not a dead shard.**
+    ///
+    /// Registration can fail for reasons that are nobody's bug -- memlock with
+    /// many shards, or a seccomp profile that allows the ring but not the
+    /// registration -- and `?` on it ended the shard, which then served nothing
+    /// at all. Without a ring each connection reads into a buffer of its own,
+    /// which is what a kernel without provided buffers does anyway.
+    #[test]
+    fn a_refused_buffer_ring_falls_back_to_per_connection_buffers() {
+        let ring = build(&Setup::default(), 64).expect("a plain ring builds");
+        let submit = ring.submitter();
+
+        // Occupy the group, so the next registration on it is refused the way a
+        // kernel refuses one, and asks the fallback for a ring.
+        let first = BufRing::register(&submit, 4, None).expect("the first ring registers");
+        assert!(
+            register_buffers(&submit, 4, None).is_none(),
+            "a refused registration must fall back, not end the shard"
+        );
+        drop(first);
+    }
+
+    /// **What `PGNOOP_PBUF` means, including the values an operator types by
+    /// accident.** A value over the index's range is clamped rather than
+    /// overflowed, one that is not a number keeps the default, and zero buffers
+    /// is no ring at all rather than a ring with none.
+    #[test]
+    fn the_buffer_ring_size_from_the_environment_is_bounded() {
+        std::env::set_var("PGNOOP_PBUF", "40000");
+        assert_eq!(pbuf_count_from_env(), PBUF_MAX);
+        std::env::set_var("PGNOOP_PBUF", " 16 ");
+        assert_eq!(pbuf_count_from_env(), 16);
+        std::env::set_var("PGNOOP_PBUF", "0");
+        assert_eq!(pbuf_count_from_env(), 1);
+        std::env::set_var("PGNOOP_PBUF", "nonsense");
+        assert_eq!(pbuf_count_from_env(), PBUF_COUNT);
+        std::env::remove_var("PGNOOP_PBUF");
+        assert_eq!(pbuf_count_from_env(), PBUF_COUNT);
+    }
+
+    /// **The ring's index cannot describe every u16 the operator can type.** The
+    /// count is a power of two below half the index's range, and
+    /// `next_power_of_two` above that used to overflow to zero -- a panic in a
+    /// debug build and an empty ring in a release one.
+    #[test]
+    fn a_buffer_ring_count_is_clamped_to_what_its_index_can_describe() {
+        for (asked, expected) in [
+            (0u16, 1u16),
+            (1, 1),
+            (1000, 1024),
+            (PBUF_MAX, PBUF_MAX),
+            (PBUF_MAX + 1, PBUF_MAX),
+            (u16::MAX, PBUF_MAX),
+        ] {
+            let ring = BufRing::alloc(asked).expect("a ring is allocated");
+            assert_eq!(ring.count, expected, "PGNOOP_PBUF={asked}");
+        }
+    }
+
+    /// **A cancelled receive on a closing slot ends the slot.** `Idle` here left
+    /// the descriptor open until the process exited: the receive the slot was
+    /// waiting for is over, so there is nothing left to wait for.
+    #[test]
+    fn a_cancelled_receive_is_answered_by_what_the_slot_needs() {
+        assert_eq!(
+            after_cancel(true, false),
+            Next::Idle,
+            "a park of ours resumes from the cancel's own completion"
+        );
+        assert_eq!(
+            after_cancel(false, true),
+            Next::Close,
+            "a closing slot must be reaped, not left holding its descriptor"
+        );
+        assert_eq!(after_cancel(false, false), Next::Arm);
     }
 
     /// **A stopped shard gives its descriptors back.**
