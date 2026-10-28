@@ -194,24 +194,39 @@ async fn serve(mut socket: TcpStream, codec: Codec) {
                     .await
                 {
                     Ok(Ok(n)) if n > 0 => n,
-                    // Timed out, closed, or failed: all three end the connection, and
-                    // the caller has what it needs to tell them apart in the log line
-                    // below.
-                    Ok(Ok(_)) | Ok(Err(_)) => return,
+                    // Closed or failed: both end the connection, and the error is
+                    // worth a line -- a dropped connection a run cannot explain is a
+                    // measurement it cannot trust.
+                    Ok(Ok(_)) => return,
+                    Ok(Err(e)) => {
+                        eprintln!("dbnoop: read failed during startup: {e}");
+
+                        return;
+                    }
                     Err(_elapsed) => {
                         eprintln!("dbnoop: connection did not complete startup in time; closing");
                         return;
                     }
                 },
                 None => match socket.read(&mut chunk).await {
-                    Ok(0) | Err(_) => return,
+                    Ok(0) => return,
                     Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("dbnoop: read failed: {e}");
+
+                        return;
+                    }
                 },
             }
         } else {
             match socket.read(&mut chunk).await {
-                Ok(0) | Err(_) => return,
+                Ok(0) => return,
                 Ok(n) => n,
+                Err(e) => {
+                    eprintln!("dbnoop: read failed: {e}");
+
+                    return;
+                }
             }
         };
 
@@ -392,6 +407,55 @@ fn ring_serving(reports: &[Report]) -> usize {
             )
         })
         .count()
+}
+
+/// Join one shard and say how it ended.
+///
+/// A panicked shard used to be indistinguishable from one that returned false, so
+/// a process with live shards and one panic exited 0 and said nothing.
+fn join_shard(name: String, handle: std::thread::JoinHandle<bool>) -> ShardEnd {
+    match handle.join() {
+        Ok(true) => ShardEnd::Served,
+        Ok(false) => ShardEnd::Stopped,
+        Err(_) => {
+            eprintln!("dbnoop: shard {name} panicked");
+
+            ShardEnd::Panicked
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ShardEnd {
+    Served,
+    /// Ended without serving: its listener failed, or it never started.
+    Stopped,
+    Panicked,
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::{join_shard, ShardEnd};
+
+    /// **A panicked shard is not a shard that stopped.** Folding the panic into
+    /// `false` let a process with live shards exit 0 and say nothing.
+    #[test]
+    fn a_panicked_shard_is_reported_and_counted() {
+        let panicked = std::thread::spawn(|| -> bool { panic!("a shard panicked") });
+
+        assert_eq!(
+            join_shard("shard 7".to_string(), panicked),
+            ShardEnd::Panicked
+        );
+        assert_eq!(
+            join_shard("shard 8".to_string(), std::thread::spawn(|| true)),
+            ShardEnd::Served
+        );
+        assert_eq!(
+            join_shard("shard 9".to_string(), std::thread::spawn(|| false)),
+            ShardEnd::Stopped
+        );
+    }
 }
 
 /// The TPCC counters, on stderr every `interval` and once when the server stops.
@@ -591,15 +655,17 @@ pub fn run() {
     // A server whose every shard failed must not exit 0.
     // Discarding the join results means a fully dead process reports success to
     // whatever supervises it.
-    let mut served = 0usize;
-    for t in threads {
-        if t.join().unwrap_or(false) {
-            served += 1;
-        }
-    }
+    let ends: Vec<ShardEnd> = threads
+        .into_iter()
+        .map(|t| join_shard(String::from("a shard"), t))
+        .collect();
+    let served = ends.iter().filter(|e| **e == ShardEnd::Served).count();
+    let panicked = ends.iter().filter(|e| **e == ShardEnd::Panicked).count();
 
-    if served == 0 {
-        eprintln!("dbnoop: no shard served; exiting nonzero");
+    // **A process whose shards are all dead, or any of whose shards panicked, must
+    // not report success** to whatever supervises it.
+    if served == 0 || panicked > 0 {
+        eprintln!("dbnoop: {served} shard(s) served, {panicked} panicked; exiting nonzero");
         std::process::exit(1);
     }
 
