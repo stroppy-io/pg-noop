@@ -892,6 +892,23 @@ fn the_tpcc_rules_answer_with_numbers() {
     assert_eq!(row_value(&packets[3]), "1", "the first variable");
 }
 
+/// **With the profile off, a TPC-C query is an ordinary select**: its columns,
+/// no rows. The profile is the only thing that makes it answer a number.
+#[test]
+fn a_tpcc_query_without_the_profile_is_an_empty_select() {
+    let _profile = tpcc::profile_guard(false);
+    let mut c = connected(CAPS);
+
+    let packets = round_trip(&mut c, &query("select sum(d_next_o_id) from district"));
+    let (columns, rows, status) = result_set(&packets);
+    assert_eq!((columns, rows), (1, 0), "{packets:?}");
+    assert_eq!(status, AUTOCOMMIT);
+
+    let packets = round_trip(&mut c, &query("show global status"));
+    let (columns, rows, _) = result_set(&packets);
+    assert_eq!((columns, rows), (2, 0), "{packets:?}");
+}
+
 /// A constant SELECT answers one row, the way PostgreSQL answers one.
 #[test]
 fn a_constant_select_answers_one_row() {

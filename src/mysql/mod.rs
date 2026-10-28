@@ -697,9 +697,8 @@ fn classify(sql: &str) -> Answer {
         // The rollback path a client injects: an error, so its own error handling runs
         // and its rollback is counted -- an OK here turns the rollback into a commit.
         Shape::Failure(failure)
-    // The synthetic answers are the profile's.
-    } else if !tpcc::profile() && tpcc::number_query(trimmed).is_some() {
-        Shape::Empty(select_columns(trimmed))
+    // The synthetic answers are the profile's: with it off, these are ordinary
+    // selects and fall through to the empty result set below.
     } else if let Some((name, value)) = tpcc::number_query(trimmed) {
         Shape::Number(name, value)
     } else if tpcc::profile() && tpcc::show_status(trimmed).is_some() {
