@@ -3,7 +3,7 @@
 //! responses, so a benchmark measures the client and not the database.
 
 pub mod config;
-pub mod handler;
+pub mod plan;
 pub mod mysql;
 pub mod protocol;
 pub mod sql;
