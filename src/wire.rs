@@ -1442,6 +1442,28 @@ impl Conn {
 /// Returns whether the portal has now been read to its end. Only a plan that
 /// returns rows has an end to reach; the rest are done when they answer.
 fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Run<'_>) -> bool {
+    // **The one statement answered with a number.** A TPC-C client reads the
+    // district sum before and after its window and reports the difference as
+    // NOPM; against a server that answered an empty result set that difference
+    // is zero, and the run it is measuring cannot report a throughput at all.
+    if crate::tpcc::is_district_sum(&plan.sql) {
+        return district_answer(out, run);
+    }
+
+    // The other TPC-C read: `show global status`, which a client asks for the
+    // commit counters it reports as TPM. PostgreSQL has no such statement, and
+    // answering it is what makes the rules the same on both protocols.
+    if let Some(filter) = crate::tpcc::show_status(&plan.sql) {
+        return status_answer(out, run, filter.as_deref());
+    }
+
+    // A statement that IS a TPC-C transaction is counted here, where it runs,
+    // and never at Parse: a portal executed a thousand times is a thousand
+    // transactions, and one that is prepared and never run is none.
+    if let Some(kind) = crate::tpcc::statement_kind(&plan.sql) {
+        crate::tpcc::note(kind);
+    }
+
     match &plan.kind {
         PlanKind::SelectMeta { .. } | PlanKind::SelectStub { .. } => {
             let cols = resolve_columns(plan, catalog);
@@ -1482,9 +1504,20 @@ fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Ru
         PlanKind::Update => complete_raw(out, "UPDATE 1"),
         PlanKind::Delete => complete_raw(out, "DELETE 1"),
         PlanKind::Begin => complete_raw(out, "BEGIN"),
-        PlanKind::Commit if run.failed => complete_raw(out, "ROLLBACK"),
-        PlanKind::Commit => complete_raw(out, "COMMIT"),
-        PlanKind::Rollback => complete_raw(out, "ROLLBACK"),
+        PlanKind::Commit if run.failed => {
+            // Committing a failed transaction rolls it back, and the tag says
+            // so; the counter says the same thing the tag does.
+            crate::tpcc::note_rollback();
+            complete_raw(out, "ROLLBACK")
+        }
+        PlanKind::Commit => {
+            crate::tpcc::note_commit();
+            complete_raw(out, "COMMIT")
+        }
+        PlanKind::Rollback => {
+            crate::tpcc::note_rollback();
+            complete_raw(out, "ROLLBACK")
+        }
         PlanKind::Ddl => {
             catalog.apply(&plan.sql);
             complete_raw(out, ddl_tag(&plan.sql));
@@ -1510,6 +1543,117 @@ fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Ru
         // PostgreSQL's answer to nothing: `I`, in place of CommandComplete.
         PlanKind::Empty => msg(out, b'I', |_| {}),
         PlanKind::FromText => complete(out, "SELECT", Some(0)),
+    }
+
+    true
+}
+
+/// The district sum's one column: `sum`, int8, in the format the portal asked
+/// for. Written by hand because it is the only answer whose value is not a
+/// stub.
+fn district_description(formats: &Formats, out: &mut Vec<u8>) {
+    msg(out, b'T', |b| {
+        b.extend_from_slice(&1i16.to_be_bytes());
+        cstr(b, "sum");
+        b.extend_from_slice(&0i32.to_be_bytes()); // table oid: none
+        b.extend_from_slice(&0i16.to_be_bytes()); // column number: none
+        b.extend_from_slice(&20u32.to_be_bytes()); // int8
+        b.extend_from_slice(&8i16.to_be_bytes()); // type size
+        b.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
+        b.extend_from_slice(&formats.get(0).to_be_bytes());
+    });
+}
+
+/// The two columns of a status answer: `Variable_name` and `Value`, both text.
+fn status_description(formats: &Formats, out: &mut Vec<u8>) {
+    msg(out, b'T', |b| {
+        b.extend_from_slice(&2i16.to_be_bytes());
+        for name in ["Variable_name", "Value"] {
+            cstr(b, name);
+            b.extend_from_slice(&0i32.to_be_bytes()); // table oid: none
+            b.extend_from_slice(&0i16.to_be_bytes()); // column number: none
+            b.extend_from_slice(&25u32.to_be_bytes()); // text
+            b.extend_from_slice(&(-1i16).to_be_bytes()); // type size: variable
+            b.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
+            b.extend_from_slice(&0i16.to_be_bytes()); // text format
+        }
+        // The formats are per column: whatever the portal asked for is honoured
+        // above only for text columns, which have no binary form of their own.
+        let _ = formats;
+    });
+}
+
+/// The TPC-C commit counters as a result set of two text columns.
+fn status_answer(out: &mut Vec<u8>, run: Run<'_>, filter: Option<&str>) -> bool {
+    if run.describe {
+        status_description(run.formats, out);
+    }
+
+    if run.consumed {
+        complete(out, "SELECT", Some(0));
+
+        return true;
+    }
+
+    let rows = crate::tpcc::status_rows(filter);
+    let mut written = 0u64;
+    for (name, value) in &rows {
+        let value = value.to_string();
+        msg(out, b'D', |b| {
+            b.extend_from_slice(&2i16.to_be_bytes());
+            for text in [*name, value.as_str()] {
+                b.extend_from_slice(&(text.len() as i32).to_be_bytes());
+                b.extend_from_slice(text.as_bytes());
+            }
+        });
+        written += 1;
+    }
+
+    if run.max_rows > 0 && written >= run.max_rows as u64 {
+        portal_suspended(out);
+    } else {
+        complete(out, "SELECT", Some(written));
+    }
+
+    true
+}
+
+/// The TPC-C district sum as one row of one int8 column.
+fn district_answer(out: &mut Vec<u8>, run: Run<'_>) -> bool {
+    let value = crate::tpcc::district_sum();
+
+    if run.describe {
+        district_description(run.formats, out);
+    }
+
+    // A portal already read to its end has nothing more, as for any other
+    // single-row plan.
+    if run.consumed {
+        complete(out, "SELECT", Some(0));
+
+        return true;
+    }
+
+    msg(out, b'D', |b| {
+        b.extend_from_slice(&1i16.to_be_bytes());
+        if run.formats.get(0) == 1 {
+            // The binary form of int8: eight bytes, network order.
+            b.extend_from_slice(&8i32.to_be_bytes());
+            b.extend_from_slice(&(value as i64).to_be_bytes());
+        } else {
+            let text = value.to_string();
+            b.extend_from_slice(&(text.len() as i32).to_be_bytes());
+            b.extend_from_slice(text.as_bytes());
+        }
+    });
+
+    // The one row is also the last one, but with a limit of one the server
+    // cannot know that until it looks for the next -- which is why PostgreSQL
+    // answers PortalSuspended here, as it does for any stub row.
+    if run.max_rows == 1 {
+        portal_suspended(out);
+    } else {
+        complete(out, "SELECT", Some(1));
     }
 
     true
@@ -1755,6 +1899,19 @@ fn row_description(
     formats: &Formats,
     out: &mut Vec<u8>,
 ) -> bool {
+    // Described as it is answered: one int8 column named `sum`, so a driver that
+    // decodes the value in binary reads the type it was told.
+    if crate::tpcc::is_district_sum(&plan.sql) {
+        district_description(formats, out);
+
+        return true;
+    }
+    if crate::tpcc::show_status(&plan.sql).is_some() {
+        status_description(formats, out);
+
+        return true;
+    }
+
     if !matches!(
         plan.kind,
         PlanKind::SelectMeta { .. } | PlanKind::SelectStub { .. }
@@ -2112,6 +2269,79 @@ mod tests {
         assert!(c.is_closed());
         assert_eq!(used, 5, "consumed Terminate and stopped");
         assert!(out.is_empty(), "a closed connection answers nothing");
+    }
+
+    /// **The one statement answered with a number.** A TPC-C client reads
+    /// `select sum(d_next_o_id) from district` before and after its window and
+    /// reports the difference as NOPM; a no-op that answered an empty result set
+    /// would make every such run report zero.
+    ///
+    /// The frames are checked here -- one int8 column named `sum`, one row, its
+    /// value the schema's -- and the arithmetic is pinned in `src/tpcc.rs` and
+    /// end to end in `tests/mysql_wire.rs`.
+    #[test]
+    fn the_district_sum_is_answered_with_one_row() {
+        let (mut c, v) = (Conn::new(), view());
+        let mut out = Vec::new();
+        c.advance(&startup_msg(), &mut out, &v);
+
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'Q', |b| cstr(b, "select sum(d_next_o_id) from district")),
+            &mut out,
+            &v,
+        );
+
+        let mut at = 0usize;
+        let (tag, body) = frame(&out, &mut at);
+        assert_eq!(tag, b'T', "a RowDescription");
+        assert_eq!(i16::from_be_bytes([body[0], body[1]]), 1, "one column");
+        assert!(
+            body.windows(3).any(|w| w == b"sum"),
+            "the column a client asked for"
+        );
+        // The field's type follows its name, the table oid and the column
+        // number: int8, so a driver decodes the value it was promised.
+        let field = &body[2..];
+        let name_end = field.iter().position(|&b| b == 0).expect("a name") + 1;
+        let oid_at = name_end + 4 + 2;
+        assert_eq!(
+            u32::from_be_bytes([
+                field[oid_at],
+                field[oid_at + 1],
+                field[oid_at + 2],
+                field[oid_at + 3]
+            ]),
+            20,
+            "int8"
+        );
+
+        let (tag, body) = frame(&out, &mut at);
+        assert_eq!(tag, b'D', "a DataRow");
+        assert_eq!(i16::from_be_bytes([body[0], body[1]]), 1, "one value");
+        let len = i32::from_be_bytes([body[2], body[3], body[4], body[5]]) as usize;
+        let value: u64 = std::str::from_utf8(&body[6..6 + len])
+            .expect("utf-8")
+            .parse()
+            .expect("a number");
+        assert!(value >= 3001, "{value} is not a district sum");
+
+        let (tag, body) = frame(&out, &mut at);
+        assert_eq!(tag, b'C', "a CommandComplete");
+        assert_eq!(body, b"SELECT 1\0");
+        assert_eq!(frame(&out, &mut at).0, b'Z', "ready for the next query");
+    }
+
+    /// One frame out of a buffer: its tag and its body, and where the next one
+    /// starts.
+    fn frame<'a>(out: &'a [u8], at: &mut usize) -> (u8, &'a [u8]) {
+        let tag = out[*at];
+        let len =
+            i32::from_be_bytes([out[*at + 1], out[*at + 2], out[*at + 3], out[*at + 4]]) as usize;
+        let body = &out[*at + 5..*at + 1 + len];
+        *at += 1 + len;
+
+        (tag, body)
     }
 
     #[test]

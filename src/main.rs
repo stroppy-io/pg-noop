@@ -2,6 +2,8 @@ mod config;
 mod handler;
 mod mysql;
 mod protocol;
+mod sql;
+mod tpcc;
 #[cfg(target_os = "linux")]
 mod uring;
 mod wire;
@@ -400,8 +402,28 @@ fn run_shard(
     })
 }
 
+/// The TPCC counters, on stderr every `interval` and once when the server stops.
+///
+/// A benchmark that reads its throughput from the server reads it from the
+/// district sum and the commit counters; this is the same information for
+/// whoever is watching the log. Off unless asked for: a server that writes to
+/// stderr during a measurement is a server in the measurement.
+fn spawn_stats(interval: std::time::Duration) {
+    std::thread::Builder::new()
+        .name("pgnoop-stats".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(interval);
+            eprintln!("{}", crate::tpcc::line());
+        })
+        .expect("spawn the stats thread");
+}
+
 fn main() {
     let config = Config::load();
+    crate::tpcc::set_warehouses(config.warehouses);
+    if config.stats_every > 0 {
+        spawn_stats(std::time::Duration::from_secs(config.stats_every));
+    }
 
     // Before any shard exists: the ring is either usable in this process or it
     // is not, and the answer does not change per shard.
@@ -513,6 +535,9 @@ fn main() {
         eprintln!("pgnoop: no shard served; exiting nonzero");
         std::process::exit(1);
     }
+
+    // The last word on what was counted, whichever way the shards ended.
+    eprintln!("{}", crate::tpcc::line());
 }
 
 #[cfg(all(test, target_os = "linux"))]

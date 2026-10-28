@@ -28,6 +28,9 @@ use std::collections::HashMap;
 use packet::Reader;
 use result::{Column, Kind};
 
+use crate::sql;
+use crate::tpcc;
+
 pub use handshake::greeting;
 
 // Server status flags, by their names in `include/mysql_com.h`. A client reads
@@ -83,6 +86,13 @@ enum Shape {
     Ok,
     /// A result set with no rows and these columns.
     Empty(Vec<String>),
+    /// The TPC-C district sum: one row, one integer (`crate::tpcc`).
+    District,
+    /// `SHOW GLOBAL STATUS`, with the `LIKE` filter the client gave it: the
+    /// `Com_commit` and `Com_rollback` counters.
+    Status(Option<String>),
+    /// `SELECT @...`: one row of plausible values, one column per variable.
+    Vars(Vec<String>),
 }
 
 /// What a statement does to the session, decided from its text and applied when
@@ -101,14 +111,21 @@ enum Tx {
 struct Answer {
     shape: Shape,
     tx: Tx,
+    /// The TPC-C transaction this statement is, when it is one: counted at
+    /// EXECUTION, so a prepared statement counts once per execution.
+    kind: Option<tpcc::Kind>,
 }
 
 impl Answer {
     /// The columns a result set will have, for the prepare response.
-    fn columns(&self) -> &[String] {
+    fn columns(&self) -> Vec<&str> {
         match &self.shape {
-            Shape::Ok => &[],
-            Shape::Empty(columns) => columns,
+            Shape::Ok => Vec::new(),
+            Shape::Empty(columns) | Shape::Vars(columns) => {
+                columns.iter().map(String::as_str).collect()
+            }
+            Shape::District => vec!["sum(d_next_o_id)"],
+            Shape::Status(_) => vec!["Variable_name", "Value"],
         }
     }
 }
@@ -432,7 +449,7 @@ impl Conn {
         // leaving `MORE_RESULTS_EXISTS` on it would make the client wait for a
         // result that never comes.
         let statements: Vec<&str> = if self.multi_statements() {
-            split_statements(sql)
+            sql::split_statements(sql)
         } else {
             vec![sql]
         };
@@ -458,13 +475,30 @@ impl Conn {
         }
     }
 
-    /// Note what a statement does to the session, before it is answered so that
-    /// the packet cannot disagree with the state.
+    /// Note what a statement does to the session, and to the counters, before it
+    /// is answered so that the packet cannot disagree with the state.
     fn apply(&mut self, answer: &Answer) {
         match answer.tx {
             Tx::None => {}
             Tx::Begin => self.in_trans = true,
-            Tx::Commit | Tx::Rollback => self.in_trans = false,
+            Tx::Commit => {
+                self.in_trans = false;
+                tpcc::note_commit();
+            }
+            Tx::Rollback => {
+                self.in_trans = false;
+                tpcc::note_rollback();
+            }
+        }
+
+        if let Some(kind) = answer.kind {
+            tpcc::note(kind);
+            // **Autocommit is a transaction per statement.** A client that never
+            // says BEGIN -- HammerDB's stored-procedure path does not -- still
+            // commits, and the TPM it reads is `Com_commit` plus `Com_rollback`.
+            if !self.in_trans {
+                tpcc::note_commit();
+            }
         }
     }
 
@@ -476,14 +510,35 @@ impl Conn {
         match &answer.shape {
             Shape::Ok => result::ok(out, &mut self.seq, 0, 0, status),
             Shape::Empty(columns) => {
-                let columns: Vec<Column<'_>> = columns
-                    .iter()
-                    .map(|name| Column {
-                        name,
-                        kind: Kind::Text,
-                    })
-                    .collect();
+                let columns = text_columns(columns.iter().map(String::as_str));
                 result::header(out, &mut self.seq, &columns, status, deprecate);
+                result::finish(out, &mut self.seq, status, deprecate);
+            }
+            Shape::District => {
+                let columns = [Column {
+                    name: "sum(d_next_o_id)",
+                    kind: Kind::LongLong,
+                }];
+                result::header(out, &mut self.seq, &columns, status, deprecate);
+                let value = tpcc::district_sum().to_string();
+                result::row(out, &mut self.seq, &[Some(&value)]);
+                result::finish(out, &mut self.seq, status, deprecate);
+            }
+            Shape::Status(filter) => {
+                let columns = text_columns(["Variable_name", "Value"]);
+                result::header(out, &mut self.seq, &columns, status, deprecate);
+                for (name, value) in tpcc::status_rows(filter.as_deref()) {
+                    let value = value.to_string();
+                    result::row(out, &mut self.seq, &[Some(name), Some(&value)]);
+                }
+                result::finish(out, &mut self.seq, status, deprecate);
+            }
+            Shape::Vars(names) => {
+                let columns = text_columns(names.iter().map(String::as_str));
+                result::header(out, &mut self.seq, &columns, status, deprecate);
+                let values: Vec<Option<&str>> =
+                    names.iter().map(|_| Some(tpcc::VAR_VALUE)).collect();
+                result::row(out, &mut self.seq, &values);
                 result::finish(out, &mut self.seq, status, deprecate);
             }
         }
@@ -499,20 +554,13 @@ impl Conn {
         };
 
         let answer = classify(sql);
-        let params = count_placeholders(sql);
+        let params = sql::count_placeholders(sql);
         let id = self.next_stmt;
         self.next_stmt += 1;
 
         let deprecate = self.deprecate_eof();
         let status = self.status(false);
-        let columns: Vec<Column<'_>> = answer
-            .columns()
-            .iter()
-            .map(|name| Column {
-                name,
-                kind: Kind::Text,
-            })
-            .collect();
+        let columns = text_columns(answer.columns());
 
         let at = packet::begin(out, &mut self.seq);
         out.push(0x00); // the OK header of a prepare response
@@ -572,8 +620,8 @@ impl Conn {
 
 /// What a statement answers, from its text alone.
 fn classify(sql: &str) -> Answer {
-    let trimmed = trim_leading(sql);
-    let head = first_word(trimmed);
+    let trimmed = sql::trim_leading(sql);
+    let head = sql::first_word(trimmed);
 
     let tx = if head.eq_ignore_ascii_case("BEGIN") || starts_transaction(trimmed) {
         Tx::Begin
@@ -591,7 +639,18 @@ fn classify(sql: &str) -> Answer {
         Tx::None
     };
 
-    let shape = if head.eq_ignore_ascii_case("SELECT") {
+    // **The TPC-C rules come first.** They are the only statements this server
+    // answers with a number, and each is checked before the shape the statement
+    // would otherwise get -- a district sum is a SELECT, a status query is a
+    // SHOW, and an OUT-parameter read is a select of variables.
+    let mut kind = None;
+    let shape = if let Some(filter) = tpcc::show_status(trimmed) {
+        Shape::Status(filter)
+    } else if tpcc::is_district_sum(trimmed) {
+        Shape::District
+    } else if let Some(names) = tpcc::select_vars(trimmed) {
+        Shape::Vars(names)
+    } else if head.eq_ignore_ascii_case("SELECT") {
         Shape::Empty(select_columns(trimmed))
     } else if head.eq_ignore_ascii_case("SHOW") {
         // Every SHOW this server answers has the two-column shape of
@@ -604,18 +663,31 @@ fn classify(sql: &str) -> Answer {
         // Statements that may return rows but have no `SELECT` to read the shape
         // from. `CALL` is deliberately NOT here: a stored procedure call answers
         // an OK packet, which is what a client that then reads its OUT
-        // parameters from `SELECT @...` expects (see `crate::tpcc`).
+        // parameters from `SELECT @...` expects -- and it is counted here.
         Shape::Empty(vec!["result".to_string()])
     } else {
+        kind = tpcc::statement_kind(trimmed);
         Shape::Ok
     };
 
-    Answer { shape, tx }
+    Answer { shape, tx, kind }
+}
+
+/// One text column per name: everything this server sends as a result set is
+/// either a string or the district sum.
+fn text_columns<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<Column<'a>> {
+    names
+        .into_iter()
+        .map(|name| Column {
+            name,
+            kind: Kind::Text,
+        })
+        .collect()
 }
 
 /// `START TRANSACTION`, with any of its modifiers.
 fn starts_transaction(sql: &str) -> bool {
-    let mut words = Words::new(sql);
+    let mut words = sql::Words::new(sql);
     if !words
         .next()
         .is_some_and(|w| w.eq_ignore_ascii_case("START"))
@@ -630,7 +702,7 @@ fn starts_transaction(sql: &str) -> bool {
 
 /// Whether the statement mentions a word anywhere, outside quotes and comments.
 fn mentions(sql: &str, word: &str) -> bool {
-    Words::new(sql).any(|w| w.eq_ignore_ascii_case(word))
+    sql::Words::new(sql).any(|w| w.eq_ignore_ascii_case(word))
 }
 
 /// The columns of a `SELECT`, named after the select-list items.
@@ -639,10 +711,10 @@ fn mentions(sql: &str, word: &str) -> bool {
 /// column name gets something it recognises from the statement it wrote, and
 /// nothing here tries to evaluate the expression.
 fn select_columns(sql: &str) -> Vec<String> {
-    let Some(list) = select_list(sql) else {
+    let Some(list) = sql::select_list(sql) else {
         return vec!["result".to_string()];
     };
-    let columns: Vec<String> = split_top_level(list)
+    let columns: Vec<String> = sql::split_top_level(list)
         .into_iter()
         .map(|item| {
             let name = item.trim();
@@ -666,305 +738,6 @@ fn select_columns(sql: &str) -> Vec<String> {
         vec!["result".to_string()]
     } else {
         columns
-    }
-}
-
-/// The select list: the text between `SELECT` (and `DISTINCT`) and the first
-/// top-level `FROM`, or the end of the statement.
-fn select_list(sql: &str) -> Option<&str> {
-    let bytes = sql.as_bytes();
-    let mut i = skip_space(bytes, 0);
-    // `SELECT`
-    let end = word_end(bytes, i)?;
-    i = skip_space(bytes, end);
-    // `DISTINCT` / `ALL` / `DISTINCTROW`
-    if let Some(end) = word_end(bytes, i) {
-        if ["DISTINCT", "ALL", "DISTINCTROW"]
-            .iter()
-            .any(|kw| sql[i..end].eq_ignore_ascii_case(kw))
-        {
-            i = skip_space(bytes, end);
-        }
-    }
-
-    let from = find_keyword(sql, i, "FROM");
-    let stop = from.unwrap_or(bytes.len());
-    let list = &sql[i..stop];
-    if list.trim().is_empty() {
-        return None;
-    }
-
-    Some(list)
-}
-
-/// The offset of the first top-level `keyword` at or after `from`.
-///
-/// Top level is outside parentheses, quotes and comments: `select coalesce(a,
-/// 'from')` names no table, and `select (select 1 from t)` does.
-fn find_keyword(sql: &str, from: usize, keyword: &str) -> Option<usize> {
-    let bytes = sql.as_bytes();
-    let mut i = from;
-    let mut depth = 0usize;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' => {
-                depth += 1;
-                i += 1;
-            }
-            b')' => {
-                depth = depth.saturating_sub(1);
-                i += 1;
-            }
-            b'\'' | b'"' | b'`' => i = skip_quoted(bytes, i),
-            b'-' | b'#' | b'/' => match skip_comment(bytes, i) {
-                Some(next) => i = next,
-                None => i += 1,
-            },
-            c if depth == 0 && is_word_byte(c) => {
-                let end = word_end(bytes, i)?;
-                if sql[i..end].eq_ignore_ascii_case(keyword) {
-                    return Some(i);
-                }
-                i = end;
-            }
-            _ => i += 1,
-        }
-    }
-
-    None
-}
-
-/// Split a multi-statement query on top-level `;`, keeping empty segments: which
-/// of them answer is the caller's rule.
-fn split_statements(sql: &str) -> Vec<&str> {
-    let bytes = sql.as_bytes();
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    let mut i = 0usize;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' | b'"' | b'`' => i = skip_quoted(bytes, i),
-            b'-' | b'#' | b'/' => match skip_comment(bytes, i) {
-                Some(next) => i = next,
-                None => i += 1,
-            },
-            b';' => {
-                out.push(&sql[start..i]);
-                i += 1;
-                start = i;
-            }
-            _ => i += 1,
-        }
-    }
-    if start < bytes.len() {
-        out.push(&sql[start..]);
-    }
-
-    out
-}
-
-/// Split on top-level commas.
-fn split_top_level(text: &str) -> Vec<&str> {
-    let bytes = text.as_bytes();
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    let mut i = 0usize;
-    let mut depth = 0usize;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' => {
-                depth += 1;
-                i += 1;
-            }
-            b')' => {
-                depth = depth.saturating_sub(1);
-                i += 1;
-            }
-            b'\'' | b'"' | b'`' => i = skip_quoted(bytes, i),
-            b',' if depth == 0 => {
-                out.push(&text[start..i]);
-                i += 1;
-                start = i;
-            }
-            _ => i += 1,
-        }
-    }
-    out.push(&text[start..]);
-
-    out
-}
-
-/// How many placeholders a statement has: `?` outside quotes, comments and
-/// identifiers.
-fn count_placeholders(sql: &str) -> u16 {
-    let bytes = sql.as_bytes();
-    let mut i = 0usize;
-    let mut count = 0u16;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' | b'"' | b'`' => i = skip_quoted(bytes, i),
-            b'-' | b'#' | b'/' => match skip_comment(bytes, i) {
-                Some(next) => i = next,
-                None => i += 1,
-            },
-            b'?' => {
-                count = count.saturating_add(1);
-                i += 1;
-            }
-            _ => i += 1,
-        }
-    }
-
-    count
-}
-
-/// Skip a quoted run, `i` at its opening quote. A doubled quote inside is an
-/// escaped one, which is how SQL spells a quote in a literal.
-fn skip_quoted(bytes: &[u8], i: usize) -> usize {
-    let quote = bytes[i];
-    let mut i = i + 1;
-    // A backtick is an identifier: it has no backslash escape.
-    let escapes = quote != b'`';
-    while i < bytes.len() {
-        if escapes && bytes[i] == b'\\' {
-            i += 2;
-
-            continue;
-        }
-        if bytes[i] == quote {
-            if bytes.get(i + 1) == Some(&quote) {
-                i += 2;
-
-                continue;
-            }
-
-            return i + 1;
-        }
-        i += 1;
-    }
-
-    bytes.len()
-}
-
-/// Skip a comment, `i` at its first byte, or `None` when what is there only
-/// looks like one (`-` that is not `--`, `/` that is not `/*`).
-fn skip_comment(bytes: &[u8], i: usize) -> Option<usize> {
-    match *bytes.get(i)? {
-        b'#' => Some(line_end(bytes, i + 1)),
-        b'-' if bytes.get(i + 1) == Some(&b'-') => Some(line_end(bytes, i + 2)),
-        b'/' if bytes.get(i + 1) == Some(&b'*') => {
-            let mut j = i + 2;
-            while j + 1 < bytes.len() {
-                if bytes[j] == b'*' && bytes[j + 1] == b'/' {
-                    return Some(j + 2);
-                }
-                j += 1;
-            }
-
-            Some(bytes.len())
-        }
-        _ => None,
-    }
-}
-
-fn line_end(bytes: &[u8], mut i: usize) -> usize {
-    while i < bytes.len() && bytes[i] != b'\n' {
-        i += 1;
-    }
-
-    i
-}
-
-fn skip_space(bytes: &[u8], mut i: usize) -> usize {
-    loop {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        match skip_comment(bytes, i) {
-            // A comment is whitespace: `select /* x */ 1` is `select 1`.
-            Some(next) if next > i => i = next,
-            _ => return i,
-        }
-    }
-}
-
-/// The statement with leading whitespace and comments removed.
-fn trim_leading(sql: &str) -> &str {
-    let start = skip_space(sql.as_bytes(), 0);
-
-    &sql[start..]
-}
-
-fn is_word_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
-}
-
-/// The end of the word starting at `i`, or `None` when there is none there.
-fn word_end(bytes: &[u8], i: usize) -> Option<usize> {
-    if i >= bytes.len() || !is_word_byte(bytes[i]) {
-        return None;
-    }
-    let mut j = i;
-    while j < bytes.len() && is_word_byte(bytes[j]) {
-        j += 1;
-    }
-
-    Some(j)
-}
-
-/// The first word of a statement.
-fn first_word(sql: &str) -> &str {
-    let bytes = sql.as_bytes();
-    let start = skip_space(bytes, 0);
-    match word_end(bytes, start) {
-        Some(end) => &sql[start..end],
-        None => "",
-    }
-}
-
-/// The words of a statement, outside quotes and comments -- all this codec reads
-/// of a statement it does not interpret.
-struct Words<'a> {
-    sql: &'a str,
-    pos: usize,
-}
-
-impl<'a> Words<'a> {
-    fn new(sql: &'a str) -> Self {
-        Words { sql, pos: 0 }
-    }
-}
-
-impl<'a> Iterator for Words<'a> {
-    type Item = &'a str;
-
-    fn next(&mut self) -> Option<&'a str> {
-        // Copied out so that a word's borrow is the statement's, not the scan's.
-        let sql: &'a str = self.sql;
-        let bytes = sql.as_bytes();
-
-        loop {
-            self.pos = skip_space(bytes, self.pos);
-            if self.pos >= bytes.len() {
-                return None;
-            }
-            match bytes[self.pos] {
-                // A literal or a quoted identifier is not a word.
-                b'\'' | b'"' | b'`' => self.pos = skip_quoted(bytes, self.pos),
-                c if is_word_byte(c) => {
-                    let end = word_end(bytes, self.pos).unwrap_or(bytes.len());
-                    let word = &sql[self.pos..end];
-                    self.pos = end;
-
-                    return Some(word);
-                }
-                _ => self.pos += 1,
-            }
-        }
     }
 }
 

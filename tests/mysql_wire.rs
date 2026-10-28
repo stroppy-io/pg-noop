@@ -32,22 +32,12 @@ impl Drop for Server {
 /// A server on both protocols with the kernel's own ports, discovered from its
 /// banner.
 fn server() -> Server {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pgnoop"))
-        .args([
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "0",
-            "--mysql-port",
-            "0",
-            "--workers",
-            "1",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the server binary starts");
+    server_with(&[])
+}
 
+/// The banner of a spawned server: the two ports the kernel gave it, read from
+/// its stderr.
+fn banner(mut child: Child) -> Server {
     let stderr = child.stderr.take().expect("stderr is piped");
     // **The pipe has to stay drained for the life of the child.** A child whose
     // stderr nobody reads blocks when the pipe fills, and one that writes to a
@@ -181,6 +171,13 @@ impl Packet {
             }
             other => panic!("not a length-encoded integer: {other:#x}"),
         }
+    }
+
+    /// A length-encoded string at `at`, and where it ended.
+    fn lenenc_bytes(&self, at: usize) -> (Vec<u8>, usize) {
+        let (len, at) = self.lenenc(at);
+        let len = len as usize;
+        (self.body[at..at + len].to_vec(), at + len)
     }
 
     /// An OK packet's status flags.
@@ -554,4 +551,275 @@ fn each_port_speaks_its_own_protocol() {
     let mut frame = [0u8; 5];
     pg.read_exact(&mut frame).expect("a reply frame");
     assert_eq!(frame[0], b'R', "AuthenticationOk");
+}
+
+/// The `--warehouses` the rules start from, when a test says otherwise.
+fn server_with(args: &[&str]) -> Server {
+    let mut all: Vec<&str> = vec![
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--mysql-port",
+        "0",
+        "--workers",
+        "1",
+    ];
+    all.extend_from_slice(args);
+
+    let child = Command::new(env!("CARGO_BIN_EXE_pgnoop"))
+        .args(&all)
+        // **A small provided-buffer ring on purpose.** The default is 256
+        // buffers, 8 MiB the kernel pins at registration; a box running several
+        // of these servers at once runs out, and the shard that cannot register
+        // is not what these tests are about.
+        .env("PGNOOP_PBUF", "4")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the server binary starts");
+
+    banner(child)
+}
+
+// ---------------------------------------------------------------- TPC-C rules
+
+/// **The district sum is answered with the schema's own number, and grows by one
+/// per NewOrder.**
+///
+/// This is the figure HammerDB reads before and after its window and reports as
+/// NOPM, and it is per PROCESS: the counters belong to the server, not to a
+/// connection, so a test with its own server sees its own arithmetic.
+#[test]
+fn the_district_sum_is_what_a_tpcc_client_reads_for_nopm() {
+    let server = server();
+    let mut client = Client::connect(server.mysql);
+
+    // Ten warehouses by default: a hundred districts, 3001 per district.
+    let answer = client.query("select sum(d_next_o_id) from district");
+    assert_eq!(answer.len(), 4, "{answer:?}");
+    assert_eq!(answer[0].lenenc(0).0, 1, "one column");
+    assert_eq!(row(&answer[2]).len(), 1, "one row");
+    assert_eq!(
+        row(&answer[2])[0],
+        "300100",
+        "3001 per district, 100 districts"
+    );
+
+    for expected in 300101..=300103u64 {
+        client.command(COM_QUERY, b"call NEWORD(1, 2, 3, 4)");
+        assert_eq!(client.answer()[0].body[0], 0x00, "a CALL answers an OK");
+
+        let answer = client.query("select sum(d_next_o_id) from district");
+        assert_eq!(
+            row(&answer[2])[0],
+            expected.to_string(),
+            "a NewOrder advances one district"
+        );
+    }
+
+    // The same query in another case, with the schema prefix a client may use,
+    // is the same query.
+    let answer = client.query("SELECT SUM(D_NEXT_O_ID) FROM tpcc.district");
+    assert_eq!(row(&answer[2])[0], "300103");
+
+    // A plain-SQL NewOrder is the INSERT into new_order.
+    client.command(
+        COM_QUERY,
+        b"insert into tpcc_new_order (no_w_id, no_d_id, no_o_id) values (1, 1, 3001)",
+    );
+    assert_eq!(client.answer()[0].body[0], 0x00);
+    let answer = client.query("select sum(d_next_o_id) from district");
+    assert_eq!(row(&answer[2])[0], "300104", "the insert counts too");
+}
+
+/// `--warehouses` sets how many districts the schema has: the sum a client reads
+/// at the start is 3001 per district.
+#[test]
+fn the_district_sum_follows_the_warehouse_count() {
+    let server = server_with(&["--warehouses", "5"]);
+    let mut client = Client::connect(server.mysql);
+
+    let answer = client.query("select sum(d_next_o_id) from district");
+    assert_eq!(
+        row(&answer[2])[0],
+        (3001 * 50).to_string(),
+        "five warehouses, ten districts each"
+    );
+}
+
+/// **`show global status` answers the commit counters a TPC-C client reads for
+/// TPM**, unfiltered and with the `LIKE` a client asks one at a time with.
+#[test]
+fn the_commit_counters_are_what_a_tpcc_client_reads_for_tpm() {
+    let server = server();
+    let mut client = Client::connect(server.mysql);
+
+    // An explicit transaction: the COMMIT is the one commit.
+    client.query("begin");
+    client.query("call PAYMENT(1, 2, 3)");
+    assert_eq!(counter(&mut client, "Com_commit"), 0, "still open");
+    client.query("commit");
+    assert_eq!(counter(&mut client, "Com_commit"), 1);
+
+    // Autocommit: each stored-procedure call is its own transaction.
+    client.query("call DELIVERY(1)");
+    client.query("call OSTAT(1, 2, 3)");
+    assert_eq!(counter(&mut client, "Com_commit"), 3);
+
+    // A rollback is a rollback.
+    client.query("begin");
+    client.query("call SLEV(1, 2, 3)");
+    client.query("rollback");
+    assert_eq!(counter(&mut client, "Com_commit"), 3);
+    assert_eq!(counter(&mut client, "Com_rollback"), 1);
+
+    // The unfiltered list holds both counters.
+    let answer = client.query("show global status");
+    let rows: Vec<Vec<String>> = answer[3..answer.len() - 1].iter().map(row).collect();
+    assert_eq!(rows.len(), 2, "{answer:?}");
+    assert_eq!(rows[0][0], "Com_commit");
+    assert_eq!(rows[1][0], "Com_rollback");
+}
+
+/// One `show global status like '<name>'` counter.
+fn counter(client: &mut Client, name: &str) -> u64 {
+    let sql = format!("show global status like '{name}'");
+    let answer = client.query(&sql);
+    let rows: Vec<Vec<String>> = answer[3..answer.len() - 1].iter().map(row).collect();
+    assert_eq!(rows.len(), 1, "{name}: {answer:?}");
+    assert_eq!(rows[0][0], name);
+
+    rows[0][1].parse().expect("a number")
+}
+
+/// A row packet's values.
+fn row(packet: &Packet) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut at = 0usize;
+    while at < packet.body.len() {
+        let (value, next) = packet.lenenc_bytes(at);
+        values.push(String::from_utf8(value).expect("utf-8"));
+        at = next;
+    }
+
+    values
+}
+
+/// **A stored procedure's OUT parameters read back as one row of numbers**, which
+/// is what a client does straight after its `CALL`.
+#[test]
+fn out_parameters_answer_one_plausible_row() {
+    let server = server();
+    let mut client = Client::connect(server.mysql);
+
+    let answer = client.query("call NEWORD(1, 2, 3, 4)");
+    assert_eq!(answer[0].body[0], 0x00, "a CALL is an OK packet");
+
+    let answer = client.query("select @neword_out, @d_next_o_id");
+    assert_eq!(answer[0].lenenc(0).0, 2, "one column per variable");
+    let values = row(&answer[3]);
+    assert_eq!(values, vec!["1", "1"], "numbers, and never NULL");
+}
+
+/// **The same rules answer on the PostgreSQL port**, where a TPC-C client's
+/// NOPM reads the same district query.
+#[test]
+fn the_district_sum_is_answered_on_the_postgres_port() {
+    let server = server();
+    let mut pg = PgClient::connect(server.postgres);
+
+    let answer = pg.query("select sum(d_next_o_id) from district");
+    assert_eq!(answer.len(), 3, "RowDescription, one row, CommandComplete");
+    assert_eq!(answer[0].0, b'T');
+    assert_eq!(answer[1].0, b'D');
+    // One field, and its length: six bytes of text.
+    assert_eq!(
+        &answer[1].1[..6],
+        b"\x00\x01\x00\x00\x00\x06",
+        "one field, six bytes long: {:?}",
+        answer[1].1
+    );
+    // The value itself: 3001 per district, 100 districts.
+    assert_eq!(&answer[1].1[6..], b"300100");
+
+    // A NewOrder counted on the PostgreSQL side advances it too.
+    pg.query("insert into new_order values (1, 1, 3001)");
+    let answer = pg.query("select sum(d_next_o_id) from district");
+    assert!(answer[1].1.ends_with(b"300101"), "{:?}", answer[1].1);
+
+    // And the commit counters a TPC-C client reads are there.
+    pg.query("begin");
+    pg.query("commit");
+    let answer = pg.query("show global status like 'Com_commit'");
+    assert_eq!(answer[0].0, b'T', "a result set");
+    let row = String::from_utf8_lossy(&answer[1].1).to_string();
+    assert!(
+        row.contains("Com_commit") && row.ends_with("1"),
+        "the commit counter: {row:?}"
+    );
+}
+
+/// A minimal PostgreSQL client: enough to send a simple query and read its
+/// frames.
+struct PgClient {
+    stream: TcpStream,
+}
+
+impl PgClient {
+    fn connect(port: u16) -> PgClient {
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        let mut client = PgClient { stream };
+
+        let mut startup = 196_608i32.to_be_bytes().to_vec();
+        startup.extend_from_slice(b"user\0bench\0\0");
+        let mut framed = ((startup.len() + 4) as i32).to_be_bytes().to_vec();
+        framed.extend_from_slice(&startup);
+        client.stream.write_all(&framed).expect("startup");
+        // AuthenticationOk and the ParameterStatus messages, then ReadyForQuery.
+        client.until_ready();
+
+        client
+    }
+
+    /// Frames up to and including ReadyForQuery.
+    fn until_ready(&mut self) -> Vec<(u8, Vec<u8>)> {
+        let mut frames = Vec::new();
+        loop {
+            let frame = self.frame();
+            let ready = frame.0 == b'Z';
+            frames.push(frame);
+            if ready {
+                return frames;
+            }
+        }
+    }
+
+    fn frame(&mut self) -> (u8, Vec<u8>) {
+        let mut head = [0u8; 5];
+        self.stream.read_exact(&mut head).expect("a frame header");
+        let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+        let mut body = vec![0u8; len - 4];
+        self.stream.read_exact(&mut body).expect("a frame body");
+
+        (head[0], body)
+    }
+
+    /// A simple query, and the frames of its answer without ReadyForQuery.
+    fn query(&mut self, sql: &str) -> Vec<(u8, Vec<u8>)> {
+        let mut body = sql.as_bytes().to_vec();
+        body.push(0);
+        let mut framed = vec![b'Q'];
+        framed.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        framed.extend_from_slice(&body);
+        self.stream.write_all(&framed).expect("query");
+
+        let mut frames = self.until_ready();
+        frames.pop();
+
+        frames
+    }
 }
