@@ -94,6 +94,17 @@ impl Kind {
         }
     }
 
+    /// Its index in `Pending`'s counts.
+    fn index(self) -> usize {
+        match self {
+            Kind::NewOrder => 0,
+            Kind::Payment => 1,
+            Kind::Delivery => 2,
+            Kind::OrderStatus => 3,
+            Kind::StockLevel => 4,
+        }
+    }
+
     fn counter(self) -> &'static AtomicU64 {
         match self {
             Kind::NewOrder => &STATS.new_order,
@@ -157,6 +168,46 @@ pub fn set_warehouses(n: u64) {
 /// total is that plus the NewOrders this process has seen.
 pub fn district_sum() -> u64 {
     3001 * districts() + new_orders()
+}
+
+/// **What one connection has done but not yet committed.**
+///
+/// A transaction is counted when it COMMITS, not when its statement runs: a
+/// NewOrder that is rolled back raises no district's next order id, and counting
+/// it when it ran inflated NOPM by every failed transaction. The statements note
+/// their kind here, the connection folds the note into the shared counters at
+/// COMMIT (or at the end of an autocommit statement), and a ROLLBACK drops it.
+#[derive(Default, Clone, Copy)]
+pub struct Pending {
+    counts: [u64; 5],
+}
+
+impl Pending {
+    /// Note one statement of this kind. Nothing is counted yet.
+    pub fn note(&mut self, kind: Kind) {
+        self.counts[kind.index()] += 1;
+    }
+
+    /// Commit: the noted transactions are counted, and the commit is one more.
+    pub fn commit(&mut self) {
+        for kind in Kind::ALL {
+            let n = std::mem::take(&mut self.counts[kind.index()]);
+            if n > 0 {
+                kind.counter().fetch_add(n, Ordering::Relaxed);
+            }
+        }
+        note_commit();
+    }
+
+    /// Roll back: the noted transactions never happened.
+    pub fn discard(&mut self) {
+        self.counts = [0; 5];
+    }
+
+    /// Whether anything is noted.
+    pub fn is_empty(&self) -> bool {
+        self.counts.iter().all(|n| *n == 0)
+    }
 }
 
 /// Count one TPC-C transaction of this kind, as committed.
@@ -601,6 +652,33 @@ mod tests {
         assert_eq!(district_sum(), at_start + 1);
 
         set_warehouses(DEFAULT_WAREHOUSES);
+    }
+
+    /// **A transaction is counted at COMMIT, and a rollback counts nothing.**
+    /// The note lives with the connection until then.
+    #[test]
+    fn a_transaction_is_counted_at_commit_not_when_it_runs() {
+        let before = new_orders();
+        let mut pending = Pending::default();
+
+        pending.note(Kind::NewOrder);
+        assert_eq!(new_orders(), before, "nothing is counted until it commits");
+        assert!(!pending.is_empty());
+
+        pending.discard();
+        assert!(pending.is_empty(), "a rollback drops the note");
+        pending.commit();
+        assert_eq!(
+            new_orders(),
+            before,
+            "and commits what is left, which is nothing",
+        );
+
+        let mut pending = Pending::default();
+        pending.note(Kind::NewOrder);
+        pending.note(Kind::NewOrder);
+        pending.commit();
+        assert_eq!(new_orders(), before + 2, "two NewOrders, one commit");
     }
 
     /// The counters a client reads are the ones the statements counted, and the

@@ -181,6 +181,9 @@ pub struct Conn {
     next_stmt: u32,
     /// `SERVER_STATUS_IN_TRANS`: a transaction is open.
     in_trans: bool,
+    /// What this connection has done in the open transaction, counted when it
+    /// commits and dropped if it rolls back.
+    pending: tpcc::Pending,
 }
 
 impl Default for Conn {
@@ -199,6 +202,7 @@ impl Conn {
             stmts: HashMap::new(),
             next_stmt: 1,
             in_trans: false,
+            pending: tpcc::Pending::default(),
         }
     }
 
@@ -373,6 +377,7 @@ impl Conn {
             // plain OK, which a client accepts as "authenticated, and clean".
             cmd::CHANGE_USER | cmd::RESET_CONNECTION => {
                 self.in_trans = false;
+                self.pending.discard();
                 self.stmts.clear();
                 let status = self.status(false);
                 result::ok(out, &mut self.seq, 0, 0, status);
@@ -501,21 +506,25 @@ impl Conn {
             Tx::Begin => self.in_trans = true,
             Tx::Commit => {
                 self.in_trans = false;
-                tpcc::note_commit();
+                // **Counted here, not when the statement ran**: a NewOrder that
+                // is rolled back raises no district's next order id, and counting
+                // it when it ran inflated NOPM by every failed transaction.
+                self.pending.commit();
             }
             Tx::Rollback => {
                 self.in_trans = false;
+                self.pending.discard();
                 tpcc::note_rollback();
             }
         }
 
         if let Some(kind) = answer.kind {
-            tpcc::note(kind);
+            self.pending.note(kind);
             // **Autocommit is a transaction per statement.** A client that never
             // says BEGIN -- HammerDB's stored-procedure path does not -- still
             // commits, and the TPM it reads is `Com_commit` plus `Com_rollback`.
             if !self.in_trans {
-                tpcc::note_commit();
+                self.pending.commit();
             }
         }
     }
