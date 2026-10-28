@@ -389,6 +389,43 @@ fn strip_trailing_comment(item: &str) -> &str {
     item
 }
 
+/// **SQL `PREPARE name AS body`**, which is a prepared statement made from a
+/// statement rather than from a Parse message.
+///
+/// A client that prepares its statements with SQL -- HammerDB's PostgreSQL
+/// TPC-C does, at login, and then executes them by name -- never sends a Parse.
+/// The name it registers has to be found by Bind, or every execution is 26000.
+pub fn sql_prepare(sql: &str) -> Option<(&str, &str)> {
+    let bytes = sql.as_bytes();
+    let start = skip_space(bytes, 0);
+    let end = word_end(bytes, start)?;
+    if !sql[start..end].eq_ignore_ascii_case("PREPARE") {
+        return None;
+    }
+
+    // `PREPARE name AS body`, with the name optionally quoted.
+    let at = skip_space(bytes, end);
+    let (name, after) = if bytes.get(at) == Some(&b'"') {
+        let close = skip_quoted(bytes, at);
+        (&sql[at + 1..close.saturating_sub(1)], close)
+    } else {
+        let name_end = word_end(bytes, at)?;
+        (&sql[at..name_end], name_end)
+    };
+    let at = skip_space(bytes, after);
+    let as_end = word_end(bytes, at)?;
+    if !sql[at..as_end].eq_ignore_ascii_case("AS") {
+        return None;
+    }
+
+    let body = trim_leading(&sql[skip_space(bytes, as_end)..]);
+    if body.is_empty() || name.is_empty() {
+        return None;
+    }
+
+    Some((name, body))
+}
+
 /// The value of a variable a client reads at connect.
 ///
 /// Every one of these is a fact about a MariaDB the caller believes it is
@@ -683,6 +720,24 @@ mod tests {
         ] {
             assert_eq!(constant_select(sql), None, "{sql}");
         }
+    }
+
+    /// **`PREPARE name AS body` is read as a name and a statement**, and a
+    /// statement that is not one of those is `None`.
+    #[test]
+    fn a_sql_prepare_is_a_name_and_a_body() {
+        assert_eq!(
+            sql_prepare("PREPARE neword AS select 1"),
+            Some(("neword", "select 1"))
+        );
+        assert_eq!(
+            sql_prepare("prepare \"s1\" as select 1, 2"),
+            Some(("s1", "select 1, 2"))
+        );
+        assert_eq!(sql_prepare("PREPARE x"), None, "no AS");
+        assert_eq!(sql_prepare("PREPARE AS select 1"), None, "no name");
+        assert_eq!(sql_prepare("select 1"), None);
+        assert_eq!(sql_prepare("DEALLOCATE neword"), None);
     }
 
     /// The words of a statement skip literals, identifiers and comments, so a
