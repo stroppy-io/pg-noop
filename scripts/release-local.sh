@@ -30,6 +30,16 @@ if ! command -v docker >/dev/null 2>&1; then
     say "        musl toolchain: cargo build --release --target <target>"
     exit 1
 fi
+# The CLI being installed says nothing about the daemon: a host in a container,
+# or one whose service is not up, has the binary and no engine behind it.
+if ! docker info >/dev/null 2>&1; then
+    # The line that says why: `docker info` prints its client section first and
+    # the failure last, and the failure is the only part worth quoting.
+    reason=$(docker info 2>&1 | grep -iE "cannot|failed|denied|error|dial" | tail -1 || true)
+    say "FAILED: docker is installed but its daemon is not usable"
+    say "        ${reason:-docker info failed}"
+    exit 1
+fi
 
 # The version comes from the manifest, so the artifacts and the crate cannot
 # disagree.
