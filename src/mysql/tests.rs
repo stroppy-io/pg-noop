@@ -808,3 +808,63 @@ fn a_statement_is_classified_the_same_way_either_way() {
         }
     }
 }
+
+/// A column definition's name: the fifth length-encoded field of the packet.
+fn definition_name(packet: &[u8]) -> String {
+    let mut r = Reader::new(packet);
+    for _ in 0..4 {
+        r.lenenc_bytes().expect("a definition field");
+    }
+
+    String::from_utf8(r.lenenc_bytes().expect("the name").to_vec()).expect("utf-8")
+}
+
+/// The value of a one-column row packet: its body, without the length prefixes
+/// this server never has more than one of in a row.
+fn row_value(packet: &[u8]) -> String {
+    let mut r = Reader::new(packet);
+    let value = r.lenenc_bytes().expect("a value");
+
+    String::from_utf8(value.to_vec()).expect("utf-8")
+}
+
+/// **The TPC-C shapes are answered as the rules say**, and the counters behind
+/// them move when a transaction runs.
+///
+/// The counters are process-wide and other tests in this binary count
+/// transactions too, so what is pinned here is the shape and that the numbers
+/// only ever grow; the exact arithmetic is pinned in `tests/mysql_wire.rs`,
+/// where each test owns a server process.
+#[test]
+fn the_tpcc_rules_answer_with_numbers() {
+    let mut c = connected(CAPS);
+
+    // `select sum(d_next_o_id) from district`: one column, one row, a number.
+    let packets = round_trip(&mut c, &query("select sum(d_next_o_id) from district"));
+    let (columns, rows, status) = result_set(&packets);
+    assert_eq!((columns, rows, status), (1, 1, AUTOCOMMIT));
+    let before: u64 = row_value(&packets[2]).parse().expect("a number");
+
+    // A NewOrder moves it by one.
+    round_trip(&mut c, &query("call NEWORD(1, 2, 3, 4)"));
+    let packets = round_trip(&mut c, &query("SELECT SUM(D_NEXT_O_ID) FROM TPCC_DISTRICT"));
+    let after: u64 = row_value(&packets[2]).parse().expect("a number");
+    assert!(after > before, "{after} does not follow {before}");
+
+    // `show global status` answers the two counters, and a LIKE filter selects.
+    let packets = round_trip(&mut c, &query("show global status"));
+    let (columns, rows, _) = result_set(&packets);
+    assert_eq!((columns, rows), (2, 2), "{packets:?}");
+
+    let packets = round_trip(&mut c, &query("show global status like 'Com_commit'"));
+    let (columns, rows, _) = result_set(&packets);
+    assert_eq!((columns, rows), (2, 1), "only the filtered counter");
+    let name = definition_name(&packets[1]);
+    assert_eq!(name, "Variable_name");
+
+    // A stored procedure's OUT parameters read back as numbers.
+    let packets = round_trip(&mut c, &query("select @neword_out, @d_next_o_id"));
+    let (columns, rows, _) = result_set(&packets);
+    assert_eq!((columns, rows), (2, 1));
+    assert_eq!(row_value(&packets[3]), "1", "the first variable");
+}

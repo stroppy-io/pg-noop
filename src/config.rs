@@ -29,6 +29,14 @@ struct CliArgs {
     #[arg(long, env = "PGNOOP_WORKERS")]
     workers: Option<usize>,
 
+    /// Warehouses the TPCC schema is said to have (districts = 10 x this)
+    #[arg(long, env = "PGNOOP_WAREHOUSES")]
+    warehouses: Option<u64>,
+
+    /// Print the TPCC counters on stderr every N seconds (0 = never)
+    #[arg(long, env = "PGNOOP_STATS_EVERY")]
+    stats_every: Option<u64>,
+
     /// I/O backend: `uring` or `epoll`. Both are shard-per-core and share the
     /// sans-io codec; they differ only in how bytes are moved. Kept selectable
     /// so the two can be measured against each other on one binary. `uring` is
@@ -44,11 +52,19 @@ struct FileConfig {
     mysql_port: Option<u16>,
     workers: Option<usize>,
     io: Option<String>,
+    warehouses: Option<u64>,
+    stats_every: Option<u64>,
 }
 
 pub struct Config {
     pub host: String,
     pub port: u16,
+    /// Warehouses the TPCC schema is said to have: `sum(d_next_o_id)` is 3001
+    /// per district and ten districts per warehouse.
+    pub warehouses: u64,
+    /// How often to print the TPCC counters on stderr, in seconds. Zero is off:
+    /// a benchmark's stderr is read by whoever runs it, not by the server.
+    pub stats_every: u64,
     /// The MySQL port, when one is served. Off by default: a server that opens a
     /// second port nobody asked for is one an operator has to remember to close.
     pub mysql_port: Option<u16>,
@@ -215,6 +231,11 @@ impl Config {
                 .unwrap_or_else(|| "0.0.0.0".to_string()),
             port: cli.port.or(file.port).unwrap_or(5432),
             mysql_port: cli.mysql_port.or(file.mysql_port),
+            warehouses: cli
+                .warehouses
+                .or(file.warehouses)
+                .unwrap_or(crate::tpcc::DEFAULT_WAREHOUSES),
+            stats_every: cli.stats_every.or(file.stats_every).unwrap_or(0),
             workers: cli.workers.or(file.workers).unwrap_or(default_workers),
             io: cli
                 .io
