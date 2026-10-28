@@ -1,34 +1,15 @@
 //! A sans-io PostgreSQL wire codec.
-//!
-//! # Why sans-io
-//!
-//! The protocol here does NO I/O. It is `(&[u8] in, &mut Vec<u8> out)` over a
-//! state machine, so who reads the bytes and who writes them is somebody else's
-//! decision -- epoll today, io_uring next, a unit test in between.
-//!
-//! That is not architectural taste, it is the fix for a measured defect. While
-//! pgwire owned the socket it flushed each backend message as it produced them,
-//! so pg-noop answered every query with THREE `sendto` calls -- BindComplete(5
-//! bytes), DataRow+CommandComplete(26), ReadyForQuery(6) -- where PostgreSQL
-//! writes the same 37 bytes once. Three syscalls and three wakeups per query is
-//! why a server that executes nothing was losing to a database that executes
-//! everything. A codec that only appends to a buffer cannot flush early: the
-//! caller decides, and it decides once per read.
-//!
-//! # What it is not
-//!
-//! Not a PostgreSQL. It answers structurally: a SELECT it cannot resolve gets
-//! one stub row of `1`s, DML gets a tag claiming one row. The one thing it does
-//! track is the schema, because a client that creates a table and then selects
-//! from it must see its own column names back.
+//! `Conn::advance` consumes bytes and appends responses without touching a socket,
+//! so each read batch produces at most one write.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::handler::{CatalogView, CopyDirection, CopyFormat, PlanKind, PreparedPlan};
 
-/// Frontend messages the blackhole understands. Anything else is consumed and
-/// answered as though it succeeded, which is the whole contract.
+/// Frontend messages the blackhole understands.
+/// Anything else is consumed and answered as though it succeeded, which is the whole
+/// contract.
 mod tag {
     pub const QUERY: u8 = b'Q';
     pub const PARSE: u8 = b'P';
@@ -39,36 +20,35 @@ mod tag {
     pub const FLUSH: u8 = b'H';
     pub const CLOSE: u8 = b'C';
     pub const TERMINATE: u8 = b'X';
-    /// Frontend COPY messages. Only reachable once the backend has sent
-    /// `CopyInResponse`, which is what puts the connection into `Phase::CopyIn`.
+    /// Frontend COPY messages.
+    /// Only reachable once the backend has sent `CopyInResponse`, which is what puts
+    /// the connection into `Phase::CopyIn`.
     pub const COPY_DATA: u8 = b'd';
     pub const COPY_DONE: u8 = b'c';
     pub const COPY_FAIL: u8 = b'f';
 
-    /// Whether a message belongs to the extended protocol, which is what
-    /// decides how an error in it ends. PostgreSQL's `SocketBackend` marks
-    /// exactly these as `doing_extended_query_message`.
+    /// Whether a message belongs to the extended protocol, which is what decides how an
+    /// error in it ends.
     pub fn is_extended(t: u8) -> bool {
         matches!(t, PARSE | BIND | DESCRIBE | EXECUTE | CLOSE | FLUSH)
     }
 }
 
-/// Largest message this server will frame. PostgreSQL's own limit is 1 GB; a
-/// blackhole has no reason to buffer anything near it, and an unbounded value is
-/// how a malformed length becomes an allocation.
+/// Largest message this server will frame.
+/// PostgreSQL's own limit is 1 GB; a blackhole has no reason to buffer anything near
+/// it, and an unbounded value is how a malformed length becomes an allocation.
 const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 
 /// The longest StartupMessage accepted, matching PostgreSQL's own
-/// `PQ_MAX_STARTUP_PACKET_LENGTH`. A startup packet carries parameters, not a
-/// query, so it needs nothing like `MAX_MESSAGE`.
+/// `PQ_MAX_STARTUP_PACKET_LENGTH`.
 const MAX_STARTUP: usize = 10000;
 
 /// PostgreSQL's own wording for a statement inside a failed transaction.
 const ABORTED: &str =
     "current transaction is aborted, commands ignored until end of transaction block";
 
-/// The statements PostgreSQL still accepts in a failed transaction: the ones
-/// that end it, and the empty one, which has nothing in it to refuse.
+/// The statements PostgreSQL still accepts in a failed transaction: the ones that end
+/// it, and the empty one, which has nothing in it to refuse.
 fn ends_transaction(kind: &PlanKind) -> bool {
     matches!(
         kind,
@@ -76,49 +56,29 @@ fn ends_transaction(kind: &PlanKind) -> bool {
     )
 }
 
-/// Where a connection is in its life. The startup exchange is unframed and has
-/// to be recognised by shape, not by a tag byte.
+/// Where a connection is in its life.
+/// The startup exchange is unframed and has to be recognised by shape, not by a tag
+/// byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Startup,
     Query,
-    /// Between `CopyInResponse` and `CopyDone`/`CopyFail`. The client is
-    /// streaming rows and the only messages that mean anything are `d`, `c` and
-    /// `f`; a query arriving here is a client that ignored the protocol.
-    ///
-    /// The row count travels because `CommandComplete` must report it: PostgreSQL
-    /// answers `COPY n`, and a client that loads 10000 rows and is told `COPY 0`
-    /// has been lied to in a way it can see.
-    ///
-    /// `format` travels because the count depends on it. In text format a row
-    /// is a line, in CSV a line outside quotes, and in binary there are no
-    /// lines at all -- `pgx.CopyFrom` encodes field lengths and payload bytes,
-    /// and `0x0a` appears wherever a value happens to contain it.
-    ///
-    /// `extended` travels because it decides how the COPY ENDS. Entered from a
-    /// simple Query, CopyDone is answered with the tag and `ReadyForQuery`.
-    /// Entered from Execute, the client has already sent a Sync behind the
-    /// Execute and will send another behind CopyDone; PostgreSQL ignores the
-    /// first and answers the second, so CopyDone gets the tag alone.
+    /// Between `CopyInResponse` and `CopyDone`/`CopyFail`.
+    /// The client is streaming rows and the only messages that mean anything are `d`,
+    /// `c` and `f`; a query arriving here is a client that ignored the protocol.
     CopyIn {
         rows: u64,
         format: CopyFormat,
         extended: bool,
     },
-    /// After an error in an extended-protocol message. PostgreSQL discards
-    /// every message until `Sync`, then sends ONE `ReadyForQuery`; a driver
-    /// that pipelined Parse/Bind/Execute/Sync counts on that, because it has
-    /// already sent the rest of the batch and must not get answers for it.
-    ///
-    /// This codec used to answer the error and carry on, so a Query behind a
-    /// malformed Parse executed and both it and the Sync reported ready.
+    /// After an error in an extended-protocol message.
     AwaitingSync,
     Closed,
 }
 
-/// Where a binary COPY stream is, carried across CopyData messages: a
-/// position in the framing plus, where a length was declared, how much of it
-/// is still to arrive. Never the bytes themselves.
+/// Where a binary COPY stream is, carried across CopyData messages: a position in the
+/// framing plus, where a length was declared, how much of it is still to arrive.
+/// Never the bytes themselves.
 #[derive(Debug, Clone, Copy)]
 struct BinaryState {
     stage: BinaryStage,
@@ -154,8 +114,8 @@ enum BinaryStage {
 }
 
 impl BinaryStage {
-    /// The stage after one field of a tuple with `fields_left` to go, counting
-    /// the tuple when it was the last.
+    /// The stage after one field of a tuple with `fields_left` to go, counting the
+    /// tuple when it was the last.
     fn after_field(fields_left: u16, rows: &mut u64) -> BinaryStage {
         if fields_left <= 1 {
             *rows += 1;
@@ -168,23 +128,22 @@ impl BinaryStage {
     }
 }
 
-/// Where a text or CSV COPY stream is within its current line, carried
-/// across CopyData messages.
+/// Where a text or CSV COPY stream is within its current line, carried across CopyData
+/// messages.
 #[derive(Debug, Default, Clone, Copy)]
 struct LineState {
-    /// Bytes have arrived since the last row end: the last row, if the data
-    /// ends here, is this unterminated line.
+    /// Bytes have arrived since the last row end: the last row, if the data ends here,
+    /// is this unterminated line.
     line_open: bool,
     /// CSV: inside a quoted field, where a newline is data.
     in_quotes: bool,
-    /// Text: the previous byte was an unescaped backslash, so this one is
-    /// data whatever it is.
+    /// Text: the previous byte was an unescaped backslash, so this one is data whatever
+    /// it is.
     escaped: bool,
     /// A `\.` line was seen: the data is over and what follows is ignored.
     ended: bool,
-    /// The current line's length so far, and its first three bytes -- enough
-    /// to recognise `\.`, with or without a carriage return before the
-    /// newline.
+    /// The current line's length so far, and its first three bytes -- enough to
+    /// recognise `\.`, with or without a carriage return before the newline.
     line_len: usize,
     head: [u8; 3],
 }
@@ -212,8 +171,8 @@ enum TxStatus {
     Idle,
     /// `T`: a transaction block is open.
     InTransaction,
-    /// `E`: a transaction block is open and a statement in it failed. PostgreSQL
-    /// stays here until `ROLLBACK`, refusing everything else.
+    /// `E`: a transaction block is open and a statement in it failed.
+    /// PostgreSQL stays here until `ROLLBACK`, refusing everything else.
     Failed,
 }
 
@@ -230,16 +189,12 @@ impl TxStatus {
 /// A prepared statement: its plan and the parameter types Describe reports.
 struct Statement {
     plan: PreparedPlan,
-    /// One OID per `$n`, declared by Parse or completed from the text. This
-    /// used to be dropped at Parse and reported as zero, so a driver refused
-    /// to bind any parametrised statement: pgx `expected 0 arguments, got 1`,
-    /// rust-postgres `Parameters(1, 0)`.
+    /// One OID per `$n`, declared by Parse or completed from the text.
     params: Vec<u32>,
 }
 
-/// The result formats a Bind asked for: none (text), one for every column,
-/// or one per column. Collapsed at Bind so that the two shapes every driver
-/// sends -- nothing, or the same code for every column -- allocate nothing.
+/// The result formats a Bind asked for: none (text), one for every column, or one per
+/// column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Formats {
     All(i16),
@@ -258,8 +213,9 @@ impl Formats {
         }
     }
 
-    /// The format of column `i`. Past the end of a per-column list is text,
-    /// which is where PostgreSQL's `pq_getmsgint` would have read zero.
+    /// The format of column `i`.
+    /// Past the end of a per-column list is text, which is where PostgreSQL's
+    /// `pq_getmsgint` would have read zero.
     fn get(&self, i: usize) -> i16 {
         match self {
             Formats::All(code) => *code,
@@ -268,52 +224,33 @@ impl Formats {
     }
 }
 
-/// A portal: the statement it was bound to, the result formats the Bind
-/// asked for, and how far it has been read.
-///
-/// The statement itself, not its name. A portal used to look its statement
-/// up by name at Execute, so Close of the statement and a Parse reusing the
-/// name changed what an already-bound portal ran -- a SELECT portal became
-/// a BEGIN, or a COPY. PostgreSQL keeps the plan with the portal; the name
-/// is only how it was found at Bind. Shared, not cloned: a plan carries the
-/// SQL and its parsed pieces, and Bind is on the hot path.
+/// A portal: the statement it was bound to, the result formats the Bind asked for, and
+/// how far it has been read.
+/// The statement itself, not its name.
 struct Portal {
     statement: Arc<Statement>,
     formats: Formats,
-    /// Whether the portal has been read to its end. A plan answers at most
-    /// one row, so this is the whole cursor: Execute of a consumed portal
-    /// answers no row and `SELECT 0`, as PostgreSQL does for a portal already
-    /// fetched to its end. Execute used to replay the row every time.
+    /// Whether the portal has been read to its end.
     consumed: bool,
 }
 
 pub struct Conn {
     phase: Phase,
-    /// Prepared statements by name. "" is the unnamed statement, which clients
-    /// reuse constantly, so it is a normal entry rather than a special case.
+    /// Prepared statements by name.
+    /// "" is the unnamed statement, which clients reuse constantly, so it is a normal
+    /// entry rather than a special case.
     statements: HashMap<String, Arc<Statement>>,
-    /// Portals by name. "" is the unnamed portal, rebound by every query.
+    /// Portals by name.
+    /// "" is the unnamed portal, rebound by every query.
     portals: HashMap<String, Portal>,
     /// Where a binary COPY stream is, between CopyData messages.
-    ///
-    /// A `CopyData` message is a slice of the stream, not a row: pgx fills a
-    /// 64 KiB buffer and sends whatever fits, so a tuple can straddle two
-    /// messages and a message can end mid-field. Counting therefore has to
-    /// carry state -- a position in the framing and a count of bytes still to
-    /// discard, never the bytes themselves.
     copy_binary: BinaryState,
     /// Where a text or CSV COPY stream is within its current line.
     copy_lines: LineState,
-    /// What this connection has done in its open transaction, counted when it
-    /// commits and dropped if it rolls back.
+    /// What this connection has done in its open transaction, counted when it commits
+    /// and dropped if it rolls back.
     pending: crate::tpcc::Pending,
     /// The state `ReadyForQuery` reports, which is not a constant.
-    ///
-    /// pgxpool reads it: a connection that reports idle while a transaction is
-    /// open is one the pool will hand to another query with the transaction
-    /// still running underneath it, and PostgreSQL's own clients use the byte to
-    /// decide whether a failed statement can be retried in place. This server
-    /// answers `I` always, which is where that behaviour came from.
     tx_status: TxStatus,
 }
 
@@ -341,16 +278,12 @@ impl Conn {
     }
 
     /// True until a startup handshake has completed.
-    ///
-    /// The phase a client is in while it may legitimately have sent nothing at
-    /// all: a TCP connection that exists is not a client yet, and the server
-    /// cannot tell a slow driver from an idle socket that will never speak.
-    /// Callers use this to bound how long that state may last.
     pub fn awaiting_startup(&self) -> bool {
         self.phase == Phase::Startup
     }
 
-    /// Answer a `COPY ... FROM STDIN` and wait for rows.
+    /// Answer a `COPY ...
+    /// FROM STDIN` and wait for rows.
     fn enter_copy_in(
         &mut self,
         columns: usize,
@@ -381,11 +314,6 @@ impl Conn {
     }
 
     /// An ErrorResponse, and the state it leaves behind.
-    ///
-    /// A failed statement inside a transaction block puts the SESSION in a
-    /// failed transaction -- `E` until `ROLLBACK` -- because that is what
-    /// PostgreSQL does and what a poolering client reads the byte to find out.
-    /// An error outside a transaction leaves it idle.
     fn error(&mut self, out: &mut Vec<u8>, code: &str, message: &str) {
         if self.tx_status == TxStatus::InTransaction {
             self.tx_status = TxStatus::Failed;
@@ -394,10 +322,9 @@ impl Conn {
         error_response(out, code, message);
     }
 
-    /// An error, and the recovery the protocol prescribes for where it
-    /// happened. In the simple protocol the reply ends with `ReadyForQuery`
-    /// and the next message runs. In the extended protocol nothing more is
-    /// said until the client's `Sync`, and nothing in between is executed.
+    /// An error, and the recovery the protocol prescribes for where it happened.
+    /// In the simple protocol the reply ends with `ReadyForQuery` and the next message
+    /// runs.
     fn refuse(&mut self, extended: bool, out: &mut Vec<u8>, code: &str, message: &str) {
         self.error(out, code, message);
 
@@ -409,20 +336,17 @@ impl Conn {
     }
 
     /// What a statement did to the transaction state.
-    ///
-    /// `BEGIN` opens one, and inside an open one it is a warning that changes
-    /// nothing; `COMMIT` and `ROLLBACK` close it, failed or not. A statement
-    /// inside a failed transaction never reaches here: it is refused first,
-    /// with 25P02, which is what a client reading `E` expects.
+    /// `BEGIN` opens one, and inside an open one it is a warning that changes nothing;
+    /// `COMMIT` and `ROLLBACK` close it, failed or not.
     fn note_transaction(&mut self, kind: &PlanKind, failed: bool) {
         match kind {
             PlanKind::Begin if self.tx_status == TxStatus::Idle => {
                 self.tx_status = TxStatus::InTransaction
             }
             PlanKind::Commit if failed => {
-                // Committing a failed transaction rolls it back, and the tag
-                // says so: its statements never happened, and the counter says
-                // the same thing the tag does.
+                // Committing a failed transaction rolls it back, and the tag says so:
+                // its statements never happened, and the counter says the same thing
+                // the tag does.
                 self.tx_status = TxStatus::Idle;
                 self.pending.discard();
                 crate::tpcc::note_rollback();
@@ -441,42 +365,28 @@ impl Conn {
     }
 
     /// Note what a statement does to the counters.
-    ///
-    /// A TPC-C transaction is counted when it COMMITS: the statement's kind is
-    /// noted here, and folded into the counters by `note_transaction` at COMMIT
-    /// or, outside a transaction, by the autocommit fold below. A statement that
-    /// is rolled back is counted by nothing.
     fn note_statement(&mut self, sql: &str) {
         let Some(kind) = crate::tpcc::statement_kind(sql) else {
             return;
         };
         self.pending.note(kind);
 
-        // **Autocommit: a counted statement outside a transaction is one
-        // transaction of its own**, and commits when it is answered -- the same
-        // rule MySQL follows, so a client that never says BEGIN still moves the
-        // commit counter a TPM check reads.
+        // Autocommit: a counted statement outside a transaction is one transaction of
+        // its own, and commits when it is answered -- the same rule MySQL follows, so a
+        // client that never says BEGIN still moves the commit counter a TPM check reads
         if self.tx_status == TxStatus::Idle {
             self.pending.commit();
         }
     }
 
-    /// Whether the session is in a failed transaction, where everything but
-    /// COMMIT and ROLLBACK is refused.
+    /// Whether the session is in a failed transaction, where everything but COMMIT and
+    /// ROLLBACK is refused.
     fn failed(&self) -> bool {
         self.tx_status == TxStatus::Failed
     }
 
     /// Count rows in a text or CSV COPY stream, carrying the line state.
-    ///
-    /// A row is a line. Newline bytes were counted, which is wrong at both
-    /// ends: the final line need not be terminated -- `a\nb\nc` is three
-    /// rows to PostgreSQL and was two here -- and in CSV a newline inside
-    /// quotes is field data -- `1,"hello\nworld"\n2,x\n` is two rows and was
-    /// three. In text format a backslash escapes the byte after it, a newline
-    /// included, and a line of exactly `\.` ends the data. All of that state
-    /// crosses CopyData boundaries, because a message is a slice of the
-    /// stream and not a row.
+    /// A row is a line.
     fn count_lines(&mut self, body: &[u8], csv: bool) {
         let ls = &mut self.copy_lines;
         let mut rows = 0u64;
@@ -531,24 +441,6 @@ impl Conn {
     }
 
     /// Count tuples in a binary COPY stream, without buffering it.
-    ///
-    /// The framing is PostgreSQL's: an 11-byte signature, an int32 of flags,
-    /// an int32 extension length and that many bytes of extension, then per
-    /// tuple an int16 field count followed by each field's int32 length (-1
-    /// for NULL) and its bytes, ending with an int16 -1 trailer. A field's
-    /// length is what makes this countable at all -- newline bytes inside a
-    /// payload are just bytes, which is exactly why counting them reported 2
-    /// for a 3-row load.
-    ///
-    /// The stream is walked as a stage machine over a count of bytes still to
-    /// discard. It used to be gathered a whole tuple at a time behind a 1 MiB
-    /// ceiling, which refused a valid 2 MiB bytea field and closed the
-    /// connection with no ErrorResponse. Field lengths are int32 and a valid
-    /// row may exceed any ceiling, so nothing is gathered but a partial
-    /// length prefix: payload and extension alike are skipped as they arrive.
-    ///
-    /// `Err` is a framing violation: the COPY is over and the caller says so
-    /// with PostgreSQL's SQLSTATE for a bad COPY file.
     fn count_binary(&mut self, body: &[u8]) -> Result<(), &'static str> {
         const SIGNATURE: &[u8; 11] = b"PGCOPY\n\xff\r\n\0";
 
@@ -617,8 +509,9 @@ impl Conn {
                     let fields = i16::from_be_bytes([st.prefix[0], st.prefix[1]]);
                     st.prefix_len = 0;
 
-                    // The trailer: an int16 -1 ends the stream. Not a row. Any
-                    // other negative count is not a trailer, it is malformed.
+                    // The trailer: an int16 -1 ends the stream.
+                    // Not a row.
+                    // Any other negative count is not a trailer, it is malformed.
                     if fields == -1 {
                         st.stage = BinaryStage::Done;
                         continue;
@@ -650,8 +543,8 @@ impl Conn {
                     let len = i32::from_be_bytes([p[0], p[1], p[2], p[3]]);
                     st.prefix_len = 0;
 
-                    // -1 is NULL: a length with no bytes after it. Below that
-                    // is not a length at all.
+                    // -1 is NULL: a length with no bytes after it.
+                    // Below that is not a length at all.
                     if len < -1 {
                         return Err("invalid field size in COPY data");
                     }
@@ -682,8 +575,8 @@ impl Conn {
                     };
                 }
 
-                // The trailer ended the stream; a writer that keeps going is
-                // not writing this format.
+                // The trailer ended the stream; a writer that keeps going is not
+                // writing this format.
                 BinaryStage::Done => return Err("received copy data after EOF marker"),
             }
         }
@@ -696,10 +589,7 @@ impl Conn {
     }
 
     /// Consume every COMPLETE message in `input`, appending replies to `out`.
-    ///
-    /// Returns how many bytes were consumed. A partial message at the end is
-    /// left alone -- the caller keeps it and calls again with more. Nothing is
-    /// written to a socket here, which is the point.
+    /// Returns how many bytes were consumed.
     pub fn advance(&mut self, input: &[u8], out: &mut Vec<u8>, catalog: &CatalogView) -> usize {
         let mut pos = 0usize;
 
@@ -712,9 +602,8 @@ impl Conn {
 
             let consumed = match self.phase {
                 Phase::Startup => self.startup(rest, out),
-                // A COPY in flight is framed the same way a query is; which
-                // messages MEAN anything is `dispatch`'s business, not the
-                // framer's.
+                // A COPY in flight is framed the same way a query is; which messages
+                // MEAN anything is `dispatch`'s business, not the framer's.
                 Phase::Query | Phase::CopyIn { .. } | Phase::AwaitingSync => {
                     self.message(rest, out, catalog)
                 }
@@ -736,16 +625,7 @@ impl Conn {
         }
 
         // The same guard the framed path carries at `dispatch`, and it was missing
-        // here. A negative i32 cast straight to usize becomes enormous, so
-        // `input.len() < len` is always true, this returns "incomplete", and the
-        // caller keeps every later byte in its pending buffer waiting for a frame
-        // that can never arrive -- unbounded memory from one malformed startup
-        // packet, before any authentication.
-        //
-        // `MAX_STARTUP` rather than `MAX_MESSAGE`: a StartupMessage carries a
-        // parameter list, not a query, and PostgreSQL itself refuses one over
-        // 10000 bytes (`PQ_MAX_STARTUP_PACKET_LENGTH` in backend/libpq/pqcomm.c).
-        // Matching that is a tighter bound than 16 MiB and is the documented one.
+        // here.
         let declared = i32::from_be_bytes(input[0..4].try_into().ok()?);
         if !(8..=MAX_STARTUP as i32).contains(&declared) {
             self.phase = Phase::Closed;
@@ -772,13 +652,8 @@ impl Conn {
                 self.phase = Phase::Closed;
                 Some(len)
             }
-            // A StartupMessage: its code is the protocol version, major in
-            // the high half. Every code that was not SSL, GSS or Cancel used
-            // to be welcomed -- 4.0, 1.0, an arbitrary 123 -- straight to
-            // AuthenticationOk. PostgreSQL speaks 3.x and refuses the rest
-            // with a FATAL before anyone is authenticated. A newer 3.x minor
-            // is accepted as 3.0, which is what PostgreSQL negotiates it
-            // down to.
+            // A StartupMessage: its code is the protocol version, major in the high
+            // half.
             code if code >> 16 != 3 => {
                 let (major, minor) = (code >> 16, code & 0xffff);
                 fatal_response(
@@ -794,8 +669,8 @@ impl Conn {
             _ => {
                 // AuthenticationOk
                 msg(out, b'R', |b| b.extend_from_slice(&0i32.to_be_bytes()));
-                // The few ParameterStatus values a driver reads before it will
-                // talk. pgx wants server_version and client_encoding at minimum.
+                // The few ParameterStatus values a driver reads before it will talk.
+                // pgx wants server_version and client_encoding at minimum.
                 for (k, v) in [
                     ("server_version", "17.0 (pg-noop)"),
                     ("client_encoding", "UTF8"),
@@ -830,11 +705,7 @@ impl Conn {
         let t = input[0];
         let declared = i32::from_be_bytes(input[1..5].try_into().ok()?);
 
-        // The length is client-controlled. A negative i32 cast straight to usize
-        // becomes enormous, `input.len() < 1 + len` is then always true, and the
-        // connection stalls forever while the caller appends every later byte to
-        // its pending buffer -- an unbounded allocation from one malformed
-        // frame. Reject the frame instead.
+        // The length is client-controlled.
         if !(4..=MAX_MESSAGE as i32).contains(&declared) {
             self.phase = Phase::Closed;
 
@@ -849,23 +720,20 @@ impl Conn {
         let body = &input[5..1 + len];
         let total = 1 + len;
 
-        // Past this point the message is FRAMED: its bytes are all here, so the
-        // only correct outcomes are "handled" and "handled badly". Returning
-        // None would mean "incomplete, keep the bytes", which for a complete
-        // frame is a permanent stall. `handled` runs the body and its `?` are
-        // confined to it.
+        // Past this point the message is FRAMED: its bytes are all here, so the only
+        // correct outcomes are "handled" and "handled badly".
         let handled = self.dispatch(t, body, out, catalog);
         if handled.is_none() {
-            // Malformed body inside a well-framed message: answer an error and
-            // consume it, so the stream stays synchronised.
+            // Malformed body inside a well-framed message: answer an error and consume
+            // it, so the stream stays synchronised.
             self.refuse(tag::is_extended(t), out, "08P01", "malformed message body");
         }
 
         Some(total)
     }
 
-    /// The body of one framed message. Every `?` here means "this body is
-    /// malformed", never "wait for more bytes".
+    /// The body of one framed message.
+    /// Every `?` here means "this body is malformed", never "wait for more bytes".
     fn dispatch(
         &mut self,
         t: u8,
@@ -873,10 +741,7 @@ impl Conn {
         out: &mut Vec<u8>,
         catalog: &CatalogView,
     ) -> Option<()> {
-        // Skipping to Sync: only Sync ends it, and only Terminate is otherwise
-        // heard. Everything else is consumed unanswered -- no BindComplete for
-        // a Bind, no ParseComplete for a Parse -- because the driver has
-        // already stopped counting on them.
+        // Skipping to Sync: only Sync ends it, and only Terminate is otherwise heard.
         if self.phase == Phase::AwaitingSync {
             match t {
                 tag::SYNC if body.is_empty() => {
@@ -894,8 +759,8 @@ impl Conn {
             return Some(());
         }
 
-        // A COPY in flight has its own vocabulary, and everything outside it is
-        // a violation rather than a statement to run.
+        // A COPY in flight has its own vocabulary, and everything outside it is a
+        // violation rather than a statement to run.
         if let Phase::CopyIn {
             format, extended, ..
         } = self.phase
@@ -914,10 +779,9 @@ impl Conn {
                 // EmptyQueryResponse where PostgreSQL answers 08P01.
                 let (sql, end) = cstr_at(body, 0)?;
                 exhausted(body, end)?;
-                // **`PREPARE name AS body` registers a statement**, which is how
-                // a SQL-preparing client (HammerDB's PostgreSQL TPC-C at login)
-                // makes one: the name has to be found by a later Bind, or every
-                // execution is 26000.
+                // `PREPARE name AS body` registers a statement, which is how a
+                // SQL-preparing client (HammerDB's PostgreSQL TPC-C at login) makes
+                // one: the name has to be found by a later Bind, or every execution is
                 if let Some((name, body)) = crate::sql::sql_prepare(sql) {
                     if self.statements.contains_key(name) {
                         self.error(
@@ -939,9 +803,9 @@ impl Conn {
                     return Some(());
                 }
 
-                // **A failure the client asked for is an error**, so its own
-                // error handling and its rollback run -- and a rollback counts
-                // nothing. An OK here made every injected rollback a commit.
+                // A failure the client asked for is an error, so its own error handling
+                // and its rollback run -- and a rollback counts nothing.
+                // An OK here made every injected rollback a commit.
                 if let Some(failure) = crate::tpcc::failure(sql) {
                     let (code, message) = match failure {
                         crate::tpcc::Failure::Signal(code) => {
@@ -966,38 +830,15 @@ impl Conn {
 
                 let plan = PreparedPlan::build(sql);
 
-                // A failed transaction runs nothing until it is ended. This
-                // used to answer the statement anyway, so a SELECT after an
-                // error got its row and a BEGIN flipped the state to `T`
-                // without any ROLLBACK.
+                // A failed transaction runs nothing until it is ended.
                 if self.failed() && !ends_transaction(&plan.kind) {
                     self.refuse(false, out, "25P02", ABORTED);
 
                     return Some(());
                 }
 
-                // **COPY is decided by its direction, once, in the plan.**
-                //
-                // `COPY ... FROM STDIN` is a conversation, not an answer: the
-                // client sends the statement and then WAITS for `CopyInResponse`
-                // before streaming rows. This path used to fall into
-                // `PlanKind::FromText` and reply `CommandComplete("SELECT 0")` --
-                // so the client believed the statement had finished and then
-                // wrote `CopyData` into a connection that had moved on. The
-                // stream desynchronises and every later reply is read against the
-                // wrong message.
-                //
-                // `COPY ... TO STDOUT` and `COPY ... FROM '/path'` do not talk
-                // back, but they are COPY statements and the tag a client checks
-                // is `COPY n`. `SELECT 0` for a COPY is a reply no client can
-                // accept: pgx's `CopyTo` reads the tag and reports it, and
-                // stroppy's load path counts rows from `CopyFrom`'s.
-                //
-                // The pgwire handler this codec replaced implemented the
-                // FROM STDIN half (`handler.rs`, `Response::CopyIn` /
-                // `on_copy_data` / `on_copy_done`), so that was a regression
-                // introduced by the rewrite rather than a gap that was always
-                // there. Found in review.
+                // COPY is decided by its direction, once, in the plan.
+                // `COPY ...
                 if let PlanKind::Copy {
                     direction,
                     columns,
@@ -1011,17 +852,14 @@ impl Conn {
                             return Some(());
                         }
                         CopyDirection::ToStdout => {
-                            // The server would stream rows here. A blackhole has
-                            // none, so it says so in the protocol's own words:
-                            // `CopyOutResponse`, then `CopyDone` with no DataRow
-                            // in between, then `COPY 0`.
+                            // The server would stream rows here.
                             copy_out_response(out);
                             copy_done(out);
                             complete(out, "COPY", Some(0));
                         }
                         CopyDirection::FromFile => {
-                            // No conversation: the server reads a path. It read
-                            // nothing, so it copied nothing.
+                            // No conversation: the server reads a path.
+                            // It read nothing, so it copied nothing.
                             complete(out, "COPY", Some(0));
                         }
                     }
@@ -1031,10 +869,9 @@ impl Conn {
                     return Some(());
                 }
 
-                // A statement that opens, ends or fails a transaction changes
-                // what the NEXT `ReadyForQuery` must say, and it is noted before
-                // the answer is written so that the byte and the statement
-                // cannot disagree.
+                // A statement that opens, ends or fails a transaction changes what the
+                // NEXT `ReadyForQuery` must say, and it is noted before the answer is
+                // written so that the byte and the statement cannot disagree.
                 let failed = self.failed();
                 self.note_transaction(&plan.kind, failed);
                 self.note_statement(&plan.sql);
@@ -1056,8 +893,8 @@ impl Conn {
 
             tag::COPY_DATA | tag::COPY_DONE | tag::COPY_FAIL => {
                 // A COPY message outside a COPY is the client desynchronised, not
-                // something to absorb quietly: absorbing it is what lets the two
-                // sides disagree for the rest of the connection.
+                // something to absorb quietly: absorbing it is what lets the two sides
+                // disagree for the rest of the connection.
                 self.error(out, "08P01", "COPY message outside a COPY operation");
                 self.ready(out);
             }
@@ -1076,12 +913,8 @@ impl Conn {
                     return Some(());
                 }
 
-                // A named statement is not replaced in place: PostgreSQL
-                // answers 42P05, and a driver that wants the name back closes
-                // it first. Only the unnamed statement, which every driver
-                // reuses for every query, is overwritten. Replacing silently
-                // also changed what an already-bound portal would execute,
-                // since a portal refers to its statement by name.
+                // A named statement is not replaced in place: PostgreSQL answers 42P05,
+                // and a driver that wants the name back closes it first.
                 if !name.is_empty() && self.statements.contains_key(name) {
                     self.refuse(
                         true,
@@ -1108,16 +941,13 @@ impl Conn {
 
             tag::BIND => {
                 // [portal][stmt][n_pfmt][pfmt..][n_params][(len, bytes)..]
-                // [n_rfmt][rfmt..]. The values are never looked at; the
-                // counts and the result formats are.
+                // [n_rfmt][rfmt..].
                 let (portal, after) = cstr_at(body, 0)?;
                 let (stmt, after) = cstr_at(body, after)?;
                 let bind = bind_tail(body, after)?;
 
-                // A statement that was never prepared -- or was closed -- is
-                // not bound to; it is reported. Answering BindComplete here
-                // let a driver with a stale statement cache run against a
-                // statement the server did not have.
+                // A statement that was never prepared -- or was closed -- is not bound
+                // to; it is reported.
                 let Some(statement) = self.statements.get(stmt) else {
                     self.refuse(
                         true,
@@ -1168,10 +998,8 @@ impl Conn {
                 }
 
                 // A per-column result-format list has to be one per column.
-                // Two codes for a one-column query answered BindComplete;
-                // PostgreSQL refuses it. Only a list longer than one is
-                // checked, so the shapes every driver sends never resolve the
-                // columns here.
+                // Two codes for a one-column query answered BindComplete; PostgreSQL
+                // refuses it.
                 if bind.result_formats > 1 {
                     let columns = match plan.kind {
                         PlanKind::SelectMeta { .. }
@@ -1194,8 +1022,8 @@ impl Conn {
                     }
                 }
 
-                // A named portal is not rebound in place either: 42P03, as
-                // PostgreSQL answers, until it is closed.
+                // A named portal is not rebound in place either: 42P03, as PostgreSQL
+                // answers, until it is closed.
                 if !portal.is_empty() && self.portals.contains_key(portal) {
                     self.refuse(
                         true,
@@ -1207,11 +1035,8 @@ impl Conn {
                     return Some(());
                 }
 
-                // One String allocation per query if done unconditionally, and
-                // a driver binds the unnamed portal to the SAME statement
-                // forever. The formats are replaced in place: for every
-                // driver's usual shapes that is a copy of an enum, not an
-                // allocation.
+                // One String allocation per query if done unconditionally, and a driver
+                // binds the unnamed portal to the SAME statement forever.
                 let statement = Arc::clone(statement);
                 match self.portals.get_mut(portal) {
                     Some(cur) => {
@@ -1234,8 +1059,7 @@ impl Conn {
             }
 
             tag::DESCRIBE => {
-                // ['S'|'P'][name]. Anything else used to be read as a portal;
-                // PostgreSQL refuses it.
+                // ['S'|'P'][name].
                 let kind = subtype(body)?;
                 let (name, end) = cstr_at(body, 1)?;
                 exhausted(body, end)?;
@@ -1256,9 +1080,9 @@ impl Conn {
                     return Some(());
                 };
 
-                // PostgreSQL refuses to describe a statement that returns rows
-                // inside a failed transaction, and only those: a client that
-                // blindly describes its ROLLBACK must still be able to send it.
+                // PostgreSQL refuses to describe a statement that returns rows inside a
+                // failed transaction, and only those: a client that blindly describes
+                // its ROLLBACK must still be able to send it.
                 if self.failed()
                     && matches!(
                         plan.kind,
@@ -1286,20 +1110,18 @@ impl Conn {
             }
 
             tag::EXECUTE => {
-                // [portal][max_rows:i32]. Zero is no limit.
+                // [portal][max_rows:i32].
+                // Zero is no limit.
                 let (name, after) = cstr_at(body, 0)?;
                 let max_rows = i32::from_be_bytes(body.get(after..after + 4)?.try_into().ok()?);
                 exhausted(body, after + 4)?;
                 let failed = self.failed();
 
-                // No clone: `answer` is a free function precisely so the plan can
-                // stay borrowed out of `self`. It used to be a method, which made
-                // the borrow checker demand `.cloned()` -- a DEEP copy of the sql
-                // String and the parsed table/column Vecs, on every Execute.
+                // No clone: `answer` is a free function precisely so the plan can stay
+                // borrowed out of `self`.
                 // The plan is the portal's own, so one lookup finds both.
                 let Some(portal) = self.portals.get_mut(name) else {
-                    // Executing a portal that was never bound used to fabricate
-                    // `SELECT 0`. PostgreSQL reports it, and so does this.
+                    // PostgreSQL reports it, and so does this.
                     self.refuse(
                         true,
                         out,
@@ -1318,10 +1140,9 @@ impl Conn {
                     return Some(());
                 }
 
-                // A COPY that streams from the client needs the connection to
-                // change phase, which is not something a free function writing
-                // into `out` can do. Read what it is first, answer, then enter
-                // the phase.
+                // A COPY that streams from the client needs the connection to change
+                // phase, which is not something a free function writing into `out` can
+                // do.
                 let streams_rows = match &p.kind {
                     PlanKind::Copy {
                         direction: CopyDirection::FromStdin,
@@ -1345,9 +1166,9 @@ impl Conn {
                     },
                 );
 
-                // The extended protocol's Execute is where a statement actually
-                // runs, so it is where the transaction state changes. `SYNC` is
-                // what asks for the byte, later.
+                // The extended protocol's Execute is where a statement actually runs,
+                // so it is where the transaction state changes.
+                // `SYNC` is what asks for the byte, later.
                 self.note_transaction(&p.kind, failed);
                 self.note_statement(&p.sql);
 
@@ -1367,13 +1188,14 @@ impl Conn {
                 self.ready(out);
             }
 
-            // Flush means "send what you have". The caller writes `out` after
-            // this call returns, so there is nothing to do but not swallow it.
+            // Flush means "send what you have".
+            // The caller writes `out` after this call returns, so there is nothing to
+            // do but not swallow it.
             tag::FLUSH => exhausted(body, 0)?,
 
             tag::CLOSE => {
-                // ['S'|'P'][name], strictly: Close `X` answered CloseComplete
-                // where PostgreSQL answers 08P01.
+                // ['S'|'P'][name], strictly: Close `X` answered CloseComplete where
+                // PostgreSQL answers 08P01.
                 let kind = subtype(body)?;
                 let (name, end) = cstr_at(body, 1)?;
                 exhausted(body, end)?;
@@ -1393,16 +1215,7 @@ impl Conn {
     }
 
     /// One message while a COPY FROM STDIN is open.
-    ///
-    /// `d`, `c` and `f` are the conversation. `S` and `H` are ignored, as
-    /// PostgreSQL's `CopyGetData` ignores them, because libpq and rust-postgres
-    /// send a Sync behind the Execute that started the COPY without noticing
-    /// that it was one. Anything else is the client talking out of turn, and
-    /// PostgreSQL ends the COPY with a protocol violation rather than running
-    /// it -- a Query executed mid-COPY used to answer rows into a stream the
-    /// client was reading as COPY replies.
-    ///
-    /// How the COPY ends depends on how it began: see `Phase::CopyIn`.
+    /// `d`, `c` and `f` are the conversation.
     fn copy_message(
         &mut self,
         t: u8,
@@ -1417,10 +1230,9 @@ impl Conn {
             tag::COPY_DATA => {
                 if binary {
                     if let Err(violation) = self.count_binary(body) {
-                        // A stream that is not PostgreSQL's binary framing is
-                        // not counted, it is refused -- with the SQLSTATE the
-                        // server uses for a bad COPY file, and the recovery
-                        // the entry protocol prescribes.
+                        // A stream that is not PostgreSQL's binary framing is not
+                        // counted, it is refused -- with the SQLSTATE the server uses
+                        // for a bad COPY file, and the recovery the entry protocol
                         self.leave_copy_in();
                         self.refuse(extended, out, "22P04", violation);
                     }
@@ -1430,15 +1242,12 @@ impl Conn {
             }
 
             tag::COPY_DONE => {
-                // The end of a binary stream is checked against its framing;
-                // this used to answer `COPY n` whatever state it was in.
+                // The end of a binary stream is checked against its framing; this used
+                // to answer `COPY n` whatever state it was in.
                 if binary {
-                    // PostgreSQL's reader takes a clean EOF at a tuple
-                    // boundary as the end (`CopyFromBinaryOneRow`: "end of
-                    // file, or trailer"), so a missing trailer is complete;
-                    // no header is not a binary COPY at all; and an end
-                    // inside the header's extension or inside a tuple is
-                    // what it says.
+                    // PostgreSQL's reader takes a clean EOF at a tuple boundary as the
+                    // end (`CopyFromBinaryOneRow`: "end of file, or trailer"), so a
+                    // missing trailer is complete; no header is not a binary COPY at
                     let violation = match self.copy_binary.stage {
                         BinaryStage::FieldCount | BinaryStage::Done => None,
                         BinaryStage::Header => Some("COPY file signature not recognized"),
@@ -1457,9 +1266,9 @@ impl Conn {
                         return Some(());
                     }
                 } else {
-                    // A quote still open at the end is PostgreSQL's error for
-                    // it; a line still open is the last row, terminated by
-                    // the end of the data rather than a newline.
+                    // A quote still open at the end is PostgreSQL's error for it; a
+                    // line still open is the last row, terminated by the end of the
+                    // data rather than a newline.
                     if self.copy_lines.in_quotes {
                         self.leave_copy_in();
                         self.refuse(extended, out, "22P04", "unterminated CSV quoted field");
@@ -1481,23 +1290,23 @@ impl Conn {
                 self.leave_copy_in();
                 complete_raw(out, &format!("COPY {rows}"));
 
-                // Simple protocol: the statement is over, say so. Extended: the
-                // client's Sync behind CopyDone asks for the byte, later.
+                // Simple protocol: the statement is over, say so.
+                // Extended: the client's Sync behind CopyDone asks for the byte, later.
                 if !extended {
                     self.ready(out);
                 }
             }
 
             tag::COPY_FAIL => {
-                // The client is abandoning its own COPY. That is an error by the
-                // protocol's own definition, and answering it as success would
-                // tell a loader its data landed.
+                // The client is abandoning its own COPY.
+                // That is an error by the protocol's own definition, and answering it
+                // as success would tell a loader its data landed.
                 self.leave_copy_in();
                 self.refuse(extended, out, "57014", "COPY from stdin failed");
             }
 
-            // Sent behind the Execute by drivers that did not notice the
-            // statement was a COPY; PostgreSQL ignores both here.
+            // Sent behind the Execute by drivers that did not notice the statement was
+            // a COPY; PostgreSQL ignores both here.
             tag::SYNC | tag::FLUSH => {}
 
             tag::TERMINATE => self.phase = Phase::Closed,
@@ -1516,9 +1325,8 @@ impl Conn {
         Some(())
     }
 
-    /// The statement a Describe names, directly or through a portal, and the
-    /// result formats to describe it in. A statement has no portal and so no
-    /// formats: PostgreSQL reports text there, whatever a later Bind asks.
+    /// The statement a Describe names, directly or through a portal, and the result
+    /// formats to describe it in.
     fn described(&self, kind: u8, name: &str) -> Option<(&Statement, &Formats)> {
         if kind == b'S' {
             self.statements.get(name).map(|s| (&**s, &Formats::TEXT))
@@ -1528,18 +1336,11 @@ impl Conn {
     }
 }
 
-/// The rows and the completion tag for one plan. A FREE function, not a method:
-/// it never needed `self`, and being a method is what forced a deep clone of the
-/// plan at every Execute.
-///
-/// Returns whether the portal has now been read to its end. Only a plan that
-/// returns rows has an end to reach; the rest are done when they answer.
+/// The rows and the completion tag for one plan.
+/// A FREE function, not a method: it never needed `self`, and being a method is what
+/// forced a deep clone of the plan at every Execute.
 fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Run<'_>) -> bool {
-    // **The statements answered with a number are the TPC-C profile's.** A
-    // client reads the district sum before and after its window and reports the
-    // difference as NOPM, and reads `pg_stat_database` for TPM; without the
-    // profile those are empty result sets, because a server that states numbers
-    // it has no data for is manufacturing a measurement.
+    // The statements answered with a number are the TPC-C profile's.
     if let Some((name, value)) = crate::tpcc::number_query(&plan.sql) {
         return number_answer(out, run, name, value);
     }
@@ -1551,8 +1352,8 @@ fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Ru
     }
 
     match &plan.kind {
-        // **A constant select answers one row, and nothing else does.** The
-        // values are the statement's own: no data is involved, so the row is
+        // A constant select answers one row, and nothing else does.
+        // The values are the statement's own: no data is involved, so the row is
         // true-shaped on both protocols.
         PlanKind::Constant(items) => {
             if run.describe {
@@ -1574,10 +1375,7 @@ fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Ru
 
             return true;
         }
-        // **A select that names data answers no rows.** The columns are real --
-        // the catalog's when it knows the table, stubs when it does not -- but a
-        // row would have to be invented, and an invented row is what made the
-        // same client find every item on PostgreSQL and none on MySQL.
+        // A select that names data answers no rows.
         PlanKind::SelectMeta { .. } | PlanKind::SelectStub { .. } => {
             if run.describe {
                 row_description(plan, catalog, run.formats, out);
@@ -1586,14 +1384,14 @@ fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Ru
 
             return true;
         }
-        // **Nothing was written, so nothing is reported written** -- the tags the
-        // README documents.
+        // Nothing was written, so nothing is reported written -- the tags the README
+        // documents.
         PlanKind::Insert => complete_raw(out, "INSERT 0 0"),
         PlanKind::Update => complete_raw(out, "UPDATE 0"),
         PlanKind::Delete => complete_raw(out, "DELETE 0"),
         PlanKind::Begin => complete_raw(out, "BEGIN"),
-        // The counters are moved by the connection, at the moment the
-        // transaction ends; the tag is what the client reads.
+        // The counters are moved by the connection, at the moment the transaction ends;
+        // the tag is what the client reads.
         PlanKind::Commit if run.failed => complete_raw(out, "ROLLBACK"),
         PlanKind::Commit => complete_raw(out, "COMMIT"),
         PlanKind::Rollback => complete_raw(out, "ROLLBACK"),
@@ -1601,9 +1399,9 @@ fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Ru
             catalog.apply(&plan.sql);
             complete_raw(out, ddl_tag(&plan.sql));
         }
-        // Reached by the extended protocol's Execute. The caller sets
-        // `Phase::CopyIn` for the FROM STDIN half, because the phase belongs to
-        // the connection and not to the reply.
+        // Reached by the extended protocol's Execute.
+        // The caller sets `Phase::CopyIn` for the FROM STDIN half, because the phase
+        // belongs to the connection and not to the reply.
         PlanKind::Copy {
             direction,
             columns,
@@ -1654,8 +1452,8 @@ fn status_description(formats: &Formats, out: &mut Vec<u8>) {
             b.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
             b.extend_from_slice(&0i16.to_be_bytes()); // text format
         }
-        // The formats are per column: whatever the portal asked for is honoured
-        // above only for text columns, which have no binary form of their own.
+        // The formats are per column: whatever the portal asked for is honoured above
+        // only for text columns, which have no binary form of their own.
         let _ = formats;
     });
 }
@@ -1701,8 +1499,8 @@ fn number_answer(out: &mut Vec<u8>, run: Run<'_>, name: &str, value: u64) -> boo
         number_description(run.formats, out, name);
     }
 
-    // A portal already read to its end has nothing more, as for any other
-    // single-row plan.
+    // A portal already read to its end has nothing more, as for any other single-row
+    // plan.
     if run.consumed {
         complete(out, "SELECT", Some(0));
 
@@ -1722,9 +1520,9 @@ fn number_answer(out: &mut Vec<u8>, run: Run<'_>, name: &str, value: u64) -> boo
         }
     });
 
-    // The one row is also the last one, but with a limit of one the server
-    // cannot know that until it looks for the next -- which is why PostgreSQL
-    // answers PortalSuspended here, as it does for any stub row.
+    // The one row is also the last one, but with a limit of one the server cannot know
+    // that until it looks for the next -- which is why PostgreSQL answers
+    // PortalSuspended here, as it does for any stub row.
     if run.max_rows == 1 {
         portal_suspended(out);
     } else {
@@ -1734,8 +1532,8 @@ fn number_answer(out: &mut Vec<u8>, run: Run<'_>, name: &str, value: u64) -> boo
     true
 }
 
-/// One DataRow of the values a constant select stated, in the format the portal
-/// asked for.
+/// One DataRow of the values a constant select stated, in the format the portal asked
+/// for.
 fn constant_row(items: &[crate::sql::Constant], out: &mut Vec<u8>, formats: &Formats) {
     msg(out, b'D', |b| {
         b.extend_from_slice(&(items.len() as i16).to_be_bytes());
@@ -1757,16 +1555,13 @@ fn constant_row(items: &[crate::sql::Constant], out: &mut Vec<u8>, formats: &For
 
 /// How one execution of a plan is to be answered.
 struct Run<'a> {
-    /// Whether to send RowDescription first: the simple protocol does, and
-    /// Execute does not, because Describe did.
+    /// Whether to send RowDescription first: the simple protocol does, and Execute does
+    /// not, because Describe did.
     describe: bool,
-    /// Whether the transaction the statement runs in has failed. Only COMMIT
-    /// reads it: committing a failed transaction rolls it back, and
-    /// PostgreSQL's tag says `ROLLBACK` so the client can see that its COMMIT
-    /// committed nothing.
+    /// Whether the transaction the statement runs in has failed.
     failed: bool,
-    /// What the portal's Bind asked the rows to be encoded in. The simple
-    /// protocol has no Bind and is always text.
+    /// What the portal's Bind asked the rows to be encoded in.
+    /// The simple protocol has no Bind and is always text.
     formats: &'a Formats,
     /// Execute's row limit; zero is none.
     max_rows: i32,
@@ -1791,8 +1586,9 @@ fn msg(out: &mut Vec<u8>, tag: u8, body: impl FnOnce(&mut Vec<u8>)) {
     out[at..at + 4].copy_from_slice(&len.to_be_bytes());
 }
 
-/// CommandComplete with a trailing count, written WITHOUT formatting into a
-/// temporary String. `format!("SELECT {n}")` was one heap allocation per query.
+/// CommandComplete with a trailing count, written WITHOUT formatting into a temporary
+/// String.
+/// `format!("SELECT {n}")` was one heap allocation per query.
 fn complete(out: &mut Vec<u8>, verb: &str, n: Option<u64>) {
     msg(out, b'C', |b| {
         b.extend_from_slice(verb.as_bytes());
@@ -1828,10 +1624,9 @@ fn cstr(out: &mut Vec<u8>, s: &str) {
     out.push(0);
 }
 
-/// `COPY ... FROM STDIN` puts the connection into a conversation: the client
-/// sends `CopyData` and ends it with `CopyDone` or `CopyFail`.
-///
-/// `CopyInResponse`: the overall format, then one format code per column.
+/// `COPY ...
+/// FROM STDIN` puts the connection into a conversation: the client sends `CopyData` and
+/// ends it with `CopyDone` or `CopyFail`.
 fn copy_in_response(out: &mut Vec<u8>, columns: usize, binary: bool) {
     // PostgreSQL's format codes: 0 text, 1 binary.
     let code: i16 = i16::from(binary);
@@ -1845,10 +1640,8 @@ fn copy_in_response(out: &mut Vec<u8>, columns: usize, binary: bool) {
     });
 }
 
-/// `CopyOutResponse` for `COPY ... TO STDOUT`.
-///
-/// Text format, zero columns: an empty stream has none, and a driver that reads
-/// rows until `CopyDone` does not need a header per column to read none of them.
+/// `CopyOutResponse` for `COPY ...
+/// TO STDOUT`.
 fn copy_out_response(out: &mut Vec<u8>) {
     msg(out, b'H', |b| {
         b.push(0); // overall format: text
@@ -1866,8 +1659,8 @@ fn error_response(out: &mut Vec<u8>, code: &str, message: &str) {
     error_with_severity(out, "ERROR", code, message);
 }
 
-/// An ErrorResponse that ends the connection: PostgreSQL's severity for a
-/// startup the server will not continue.
+/// An ErrorResponse that ends the connection: PostgreSQL's severity for a startup the
+/// server will not continue.
 fn fatal_response(out: &mut Vec<u8>, code: &str, message: &str) {
     error_with_severity(out, "FATAL", code, message);
 }
@@ -1886,9 +1679,8 @@ fn error_with_severity(out: &mut Vec<u8>, severity: &str, code: &str, message: &
     });
 }
 
-/// The columns a SELECT answers with: the catalog's, when it knows the table,
-/// or `n` stubs. Resolved once per answer and used for both the
-/// RowDescription and the DataRow, so the two cannot disagree.
+/// The columns a SELECT answers with: the catalog's, when it knows the table, or `n`
+/// stubs.
 enum Columns {
     /// `?column?` int8, `n` times, from a `&'static str` rather than n freshly
     /// allocated Strings.
@@ -1939,10 +1731,7 @@ fn resolve_columns(plan: &PreparedPlan, catalog: &CatalogView) -> Columns {
     }
 }
 
-/// RowDescription for a plan that returns rows, or false for one that does
-/// not. Uses the client's own column names when the catalog knows the table --
-/// a driver that created a table and selects from it gets its names back,
-/// which is the one piece of real behaviour this server has.
+/// RowDescription for a plan that returns rows, or false for one that does not.
 fn row_description(
     plan: &PreparedPlan,
     catalog: &CatalogView,
@@ -1980,9 +1769,9 @@ fn row_description(
     true
 }
 
-/// RowDescription: each column's name, type, and the format code the portal
-/// asked for. The format codes are the client's own request read back, and a
-/// driver that asked for binary decodes what follows as binary.
+/// RowDescription: each column's name, type, and the format code the portal asked for.
+/// The format codes are the client's own request read back, and a driver that asked for
+/// binary decodes what follows as binary.
 fn row_description_of(cols: &Columns, formats: &Formats, out: &mut Vec<u8>) {
     msg(out, b'T', |b| {
         b.extend_from_slice(&(cols.len() as i16).to_be_bytes());
@@ -2011,8 +1800,8 @@ fn ddl_tag(sql: &str) -> &'static str {
 
 // ------------------------------------------------------------------ decoding
 
-/// The `S` or `P` a Describe or Close begins with. Anything else is a
-/// malformed body, not a portal.
+/// The `S` or `P` a Describe or Close begins with.
+/// Anything else is a malformed body, not a portal.
 fn subtype(body: &[u8]) -> Option<u8> {
     match body.first() {
         Some(&k @ (b'S' | b'P')) => Some(k),
@@ -2020,9 +1809,9 @@ fn subtype(body: &[u8]) -> Option<u8> {
     }
 }
 
-/// An int16 count at `from` followed by that many int32 OIDs, as Parse
-/// declares its parameter types, and the index after them. A count that
-/// outruns the body is malformed.
+/// An int16 count at `from` followed by that many int32 OIDs, as Parse declares its
+/// parameter types, and the index after them.
+/// A count that outruns the body is malformed.
 fn oid_list(body: &[u8], from: usize) -> Option<(Vec<u32>, usize)> {
     let n = i16::from_be_bytes(body.get(from..from + 2)?.try_into().ok()?);
     let n = usize::try_from(n).ok()?;
@@ -2037,9 +1826,7 @@ fn oid_list(body: &[u8], from: usize) -> Option<(Vec<u32>, usize)> {
     ))
 }
 
-/// A body is its fields and nothing after them. Every decoder ends with this:
-/// a valid prefix followed by trailing bytes used to be accepted by Query,
-/// Parse, Describe, Close and Execute, where PostgreSQL answers 08P01.
+/// A body is its fields and nothing after them.
 fn exhausted(body: &[u8], end: usize) -> Option<()> {
     (end == body.len()).then_some(())
 }
@@ -2050,16 +1837,16 @@ struct BindTail {
     params: usize,
     /// The parameter-format count, when it is not 0, 1 or `params`.
     format_mismatch: Option<usize>,
-    /// How many result-format codes it carries, which must be 0, 1 or the
-    /// statement's column count -- checked by the caller, who has the plan.
+    /// How many result-format codes it carries, which must be 0, 1 or the statement's
+    /// column count -- checked by the caller, who has the plan.
     result_formats: usize,
     /// The result formats it asks for.
     formats: Formats,
 }
 
-/// Decode the rest of a Bind: parameter formats, parameter values, result
-/// formats. `None` is a body that ends before its own counts do, or a format
-/// code that is neither text nor binary -- malformed, not "no formats".
+/// Decode the rest of a Bind: parameter formats, parameter values, result formats.
+/// `None` is a body that ends before its own counts do, or a format code that is
+/// neither text nor binary -- malformed, not "no formats".
 fn bind_tail(body: &[u8], from: usize) -> Option<BindTail> {
     fn i16_at(body: &[u8], at: usize) -> Option<i16> {
         Some(i16::from_be_bytes(body.get(at..at + 2)?.try_into().ok()?))
@@ -2081,7 +1868,7 @@ fn bind_tail(body: &[u8], from: usize) -> Option<BindTail> {
     for _ in 0..params {
         let len = i32::from_be_bytes(body.get(at..at + 4)?.try_into().ok()?);
         at += 4;
-        // -1 is NULL. Below that is not a length; it used to be read as NULL.
+        // -1 is NULL.
         if len < -1 {
             return None;
         }
@@ -2170,8 +1957,8 @@ mod tests {
         b
     }
 
-    /// Every message tag present in `out`, in order. The property most of these
-    /// tests assert is about the SEQUENCE the client sees.
+    /// Every message tag present in `out`, in order.
+    /// The property most of these tests assert is about the SEQUENCE the client sees.
     fn tags(out: &[u8]) -> Vec<u8> {
         let mut seen = Vec::new();
         let mut i = 0;
@@ -2192,10 +1979,6 @@ mod tests {
     }
 
     /// The status byte of the LAST `ReadyForQuery` in a reply.
-    ///
-    /// `Z` messages are `[b'Z'][len:i32][status:u8]`, so the byte the client
-    /// reads sits at the end of the last one -- which is always where
-    /// `ReadyForQuery` is in a well-formed reply.
     fn last_ready_status(out: &[u8]) -> u8 {
         let mut i = 0;
         let mut status = None;
@@ -2249,10 +2032,9 @@ mod tests {
         assert!(!c.is_closed());
     }
 
-    /// THE PROPERTY THIS FILE EXISTS FOR. A pipelined Bind/Execute/Sync must
-    /// produce ONE contiguous reply, because the caller writes `out` once. The
-    /// old pgwire path flushed BindComplete, then DataRow+CommandComplete, then
-    /// ReadyForQuery -- three syscalls for these same 37 bytes.
+    /// THE PROPERTY THIS FILE EXISTS FOR.
+    /// A pipelined Bind/Execute/Sync must produce ONE contiguous reply, because the
+    /// caller writes `out` once.
     #[test]
     fn bind_execute_sync_produces_one_contiguous_reply() {
         let (mut c, v) = connected();
@@ -2286,8 +2068,8 @@ mod tests {
         );
     }
 
-    /// A message split across reads must not be consumed or answered until it
-    /// is whole -- otherwise a slow client desynchronises the stream.
+    /// A message split across reads must not be consumed or answered until it is whole
+    /// -- otherwise a slow client desynchronises the stream.
     #[test]
     fn a_partial_message_is_left_for_the_next_read() {
         let (mut c, v) = connected();
@@ -2327,15 +2109,7 @@ mod tests {
         assert!(out.is_empty(), "a closed connection answers nothing");
     }
 
-    /// **The one statement answered with a number.** A TPC-C client reads
-    /// `select sum(d_next_o_id) from district` before and after its window and
-    /// reports the difference as NOPM; a no-op that answered an empty result set
-    /// would make every such run report zero.
-    ///
-    /// The frames are checked here -- one int8 column named `sum`, one row, its
-    /// value the schema's -- and the arithmetic is pinned in `src/tpcc.rs` and
-    /// end to end in `tests/wire.rs`. The answers are the `tpcc` profile's, so the
-    /// test turns the profile on.
+    /// The one statement answered with a number.
     #[test]
     fn the_district_sum_is_answered_with_one_row() {
         let _profile = crate::tpcc::profile_guard(true);
@@ -2358,8 +2132,8 @@ mod tests {
             body.windows(3).any(|w| w == b"sum"),
             "the column a client asked for"
         );
-        // The field's type follows its name, the table oid and the column
-        // number: int8, so a driver decodes the value it was promised.
+        // The field's type follows its name, the table oid and the column number: int8,
+        // so a driver decodes the value it was promised.
         let field = &body[2..];
         let name_end = field.iter().position(|&b| b == 0).expect("a name") + 1;
         let oid_at = name_end + 4 + 2;
@@ -2390,8 +2164,7 @@ mod tests {
         assert_eq!(frame(&out, &mut at).0, b'Z', "ready for the next query");
     }
 
-    /// One frame out of a buffer: its tag and its body, and where the next one
-    /// starts.
+    /// One frame out of a buffer: its tag and its body, and where the next one starts.
     fn frame<'a>(out: &'a [u8], at: &mut usize) -> (u8, &'a [u8]) {
         let tag = out[*at];
         let len =
@@ -2402,14 +2175,9 @@ mod tests {
         (tag, body)
     }
 
-    /// **SQL `PREPARE name AS body` registers `name` for Bind/Execute.**
-    ///
-    /// HammerDB's PostgreSQL TPROC-C prepares its stored procedures this way at
-    /// login (`PREPARE neword AS select ...`) and then executes them by name. The
-    /// codec answered the PREPARE like any other statement and kept nothing, so
-    /// the first Bind of the name was 26000 "prepared statement does not exist"
-    /// and the run measured zero. The name is registered against its body, which
-    /// from then on behaves exactly as if it had been prepared with a Parse.
+    /// SQL `PREPARE name AS body` registers `name` for Bind/Execute.
+    /// HammerDB's PostgreSQL TPROC-C prepares its stored procedures this way at login
+    /// (`PREPARE neword AS select ...`) and then executes them by name.
     #[test]
     fn a_sql_prepare_registers_a_statement_for_bind() {
         let (mut c, v) = (Conn::new(), view());
@@ -2453,8 +2221,8 @@ mod tests {
         assert!(out.contains(&b'D'), "executing it answers its row: {out:?}");
     }
 
-    /// A `PREPARE` of a name already in use is PostgreSQL's 42P05, and a name
-    /// that was never prepared is still 26000.
+    /// A `PREPARE` of a name already in use is PostgreSQL's 42P05, and a name that was
+    /// never prepared is still 26000.
     #[test]
     fn a_sql_prepare_refuses_a_duplicate_name() {
         let (mut c, v) = (Conn::new(), view());
@@ -2484,12 +2252,8 @@ mod tests {
         assert_eq!(t.last(), Some(&b'Z'));
     }
 
-    /// **The status byte is not a constant.**
-    ///
-    /// `ReadyForQuery` always said `I`. pgxpool reads it to decide whether a
-    /// connection is free, so after a raw `BEGIN` it put the connection back in
-    /// the pool with the transaction still open underneath the next user of it.
-    /// PostgreSQL reports `T` there and so must this.
+    /// The status byte is not a constant.
+    /// `ReadyForQuery` always said `I`.
     #[test]
     fn a_raw_begin_reports_in_transaction() {
         let (mut c, v) = connected();
@@ -2497,15 +2261,15 @@ mod tests {
 
         c.advance(&tagged(b'Q', |b| cstr(b, "BEGIN")), &mut out, &v);
 
-        // `BEGIN` answers `BEGIN`, then `ReadyForQuery`, whose status byte is
-        // the byte after the message's own length.
+        // `BEGIN` answers `BEGIN`, then `ReadyForQuery`, whose status byte is the byte
+        // after the message's own length.
         let text = String::from_utf8_lossy(&out);
         assert!(text.contains("BEGIN"), "{text}");
         assert_eq!(last_ready_status(&out), b'T', "a transaction block is open");
     }
 
-    /// `COMMIT` and `ROLLBACK` close it in both directions, including out of a
-    /// failed transaction.
+    /// `COMMIT` and `ROLLBACK` close it in both directions, including out of a failed
+    /// transaction.
     #[test]
     fn commit_and_rollback_report_idle() {
         for end in ["COMMIT", "ROLLBACK"] {
@@ -2521,10 +2285,9 @@ mod tests {
         }
     }
 
-    /// An error inside a transaction block leaves the session in a FAILED
-    /// transaction -- `E` -- until it is rolled back, which is what PostgreSQL
-    /// does and what tells a client its statements cannot be retried in place.
-    /// Outside a transaction, an error leaves the session idle.
+    /// An error inside a transaction block leaves the session in a FAILED transaction
+    /// -- `E` -- until it is rolled back, which is what PostgreSQL does and what tells
+    /// a client its statements cannot be retried in place.
     #[test]
     fn an_error_inside_a_transaction_reports_failed() {
         let (mut c, v) = connected();
@@ -2549,8 +2312,8 @@ mod tests {
         assert_eq!(last_ready_status(&out), b'I');
     }
 
-    /// The extended protocol's Execute changes the state, and `Sync` is what
-    /// reports it -- so `Parse/Bind/Execute(Sync)` around a `BEGIN` must say `T`.
+    /// The extended protocol's Execute changes the state, and `Sync` is what reports it
+    /// -- so `Parse/Bind/Execute(Sync)` around a `BEGIN` must say `T`.
     #[test]
     fn an_extended_begin_reports_in_transaction() {
         let (mut c, v) = connected();
@@ -2580,8 +2343,8 @@ mod tests {
         assert_eq!(last_ready_status(&out), b'T', "Sync reports the open block");
     }
 
-    /// The one piece of real behaviour: a client that creates a table and then
-    /// selects from it gets ITS OWN column names back, not stubs.
+    /// The one piece of real behaviour: a client that creates a table and then selects
+    /// from it gets ITS OWN column names back, not stubs.
     #[test]
     fn a_created_tables_columns_come_back_by_name() {
         let (mut c, v) = connected();
@@ -2614,11 +2377,7 @@ mod tests {
         );
     }
 
-    /// A client-controlled negative length cast to usize becomes enormous, so
-    /// `input.len() < 1 + len` is permanently true: the codec consumes nothing,
-    /// the caller appends every later byte to its pending buffer, and one frame
-    /// becomes an unbounded allocation. Found in review, not by these tests --
-    /// which covered a message SPLIT across reads but never a malformed one.
+    /// A client-controlled negative length cast to usize becomes enormous, so `input
     #[test]
     fn a_negative_length_is_rejected_rather_than_stalling() {
         for bad in [-1i32, i32::MIN, 3, (MAX_MESSAGE as i32) + 1] {
@@ -2635,12 +2394,9 @@ mod tests {
         }
     }
 
-    /// **COPY FROM STDIN is a conversation**, and answering it with
-    /// `CommandComplete` desynchronises the stream: the client believes the
-    /// statement finished and then writes rows into a connection that moved on.
-    ///
-    /// The pgwire handler this codec replaced implemented it; the rewrite dropped
-    /// it and answered `SELECT 0`. A reviewer found that, not these tests.
+    /// COPY FROM STDIN is a conversation, and answering it with `CommandComplete`
+    /// desynchronises the stream: the client believes the statement finished and then
+    /// writes rows into a connection that moved on.
     #[test]
     fn copy_from_stdin_gets_its_response_and_row_count() {
         let (mut c, v) = connected();
@@ -2689,8 +2445,8 @@ mod tests {
         assert!(out.ends_with(b"I"), "and ReadyForQuery(idle) must close it");
     }
 
-    /// A client that abandons its own COPY is told it failed. Answering success
-    /// would tell a loader its data landed.
+    /// A client that abandons its own COPY is told it failed.
+    /// Answering success would tell a loader its data landed.
     #[test]
     fn copy_fail_is_an_error_not_a_success() {
         let (mut c, v) = connected();
@@ -2707,14 +2463,9 @@ mod tests {
         assert!(!c.is_closed(), "and the connection survives it");
     }
 
-    /// COPY TO STDOUT and COPY FROM a file are not conversations, so they must
-    /// not enter the copy phase -- but they are COPY statements, and the tag a
-    /// client checks is `COPY n`.
-    ///
-    /// This test used to assert only "not CopyInResponse" and "answered and
-    /// ready", which a `SELECT 0` satisfied: it accepted the wrong answer for
-    /// `COPY t TO STDOUT` because it never looked at what came back. pgx's
-    /// `CopyTo` reads the tag, and stroppy's load path reads the row count.
+    /// COPY TO STDOUT and COPY FROM a file are not conversations, so they must not
+    /// enter the copy phase -- but they are COPY statements, and the tag a client
+    /// checks is `COPY n`.
     #[test]
     fn only_copy_from_stdin_enters_the_copy_phase() {
         for sql in ["COPY t TO STDOUT", "COPY t FROM '/tmp/x.csv'", "SELECT 1"] {
@@ -2727,7 +2478,6 @@ mod tests {
     }
 
     /// `COPY t TO STDOUT` is a `CopyOutResponse`, an empty stream and `COPY 0`.
-    /// It used to fall through to `CommandComplete("SELECT 0")`.
     #[test]
     fn copy_to_stdout_answers_copy_out_and_a_copy_tag() {
         let (mut c, v) = connected();
@@ -2765,13 +2515,9 @@ mod tests {
         assert!(text.contains("COPY 0"), "the tag must be COPY 0: {text}");
     }
 
-    /// **The reviewer's case.** SQL whitespace is not one space: three spaces, a
-    /// tab and a newline are all the same statement, and all three have to be
-    /// recognised as the conversation FROM STDIN is.
-    ///
-    /// `COPY t FROM    STDIN` used to answer `SELECT 0` (the two-spelling match
-    /// missed it by one space), after which the client's `CopyData` arrived
-    /// outside a COPY and every later reply was read against the wrong message.
+    /// SQL whitespace is not one space: three spaces, a tab and a newline are all the
+    /// same statement, and all three have to be recognised as the conversation FROM
+    /// STDIN is.
     #[test]
     fn copy_from_stdin_survives_any_whitespace() {
         for sql in [
@@ -2801,8 +2547,8 @@ mod tests {
         }
     }
 
-    /// The column count announced to the client has to match the client's own
-    /// column list, whatever whitespace separates them.
+    /// The column count announced to the client has to match the client's own column
+    /// list, whatever whitespace separates them.
     #[test]
     fn copy_in_announces_the_column_count_under_any_whitespace() {
         for (sql, want) in [
@@ -2824,12 +2570,9 @@ mod tests {
         }
     }
 
-    /// **Binary COPY counts tuples, not newlines.**
-    ///
-    /// pgx's `CopyFrom` sends PostgreSQL's binary framing, where `0x0a` is just
-    /// a byte in a payload. Counting newline bytes reported `COPY 2` for three
-    /// rows -- which stroppy then reported as `confirmed_rows=2` of 3 -- and the
-    /// count is the only thing a loader can check.
+    /// Binary COPY counts tuples, not newlines.
+    /// pgx's `CopyFrom` sends PostgreSQL's binary framing, where `0x0a` is just a byte
+    /// in a payload.
     #[test]
     fn binary_copy_counts_tuples() {
         let (mut c, v) = connected();
@@ -2859,8 +2602,9 @@ mod tests {
         );
         out.clear();
 
-        // Header, then three tuples. The second field of the first row contains
-        // a newline byte, and the third row is split across two messages.
+        // Header, then three tuples.
+        // The second field of the first row contains a newline byte, and the third row
+        // is split across two messages.
         let mut stream = Vec::new();
         stream.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
         stream.extend_from_slice(&0i32.to_be_bytes()); // flags
@@ -2876,8 +2620,8 @@ mod tests {
 
         stream.extend_from_slice(&(-1i16).to_be_bytes()); // trailer
 
-        // Split it mid-tuple on purpose: a CopyData message is a slice of the
-        // stream, not a row.
+        // Split it mid-tuple on purpose: a CopyData message is a slice of the stream,
+        // not a row.
         let split = stream.len() - 12;
 
         c.advance(
@@ -2897,8 +2641,8 @@ mod tests {
         assert!(text.contains("COPY 3"), "three tuples: {text}");
     }
 
-    /// A NULL field is a length of -1 with no bytes after it, and it must not
-    /// throw the frame walk off by four.
+    /// A NULL field is a length of -1 with no bytes after it, and it must not throw the
+    /// frame walk off by four.
     #[test]
     fn binary_copy_counts_nulls_and_knows_when_the_stream_is_over() {
         let (mut c, v) = connected();
@@ -2936,13 +2680,7 @@ mod tests {
         );
     }
 
-    /// **A field is skipped, not buffered.** The walker used to gather a
-    /// whole tuple before counting it, behind a 1 MiB ceiling -- so a single
-    /// 2 MiB bytea, a valid binary field, closed the connection with no
-    /// ErrorResponse where PostgreSQL answers `COPY 1`. Payload is now
-    /// discarded as it arrives against a remaining-length count, whatever
-    /// the field declares, and nothing is retained between messages beyond
-    /// a partial length prefix.
+    /// A field is skipped, not buffered.
     #[test]
     fn binary_copy_skips_a_large_field_without_buffering() {
         let mut stream = binary_header(0, &[]);
@@ -2978,8 +2716,8 @@ mod tests {
         c.advance(&tagged(b'c', |_| {}), &mut out, &v);
         assert_eq!(copy_tag(&out), "COPY 1");
 
-        // A field declaring a gigabyte that never arrives holds no memory
-        // either: it is a count, and CopyDone inside it is unexpected EOF.
+        // A field declaring a gigabyte that never arrives holds no memory either: it is
+        // a count, and CopyDone inside it is unexpected EOF.
         let (mut c, v) = connected();
         let mut out = Vec::new();
         c.advance(
@@ -3005,10 +2743,8 @@ mod tests {
         assert_eq!(first_sqlstate(&out), "22P04");
     }
 
-    /// The same stall, one packet earlier: the STARTUP length is client-controlled
-    /// too, and it is read before any authentication. The framed path was guarded
-    /// in the first review round and this one was not, which is what a reviewer
-    /// found and these tests did not -- they covered the framed path only.
+    /// The same stall, one packet earlier: the STARTUP length is client-controlled too,
+    /// and it is read before any authentication.
     #[test]
     fn a_negative_startup_length_is_rejected_rather_than_stalling() {
         for bad in [-1i32, i32::MIN, 7, (MAX_STARTUP as i32) + 1] {
@@ -3048,9 +2784,8 @@ mod tests {
         assert!(!out.is_empty(), "and must be answered");
     }
 
-    /// Once a message is FRAMED its bytes are all present, so the only outcomes
-    /// are handled and handled-badly. Returning None would mean "incomplete,
-    /// keep the bytes", which for a complete frame is a permanent stall.
+    /// Once a message is FRAMED its bytes are all present, so the only outcomes are
+    /// handled and handled-badly.
     #[test]
     fn a_malformed_body_is_answered_and_consumed() {
         let (mut c, v) = connected();
@@ -3083,18 +2818,15 @@ mod tests {
         assert!(framed < input.len());
     }
 
-    /// **An error in an extended-protocol message discards everything until
-    /// Sync.** PostgreSQL answers `ErrorResponse`, then reads and drops every
-    /// message until `Sync`, then sends ONE `ReadyForQuery`. This codec answered
-    /// the error and kept going: the Query after a malformed Parse executed,
-    /// and both it and the Sync reported ready -- `E,T,D,C,Z,Z` where the
-    /// client's driver expects `E,Z`.
+    /// An error in an extended-protocol message discards everything until Sync.
+    /// PostgreSQL answers `ErrorResponse`, then reads and drops every message until
+    /// `Sync`, then sends ONE `ReadyForQuery`.
     #[test]
     fn an_error_in_an_extended_message_discards_everything_until_sync() {
         let (mut c, v) = connected();
 
-        // Malformed Parse (no NUL anywhere), then a Query, then Sync, in one
-        // packet -- which is how a pipelining driver sends them.
+        // Malformed Parse (no NUL anywhere), then a Query, then Sync, in one packet --
+        // which is how a pipelining driver sends them.
         let mut input = Vec::new();
         msg(&mut input, b'P', |b| b.extend_from_slice(b"no-nul-here"));
         input.extend(tagged(b'Q', |b| cstr(b, "select 1")));
@@ -3114,9 +2846,9 @@ mod tests {
         assert_eq!(tags(&out), vec![b'T', b'D', b'C', b'Z']);
     }
 
-    /// Extended messages that arrive while skipping are not answered either --
-    /// no BindComplete for a Bind, no ParseComplete for a Parse. A driver
-    /// counts replies against what it sent, and a stray `2` desynchronises it.
+    /// Extended messages that arrive while skipping are not answered either -- no
+    /// BindComplete for a Bind, no ParseComplete for a Parse.
+    /// A driver counts replies against what it sent, and a stray `2` desynchronises it.
     #[test]
     fn extended_messages_are_silent_while_awaiting_sync() {
         let (mut c, v) = connected();
@@ -3147,8 +2879,8 @@ mod tests {
         assert_eq!(tags(&out), vec![b'E', b'Z']);
     }
 
-    /// A Terminate while skipping still closes: the client is allowed to give
-    /// up without sending the Sync it never got an answer for.
+    /// A Terminate while skipping still closes: the client is allowed to give up
+    /// without sending the Sync it never got an answer for.
     #[test]
     fn terminate_while_awaiting_sync_closes() {
         let (mut c, v) = connected();
@@ -3162,9 +2894,8 @@ mod tests {
         assert!(c.is_closed());
     }
 
-    /// The simple protocol has no Sync, so an error there ends with
-    /// `ReadyForQuery` at once and the next message runs. A COPY message with
-    /// no COPY open is the one simple-protocol error this codec produces.
+    /// The simple protocol has no Sync, so an error there ends with `ReadyForQuery` at
+    /// once and the next message runs.
     #[test]
     fn a_simple_protocol_error_is_ready_at_once() {
         let (mut c, v) = connected();
@@ -3177,8 +2908,8 @@ mod tests {
         assert_eq!(tags(&out), vec![b'E', b'Z', b'T', b'D', b'C', b'Z']);
     }
 
-    /// The SQLSTATE of the first ErrorResponse in a reply, as the five bytes
-    /// after the `C` field tag.
+    /// The SQLSTATE of the first ErrorResponse in a reply, as the five bytes after the
+    /// `C` field tag.
     fn first_sqlstate(out: &[u8]) -> String {
         let mut i = 0;
         while i + 5 <= out.len() {
@@ -3193,13 +2924,9 @@ mod tests {
         panic!("no ErrorResponse in the reply")
     }
 
-    /// **A name that was never prepared is an error, not an empty answer.**
-    /// Bind to an unknown statement answered BindComplete, Execute of an
-    /// unknown portal fabricated `SELECT 0`, and Describe of either answered as
-    /// if it existed. A driver whose statement cache was invalidated -- or
-    /// that closed the statement itself -- then reads answers for a statement
-    /// the server does not have, and never learns it. PostgreSQL says 26000 for
-    /// a statement and 34000 for a portal, and skips to Sync.
+    /// A name that was never prepared is an error, not an empty answer.
+    /// Bind to an unknown statement answered BindComplete, Execute of an unknown portal
+    /// fabricated `SELECT 0`, and Describe of either answered as if it existed.
     #[test]
     fn bind_to_an_unknown_statement_is_an_error() {
         let (mut c, v) = connected();
@@ -3257,8 +2984,8 @@ mod tests {
         }
     }
 
-    /// Close of a name that does not exist is NOT an error: PostgreSQL
-    /// answers CloseComplete, and drivers close speculatively.
+    /// Close of a name that does not exist is NOT an error: PostgreSQL answers
+    /// CloseComplete, and drivers close speculatively.
     #[test]
     fn close_of_an_unknown_name_is_not_an_error() {
         let (mut c, v) = connected();
@@ -3274,8 +3001,8 @@ mod tests {
         assert_eq!(tags(&out), vec![b'3', b'Z']);
     }
 
-    /// Put a connection into a FAILED transaction: BEGIN, then the one
-    /// simple-protocol error this codec produces.
+    /// Put a connection into a FAILED transaction: BEGIN, then the one simple-protocol
+    /// error this codec produces.
     fn failed(c: &mut Conn, v: &CatalogView) {
         let mut out = Vec::new();
         c.advance(&tagged(b'Q', |b| cstr(b, "BEGIN")), &mut out, v);
@@ -3283,11 +3010,9 @@ mod tests {
         assert_eq!(last_ready_status(&out), b'E');
     }
 
-    /// **A failed transaction refuses statements, not just reports itself.**
-    /// The state byte said `E` and every statement still ran: a SELECT got its
-    /// row, and a BEGIN flipped the byte back to `T` with no ROLLBACK. A
-    /// client reading `E` expects PostgreSQL's 25P02 for anything but the
-    /// transaction's end, and a pool that retries in place relies on it.
+    /// A failed transaction refuses statements, not just reports itself.
+    /// The state byte said `E` and every statement still ran: a SELECT got its row, and
+    /// a BEGIN flipped the byte back to `T` with no ROLLBACK.
     #[test]
     fn a_failed_transaction_refuses_everything_but_its_end() {
         let (mut c, v) = connected();
@@ -3327,8 +3052,8 @@ mod tests {
         assert_eq!(last_ready_status(&out), b'I');
     }
 
-    /// BEGIN inside an open transaction is a warning in PostgreSQL, not a new
-    /// block: the state stays `T`.
+    /// BEGIN inside an open transaction is a warning in PostgreSQL, not a new block:
+    /// the state stays `T`.
     #[test]
     fn begin_inside_a_transaction_keeps_it_open() {
         let (mut c, v) = connected();
@@ -3338,14 +3063,14 @@ mod tests {
         assert_eq!(last_ready_status(&out), b'T');
     }
 
-    /// The extended protocol is refused the same way, at Parse, Bind and
-    /// Execute -- and skips to Sync, since those are extended messages.
+    /// The extended protocol is refused the same way, at Parse, Bind and Execute -- and
+    /// skips to Sync, since those are extended messages.
     #[test]
     fn a_failed_transaction_refuses_extended_messages_too() {
         let (mut c, v) = connected();
 
-        // A statement prepared BEFORE the failure, so Bind and Execute can be
-        // tried on their own.
+        // A statement prepared BEFORE the failure, so Bind and Execute can be tried on
+        // their own.
         let mut out = Vec::new();
         c.advance(
             &tagged(b'P', |b| {
@@ -3413,8 +3138,8 @@ mod tests {
         assert_eq!(last_ready_status(&out), b'I');
     }
 
-    /// Parse/Bind/Execute/Sync for a statement, in one packet, the way a
-    /// driver sends them.
+    /// Parse/Bind/Execute/Sync for a statement, in one packet, the way a driver sends
+    /// them.
     fn extended(sql: &str) -> Vec<u8> {
         let mut input = tagged(b'P', |b| {
             cstr(b, "");
@@ -3436,12 +3161,8 @@ mod tests {
         input
     }
 
-    /// **A COPY entered through the extended protocol ends at the client's
-    /// Sync, not at CopyDone.** rust-postgres and libpq send Execute+Sync,
-    /// wait for CopyInResponse, stream, then send CopyDone+Sync and expect
-    /// `C, Z`. This codec answered the first Sync mid-COPY and let CopyDone
-    /// send its own ReadyForQuery: `G, Z, C, Z, Z`, and the driver read
-    /// `UnexpectedMessage` twice.
+    /// A COPY entered through the extended protocol ends at the client's Sync, not at
+    /// CopyDone.
     #[test]
     fn an_extended_copy_ends_at_sync() {
         let (mut c, v) = connected();
@@ -3469,9 +3190,9 @@ mod tests {
         assert_eq!(tags(&out), vec![b'1', b'2', b'D', b'C', b'Z']);
     }
 
-    /// The simple protocol has no Sync, so there CopyDone still ends with
-    /// ReadyForQuery -- and a Flush or Sync a confused client sends during
-    /// either kind is ignored, as PostgreSQL ignores them.
+    /// The simple protocol has no Sync, so there CopyDone still ends with ReadyForQuery
+    /// -- and a Flush or Sync a confused client sends during either kind is ignored, as
+    /// PostgreSQL ignores them.
     #[test]
     fn a_simple_copy_still_ends_at_copy_done() {
         let (mut c, v) = connected();
@@ -3493,9 +3214,9 @@ mod tests {
         assert_eq!(tags(&out), vec![b'C', b'Z']);
     }
 
-    /// An ordinary message during COPY is a protocol violation, not a query
-    /// to run. A Query executed mid-COPY answered rows into a stream the
-    /// client was reading as COPY replies.
+    /// An ordinary message during COPY is a protocol violation, not a query to run.
+    /// A Query executed mid-COPY answered rows into a stream the client was reading as
+    /// COPY replies.
     #[test]
     fn a_query_during_copy_is_refused_not_run() {
         // Extended: the error skips to Sync.
@@ -3531,8 +3252,8 @@ mod tests {
         );
     }
 
-    /// CopyFail in an extended COPY is an extended error: ErrorResponse, then
-    /// nothing until the client's Sync.
+    /// CopyFail in an extended COPY is an extended error: ErrorResponse, then nothing
+    /// until the client's Sync.
     #[test]
     fn copy_fail_in_an_extended_copy_waits_for_sync() {
         let (mut c, v) = connected();
@@ -3568,8 +3289,8 @@ mod tests {
         t
     }
 
-    /// Start a binary COPY and feed it `chunks`, then CopyDone; the reply to
-    /// the whole exchange after CopyInResponse.
+    /// Start a binary COPY and feed it `chunks`, then CopyDone; the reply to the whole
+    /// exchange after CopyInResponse.
     fn binary_copy(chunks: &[&[u8]]) -> (Conn, Vec<u8>) {
         let (mut c, v) = connected();
         let mut out = Vec::new();
@@ -3587,11 +3308,9 @@ mod tests {
         (c, out)
     }
 
-    /// **The header is not 19 bytes; it is 19 bytes plus the extension it
-    /// declares.** Bytes 15..19 carry the extension length, and a reader
-    /// must skip that many more before the first tuple. This one started
-    /// tuple parsing at byte 19 regardless, so a four-byte extension was read
-    /// as a field count and a length, and one tuple came back as `COPY 3`.
+    /// The header is not 19 bytes; it is 19 bytes plus the extension it declares.
+    /// Bytes 15..19 carry the extension length, and a reader must skip that many more
+    /// before the first tuple.
     #[test]
     fn binary_copy_skips_the_header_extension() {
         let mut stream = binary_header(0, &[0xde, 0xad, 0xbe, 0xef]);
@@ -3608,8 +3327,8 @@ mod tests {
         assert!(text.contains("COPY 1"), "split: {text}");
     }
 
-    /// A stream that does not start with the signature is not a binary COPY,
-    /// and PostgreSQL says so (22P04) instead of counting whatever it is.
+    /// A stream that does not start with the signature is not a binary COPY, and
+    /// PostgreSQL says so (22P04) instead of counting whatever it is.
     #[test]
     fn binary_copy_rejects_a_bad_signature() {
         let mut stream = b"PGCOPY\n\xff\r\n\0".to_vec();
@@ -3628,9 +3347,9 @@ mod tests {
         assert!(!c.is_closed());
     }
 
-    /// The flags word reserves bits 16..31 as critical: a reader that does
-    /// not understand one must refuse the file. None are defined, so any set
-    /// bit there is a refusal.
+    /// The flags word reserves bits 16..31 as critical: a reader that does not
+    /// understand one must refuse the file.
+    /// None are defined, so any set bit there is a refusal.
     #[test]
     fn binary_copy_rejects_critical_flags() {
         let mut stream = binary_header(1 << 20, &[]);
@@ -3640,10 +3359,9 @@ mod tests {
         assert_eq!(first_sqlstate(&out), "22P04");
     }
 
-    /// **Only -1 is special.** A field count of -1 is the trailer and a field
-    /// length of -1 is NULL; every other negative value is a malformed stream.
-    /// This treated every negative count as the trailer and every negative
-    /// length as NULL, so a length of -2 was counted as a valid row.
+    /// Only -1 is special.
+    /// A field count of -1 is the trailer and a field length of -1 is NULL; every other
+    /// negative value is a malformed stream.
     #[test]
     fn binary_copy_rejects_negative_values_other_than_minus_one() {
         // Field length -2.
@@ -3665,10 +3383,7 @@ mod tests {
         assert_eq!(first_sqlstate(&out), "22P04", "count -2");
     }
 
-    /// **CopyDone is checked against the framing, not taken on trust.** A
-    /// stream that ends mid-tuple is `unexpected EOF in COPY data` in
-    /// PostgreSQL; this answered `COPY n` for whatever had been counted and
-    /// dropped the partial tuple on the floor.
+    /// CopyDone is checked against the framing, not taken on trust.
     #[test]
     fn binary_copy_done_with_a_partial_tuple_is_an_error() {
         let mut stream = binary_header(0, &[]);
@@ -3680,8 +3395,8 @@ mod tests {
         assert_eq!(first_sqlstate(&out), "22P04");
     }
 
-    /// Bytes after the trailer are `received copy data after EOF marker`,
-    /// whether they arrive in the same message or a later one.
+    /// Bytes after the trailer are `received copy data after EOF marker`, whether they
+    /// arrive in the same message or a later one.
     #[test]
     fn binary_copy_data_after_the_trailer_is_an_error() {
         let mut stream = binary_header(0, &[]);
@@ -3706,10 +3421,8 @@ mod tests {
     }
 
     /// The trailer is how a writer says it is done, but PostgreSQL's reader
-    /// (`CopyFromBinaryOneRow`) treats a clean EOF at a tuple boundary the
-    /// same way -- "EOF detected (end of file, or trailer)" -- so a stream that
-    /// omits it is complete, not malformed, and this server agrees with the
-    /// server it stands in for.
+    /// (`CopyFromBinaryOneRow`) treats a clean EOF at a tuple boundary the same way --
+    /// "EOF detected (end of file, or trailer)" -- so a stream that omits it is
     #[test]
     fn binary_copy_without_a_trailer_is_still_complete() {
         let mut stream = binary_header(0, &[]);
@@ -3737,9 +3450,9 @@ mod tests {
         panic!("no ParameterDescription in the reply")
     }
 
-    /// Parse the unnamed statement with declared parameter types, Describe
-    /// it, Sync. Unnamed, so one connection can do it repeatedly: a named
-    /// statement cannot be re-parsed without a Close.
+    /// Parse the unnamed statement with declared parameter types, Describe it, Sync.
+    /// Unnamed, so one connection can do it repeatedly: a named statement cannot be
+    /// re-parsed without a Close.
     fn parse_and_describe(c: &mut Conn, v: &CatalogView, sql: &str, oids: &[u32]) -> Vec<u8> {
         let mut input = tagged(b'P', |b| {
             cstr(b, "");
@@ -3760,12 +3473,9 @@ mod tests {
         out
     }
 
-    /// **ParameterDescription reports the statement's parameters.** It
-    /// reported zero, always: Parse read the statement name and the SQL and
-    /// dropped the declared types on the floor. A driver checks the count
-    /// against its arguments before it binds -- pgx: `expected 0 arguments,
-    /// got 1`; rust-postgres: `Parameters(1, 0)` -- so no parametrised
-    /// statement could be executed at all.
+    /// ParameterDescription reports the statement's parameters.
+    /// It reported zero, always: Parse read the statement name and the SQL and dropped
+    /// the declared types on the floor.
     #[test]
     fn declared_parameter_types_are_reported() {
         let (mut c, v) = connected();
@@ -3776,12 +3486,8 @@ mod tests {
         assert_eq!(parameter_description(&out), vec![20, 25]);
     }
 
-    /// An undeclared parameter with a cast takes the cast's type; without
-    /// one it is reported as unknown (OID 0). Text was tried first and
-    /// measured to break pgx, which refuses to encode a Go integer into a
-    /// text parameter; given an unknown OID it encodes from the value's own
-    /// type, so `UPDATE t SET v = $1 WHERE id = $2` with two int64 arguments
-    /// -- the case in issue #1 -- goes through.
+    /// An undeclared parameter with a cast takes the cast's type; without one it is
+    /// reported as unknown (OID 0).
     #[test]
     fn undeclared_parameters_are_inferred_from_casts_or_reported_unknown() {
         let (mut c, v) = connected();
@@ -3796,8 +3502,8 @@ mod tests {
         let out = parse_and_describe(&mut c, &v, "select $1::int4, $2::int4", &[0, 20]);
         assert_eq!(parameter_description(&out), vec![23, 20]);
 
-        // Placeholders are counted by the highest number, not by occurrences,
-        // and a `$1` inside a string literal is not a placeholder.
+        // Placeholders are counted by the highest number, not by occurrences, and a
+        // `$1` inside a string literal is not a placeholder.
         let out = parse_and_describe(&mut c, &v, "select $2, $2, '$3'", &[]);
         assert_eq!(parameter_description(&out), vec![0, 0]);
 
@@ -3806,8 +3512,8 @@ mod tests {
         assert_eq!(parameter_description(&out), Vec::<u32>::new());
     }
 
-    /// A Parse whose declared count outruns its body is malformed, not
-    /// "zero parameters".
+    /// A Parse whose declared count outruns its body is malformed, not "zero
+    /// parameters".
     #[test]
     fn a_parse_with_a_truncated_type_list_is_malformed() {
         let (mut c, v) = connected();
@@ -3872,8 +3578,8 @@ mod tests {
         fields
     }
 
-    /// Parse `sql`, Bind with the given result formats, Describe the portal,
-    /// Execute, Sync -- the shape pgx and rust-postgres send for a query.
+    /// Parse `sql`, Bind with the given result formats, Describe the portal, Execute,
+    /// Sync -- the shape pgx and rust-postgres send for a query.
     fn query_with_formats(c: &mut Conn, v: &CatalogView, sql: &str, formats: &[i16]) -> Vec<u8> {
         let mut input = tagged(b'P', |b| {
             cstr(b, "");
@@ -3906,12 +3612,9 @@ mod tests {
         out
     }
 
-    /// **The result format a client asks for is the one it gets.** Bind read
-    /// two names and ignored the rest, so a portal bound with result format 1
+    /// The result format a client asks for is the one it gets.
+    /// Bind read two names and ignored the rest, so a portal bound with result format 1
     /// was described as text and answered with the one ASCII byte `1`.
-    /// rust-postgres decoded that as a binary INT8 and failed with
-    /// `UnexpectedEof`; pgx, which asks for binary int8 by default, failed
-    /// with `invalid length for int8: 1`. This is the second half of issue #1.
     #[test]
     fn a_binary_result_format_is_honoured() {
         let (mut c, v) = connected();
@@ -3945,8 +3648,8 @@ mod tests {
             .iter()
             .all(|f| f.as_ref().unwrap().len() == 8));
 
-        // **The values are the statement's**, not a stub: `select 1, 2` answers
-        // 1 and 2, each in the format its column was asked for.
+        // The values are the statement's, not a stub: `select 1, 2` answers 1 and 2,
+        // each in the format its column was asked for.
         let out = query_with_formats(&mut c, &v, "select 1, 2", &[0, 1]);
         assert_eq!(row_description_formats(&out), vec![0, 1]);
         let fields = data_row_fields(&out);
@@ -3954,9 +3657,9 @@ mod tests {
         assert_eq!(fields[1], Some(2i64.to_be_bytes().to_vec()));
     }
 
-    /// A select from a table the catalog knows describes the client's own
-    /// types, in the format the client asked for -- and answers no rows, which
-    /// is the rule for a metadata select and unchanged here.
+    /// A select from a table the catalog knows describes the client's own types, in the
+    /// format the client asked for -- and answers no rows, which is the rule for a
+    /// metadata select and unchanged here.
     #[test]
     fn known_columns_are_described_with_their_types_and_the_asked_format() {
         let (mut c, v) = connected();
@@ -3979,8 +3682,8 @@ mod tests {
         assert!(text.contains("SELECT 0"), "{text}");
     }
 
-    /// Describe of a STATEMENT has no portal and so no formats: PostgreSQL
-    /// reports text there, whatever a later Bind will ask for.
+    /// Describe of a STATEMENT has no portal and so no formats: PostgreSQL reports text
+    /// there, whatever a later Bind will ask for.
     #[test]
     fn describe_statement_reports_text_formats() {
         let (mut c, v) = connected();
@@ -3988,9 +3691,9 @@ mod tests {
         assert_eq!(row_description_formats(&out), vec![0]);
     }
 
-    /// Bind is parsed to its end and its counts are checked: the parameter
-    /// count must match the statement, and there are 0, 1 or n parameter
-    /// format codes. Anything else is 08P01, as it is in PostgreSQL.
+    /// Bind is parsed to its end and its counts are checked: the parameter count must
+    /// match the statement, and there are 0, 1 or n parameter format codes.
+    /// Anything else is 08P01, as it is in PostgreSQL.
     #[test]
     fn bind_counts_are_validated() {
         let (mut c, v) = connected();
@@ -4081,11 +3784,9 @@ mod tests {
         assert_eq!(tags(&out), vec![b'1', b'2']);
     }
 
-    /// **A portal is a cursor, and Execute reads `max_rows`.** Execute parsed
-    /// only the portal name, so a limit was ignored and a second Execute of the
-    /// same portal replayed the row. PostgreSQL returns the row and
-    /// PortalSuspended when the limit is hit, and `SELECT 0` with no row for
-    /// a portal already read to its end.
+    /// A portal is a cursor, and Execute reads `max_rows`.
+    /// Execute parsed only the portal name, so a limit was ignored and a second Execute
+    /// of the same portal replayed the row.
     #[test]
     fn a_portal_suspends_at_max_rows_and_does_not_replay() {
         let (mut c, v) = connected();
@@ -4104,8 +3805,8 @@ mod tests {
         assert!(text.contains("SELECT 0"), "{text}");
     }
 
-    /// No limit reads the portal to its end in one go, and a later Execute of
-    /// it finds nothing more.
+    /// No limit reads the portal to its end in one go, and a later Execute of it finds
+    /// nothing more.
     #[test]
     fn an_unlimited_execute_completes_the_portal() {
         let (mut c, v) = connected();
@@ -4119,8 +3820,8 @@ mod tests {
         assert_eq!(tags(&out), vec![b'C', b'Z']);
         assert!(String::from_utf8_lossy(&out).contains("SELECT 0"));
 
-        // Closed and bound again, it is a new portal, with its row. (A named
-        // portal cannot be rebound in place: that is 42P03.)
+        // Closed and bound again, it is a new portal, with its row.
+        // (A named portal cannot be rebound in place: that is 42P03.)
         let mut out = Vec::new();
         c.advance(
             &tagged(b'C', |b| {
@@ -4146,13 +3847,9 @@ mod tests {
         assert_eq!(tags(&out), vec![b'D', b'C', b'Z']);
     }
 
-    /// **A named object is not silently replaced.** Parsing named statement
-    /// `s` twice answered ParseComplete twice; PostgreSQL answers 42P05 the
-    /// second time. Binding named portal `p` twice answered BindComplete
-    /// twice; PostgreSQL answers 42P03. Since a portal refers to its
-    /// statement by name, replacing the statement also changed what an
-    /// already-bound portal would execute. Only the unnamed statement and
-    /// portal are replaceable, and a Close makes a name free again.
+    /// A named object is not silently replaced.
+    /// Parsing named statement `s` twice answered ParseComplete twice; PostgreSQL
+    /// answers 42P05 the second time.
     #[test]
     fn named_statements_and_portals_are_not_overwritten() {
         let (mut c, v) = connected();
@@ -4211,8 +3908,8 @@ mod tests {
         c.advance(&bind("p", "s"), &mut out, &v);
         assert_eq!(tags(&out), vec![b'3', b'Z', b'2', b'Z']);
 
-        // The unnamed statement and portal are replaced freely: every driver
-        // reuses them for every query.
+        // The unnamed statement and portal are replaced freely: every driver reuses
+        // them for every query.
         out.clear();
         c.advance(&parse("", "select 1"), &mut out, &v);
         c.advance(&parse("", "select 2"), &mut out, &v);
@@ -4238,10 +3935,7 @@ mod tests {
         assert_eq!(first_sqlstate(&out), "08P01");
     }
 
-    /// **An empty query is EmptyQueryResponse, not `SELECT 0`.** `""`, `";"`
-    /// and whitespace around a semicolon are all the empty statement, and
-    /// PostgreSQL answers `I` for it; this classified it as unknown text and
-    /// answered CommandComplete for a SELECT that was never written.
+    /// An empty query is EmptyQueryResponse, not `SELECT 0`.
     #[test]
     fn an_empty_query_is_an_empty_query_response() {
         for sql in ["", ";", " ; ", "\n;;\t"] {
@@ -4252,8 +3946,8 @@ mod tests {
         }
     }
 
-    /// The same through the extended protocol: Describe says NoData, and
-    /// Execute answers EmptyQueryResponse in place of CommandComplete.
+    /// The same through the extended protocol: Describe says NoData, and Execute
+    /// answers EmptyQueryResponse in place of CommandComplete.
     #[test]
     fn an_empty_prepared_statement_executes_to_an_empty_query_response() {
         let (mut c, v) = connected();
@@ -4264,8 +3958,8 @@ mod tests {
         assert_eq!(tags(&out), vec![b'1', b'2', b'n', b'I', b'Z']);
     }
 
-    /// An empty query is allowed in a failed transaction -- there is nothing
-    /// in it to refuse -- and leaves the state as it found it.
+    /// An empty query is allowed in a failed transaction -- there is nothing in it to
+    /// refuse -- and leaves the state as it found it.
     #[test]
     fn an_empty_query_is_allowed_in_a_failed_transaction() {
         let (mut c, v) = connected();
@@ -4277,8 +3971,8 @@ mod tests {
         assert_eq!(last_ready_status(&out), b'E');
     }
 
-    /// A placeholder PostgreSQL would refuse is refused at Parse, with its
-    /// SQLSTATE, and skips to Sync like any other Parse error.
+    /// A placeholder PostgreSQL would refuse is refused at Parse, with its SQLSTATE,
+    /// and skips to Sync like any other Parse error.
     #[test]
     fn an_invalid_placeholder_is_a_parse_error() {
         for (sql, code) in [("select $0", "42P02"), ("select $5000000", "54000")] {
@@ -4297,10 +3991,7 @@ mod tests {
         }
     }
 
-    /// **A header extension is skipped like a field, not waited for.** It
-    /// used to be gathered whole, which needed a ceiling; now it is a count
-    /// of bytes to discard, so any declared length -- 2 GB included -- costs
-    /// nothing to hold, and the tuples after a real one are counted.
+    /// A header extension is skipped like a field, not waited for.
     #[test]
     fn a_binary_copy_header_extension_is_skipped_not_buffered() {
         let ext = vec![0xabu8; 100 * 1024];
@@ -4309,9 +4000,9 @@ mod tests {
         let (_, out) = binary_copy(&[&stream[..50_000], &stream[50_000..]]);
         assert_eq!(copy_tag(&out), "COPY 1");
 
-        // A 2 GB extension is a count too. Nothing arrives after the header
-        // here, so CopyDone inside it is unexpected EOF, and the connection
-        // was never asked to hold anything.
+        // A 2 GB extension is a count too.
+        // Nothing arrives after the header here, so CopyDone inside it is unexpected
+        // EOF, and the connection was never asked to hold anything.
         let (mut c, v) = connected();
         let mut out = Vec::new();
         c.advance(
@@ -4341,8 +4032,8 @@ mod tests {
         assert_eq!(first_sqlstate(&out), "22P04");
     }
 
-    /// Start a COPY with `options` after STDIN, feed `chunks`, CopyDone; the
-    /// reply after CopyInResponse.
+    /// Start a COPY with `options` after STDIN, feed `chunks`, CopyDone; the reply
+    /// after CopyInResponse.
     fn text_copy(options: &str, chunks: &[&[u8]]) -> (Conn, Vec<u8>) {
         let (mut c, v) = connected();
         let mut out = Vec::new();
@@ -4362,9 +4053,9 @@ mod tests {
         String::from_utf8_lossy(&body[..body.len() - 1]).into_owned()
     }
 
-    /// **Text rows are lines, and the last line need not be terminated.**
-    /// Newlines were counted, so `a\nb\nc` answered `COPY 2` where PostgreSQL
-    /// reads the final unterminated line as a row and answers `COPY 3`.
+    /// Text rows are lines, and the last line need not be terminated.
+    /// Newlines were counted, so `a\nb\nc` answered `COPY 2` where PostgreSQL reads the
+    /// final unterminated line as a row and answers `COPY 3`.
     #[test]
     fn a_text_copy_counts_an_unterminated_final_line() {
         assert_eq!(copy_tag(&text_copy("", &[b"a\nb\nc"]).1), "COPY 3");
@@ -4375,10 +4066,9 @@ mod tests {
         assert_eq!(copy_tag(&text_copy("", &[b"\n"]).1), "COPY 1");
     }
 
-    /// In text format a backslash escapes the byte after it, including a
-    /// newline, which is then data and not a row end; a doubled backslash is
-    /// one backslash and the newline after it ends the row. And a line of
-    /// exactly `\.` ends the data: what follows is not counted.
+    /// In text format a backslash escapes the byte after it, including a newline, which
+    /// is then data and not a row end; a doubled backslash is one backslash and the
+    /// newline after it ends the row.
     #[test]
     fn a_text_copy_honours_escapes_and_the_end_marker() {
         assert_eq!(copy_tag(&text_copy("", &[b"a\\\nb\n"]).1), "COPY 1");
@@ -4395,11 +4085,9 @@ mod tests {
         assert_eq!(copy_tag(&text_copy("", &[b"a\n\\.x\n"]).1), "COPY 2");
     }
 
-    /// **CSV rows are lines outside quotes.** A quoted newline is field data;
-    /// `1,"hello\nworld"\n2,x\n` answered `COPY 3` where PostgreSQL answers
-    /// `COPY 2`. Quote state carries across CopyData boundaries, `""` inside
-    /// a quoted field is one quote, and a quote left open at CopyDone is the
-    /// error PostgreSQL raises for it.
+    /// CSV rows are lines outside quotes.
+    /// A quoted newline is field data; `1,"hello\nworld"\n2,x\n` answered `COPY 3`
+    /// where PostgreSQL answers `COPY 2`.
     #[test]
     fn a_csv_copy_counts_lines_outside_quotes() {
         let csv = b"1,\"hello\nworld\"\n2,x\n";
@@ -4427,11 +4115,7 @@ mod tests {
         assert_eq!(first_sqlstate(&out), "22P04");
     }
 
-    /// **Two more Bind shapes PostgreSQL rejects.** A result-format count
-    /// that is neither 0, 1 nor the statement's column count answered
-    /// BindComplete; PostgreSQL says `bind message has 2 result formats but
-    /// query has 1 columns`. A parameter length below -1 was taken as NULL;
-    /// only -1 is NULL and PostgreSQL rejects the message. Both 08P01.
+    /// Two more Bind shapes PostgreSQL rejects.
     #[test]
     fn bind_result_format_count_must_match_the_columns() {
         let (mut c, v) = connected();
@@ -4528,8 +4212,8 @@ mod tests {
         assert_eq!(first_sqlstate(&out), "08P01");
     }
 
-    /// The reviewer's end-to-end case: a comment glued to the direction must
-    /// still enter COPY, or the client's rows land outside one.
+    /// A comment glued to the direction must still enter COPY, or the client's rows
+    /// land outside one.
     #[test]
     fn a_comment_glued_to_a_token_still_enters_copy() {
         for sql in [
@@ -4549,12 +4233,7 @@ mod tests {
         }
     }
 
-    /// **A portal keeps the plan it was bound to.** The portal stored its
-    /// statement's NAME and looked the plan up at Execute, so Close of the
-    /// statement followed by a Parse reusing the name changed what an
-    /// already-bound portal ran: Parse s as SELECT 1, Bind p, Close s, Parse s
-    /// as BEGIN, Execute p answered `BEGIN` with status `T`. PostgreSQL keeps
-    /// the plan with the portal and answers the row and `I`.
+    /// A portal keeps the plan it was bound to.
     #[test]
     fn a_portal_keeps_its_plan_when_the_statement_name_is_reused() {
         let (mut c, v) = connected();
@@ -4583,8 +4262,8 @@ mod tests {
         assert_eq!(copy_tag(&out), "SELECT 1");
         assert_eq!(last_ready_status(&out), b'I');
 
-        // And a portal survives the Close of its statement on its own: the
-        // plan is the portal's, and the name was only how it was found.
+        // And a portal survives the Close of its statement on its own: the plan is the
+        // portal's, and the name was only how it was found.
         let (mut c, v) = connected();
         let mut out = Vec::new();
         c.advance(&parse("s", "select 1"), &mut out, &v);
@@ -4634,11 +4313,9 @@ mod tests {
         b
     }
 
-    /// **The protocol version is checked before anyone is authenticated.**
+    /// The protocol version is checked before anyone is authenticated.
     /// Every startup code other than SSL, GSS and Cancel fell through to
-    /// AuthenticationOk: protocol 4.0, 1.0 and an arbitrary 123 were all
-    /// welcomed. PostgreSQL refuses a major version it does not speak with a
-    /// FATAL 0A000 and closes.
+    /// AuthenticationOk: protocol 4.0, 1.0 and an arbitrary 123 were all welcomed.
     #[test]
     fn an_unsupported_protocol_version_is_refused_at_startup() {
         for code in [262144, 65536, 123, 0, -1] {
@@ -4659,8 +4336,8 @@ mod tests {
         }
     }
 
-    /// Any 3.x is spoken: 3.0 is what every driver sends, and a newer minor
-    /// is what PostgreSQL 18 negotiates down rather than refuses.
+    /// Any 3.x is spoken: 3.0 is what every driver sends, and a newer minor is what
+    /// PostgreSQL 18 negotiates down rather than refuses.
     #[test]
     fn protocol_three_is_accepted_whatever_the_minor() {
         for code in [196608, 196609, 196610] {
@@ -4672,8 +4349,7 @@ mod tests {
         }
     }
 
-    /// The reviewer's end-to-end case: a `)` inside a quoted column name
-    /// must not keep the statement out of COPY.
+    /// A `)` inside a quoted column name must not keep the statement out of COPY.
     #[test]
     fn a_quoted_paren_in_the_column_list_still_enters_copy() {
         let (mut c, v) = connected();
@@ -4687,10 +4363,9 @@ mod tests {
         assert_eq!(i16::from_be_bytes([out[6], out[7]]), 2, "two columns");
     }
 
-    /// **A Query without its terminating NUL is malformed, not empty.** The
-    /// body was read with `unwrap_or("")`, so `select 1` with no NUL became
-    /// the empty query and answered EmptyQueryResponse. PostgreSQL answers
-    /// 08P01, then ReadyForQuery since Query is a simple-protocol message.
+    /// A Query without its terminating NUL is malformed, not empty.
+    /// The body was read with `unwrap_or("")`, so `select 1` with no NUL became the
+    /// empty query and answered EmptyQueryResponse.
     #[test]
     fn a_query_without_a_nul_is_malformed() {
         let (mut c, v) = connected();
@@ -4702,8 +4377,8 @@ mod tests {
         assert_eq!(first_sqlstate(&out), "08P01");
     }
 
-    /// **Describe and Close take `S` or `P` and nothing else.** Any other
-    /// subtype was treated as a portal: Close `X` answered CloseComplete
+    /// Describe and Close take `S` or `P` and nothing else.
+    /// Any other subtype was treated as a portal: Close `X` answered CloseComplete
     /// where PostgreSQL answers 08P01.
     #[test]
     fn describe_and_close_subtypes_are_strict() {
@@ -4726,8 +4401,8 @@ mod tests {
                 assert_eq!(first_sqlstate(&out), "08P01");
             }
 
-            // And the two valid ones still work on the unnamed portal, which
-            // is never absent for Close and is refused as absent by Describe.
+            // And the two valid ones still work on the unnamed portal, which is never
+            // absent for Close and is refused as absent by Describe.
             let (mut c, v) = connected();
             let mut input = tagged(tag, |b| {
                 b.push(b'P');
@@ -4741,9 +4416,9 @@ mod tests {
         }
     }
 
-    /// **A body is its fields and nothing after them.** Query, Parse,
-    /// Describe, Close and Execute accepted a valid prefix plus trailing
-    /// bytes; PostgreSQL answers 08P01 for each. Bind already checked.
+    /// A body is its fields and nothing after them.
+    /// Query, Parse, Describe, Close and Execute accepted a valid prefix plus trailing
+    /// bytes; PostgreSQL answers 08P01 for each.
     #[test]
     fn trailing_bytes_after_a_body_are_malformed() {
         let cases: Vec<(&str, Vec<u8>, bool)> = vec![
@@ -4796,8 +4471,8 @@ mod tests {
 
         for (name, message, is_extended) in cases {
             let (mut c, v) = connected();
-            // Something to describe, close and execute, so the refusal is for
-            // the trailing bytes and not for a missing object.
+            // Something to describe, close and execute, so the refusal is for the
+            // trailing bytes and not for a missing object.
             let mut out = Vec::new();
             c.advance(&extended("select 1"), &mut out, &v);
 
