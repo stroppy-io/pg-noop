@@ -48,9 +48,10 @@ database was not, and it is not a TPC-C result.
 A SELECT answers its columns and no rows; `INSERT`/`UPDATE`/`DELETE` answer
 `INSERT 0 0`/`UPDATE 0`/`DELETE 0`; a constant select (`select 1`, `select
 @@version`) answers one row of exactly those values. A failure a benchmark
-injects (`SIGNAL`, a NULL into a NOT NULL column, `RAISE`, an unknown `CALL`) is
-answered as the error it is, so the client's rollback path runs and counts
-nothing.
+injects (`SIGNAL`, `RAISE`, an unknown `CALL`) is answered as the error it is, so
+the client's rollback path runs and counts nothing; a NULL written into a NOT NULL
+column is one too, under `--profile tpcc` only, where writing one is the injection
+rather than the data.
 
 `--profile tpcc` adds the numbers a TPC-C client reads: the district sum, the
 population counts, `pg_stat_database`'s transaction totals and `show global

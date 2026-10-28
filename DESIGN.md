@@ -27,11 +27,13 @@ failed transaction, and counting only explicit COMMITs made PostgreSQL report ze
 
 ## Injected failures are errors
 
-A benchmark exercises its rollback path on purpose: stroppy-rust writes a NULL into
-a NOT NULL column and sends `SIGNAL SQLSTATE '45000'`, HammerDB's PostgreSQL arm
-raises. Answering OK turns every injected rollback into a commit, so `tpcc::failure`
-matches `SIGNAL`, a written NULL, `RAISE` and an unknown `CALL`, and each protocol
-answers with its own numbers and states.
+A benchmark exercises its rollback path on purpose: `SIGNAL SQLSTATE '45000'`,
+`RAISE`, an unknown `CALL`, and under `--profile tpcc` a NULL written into a NOT
+NULL column. Answering OK turns every injected rollback into a commit, so
+`tpcc::failure` matches those four and each protocol answers with its own numbers and
+states. **The NULL is the profile's alone**: off, a NULL is data, and a client
+writing one into a nullable column is not injecting anything -- the same profile
+that decides the synthetic answers decides this.
 
 ## The synthetic answers are a profile
 

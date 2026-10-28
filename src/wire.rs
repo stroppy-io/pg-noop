@@ -1171,9 +1171,9 @@ impl Conn {
             if failed && !ends_transaction(&p.statement.plan.kind) {
                 return Some(None);
             }
-            // A NULL bound into an INSERT or UPDATE is the same injected failure a
-            // NULL literal is, and the client sends it as a value.
-            if p.bound_null && writes_null(&p.statement.plan.kind) {
+            // A NULL bound into an INSERT or UPDATE is the same failure a NULL literal
+            // is, and the same profile decides it.
+            if crate::tpcc::profile() && p.bound_null && writes_null(&p.statement.plan.kind) {
                 return Some(Some(crate::tpcc::Failure::Null));
             }
             crate::tpcc::failure(&p.statement.plan.sql, Dialect::Postgres).map(Some)
@@ -2884,6 +2884,47 @@ mod tests {
         assert!(framed < input.len());
     }
 
+    /// **A NULL is an injected failure only under `--profile tpcc`.** Off, a client
+    /// writing a NULL -- as a literal or as a bound value -- is writing data, and the
+    /// statement is answered as the no-op it is.
+    #[test]
+    fn a_null_is_data_without_the_profile() {
+        let _state = crate::tpcc::state_guard(false, 10);
+        let (mut c, v) = connected();
+
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'Q', |b| cstr(b, "insert into t values (1, NULL, 3)")),
+            &mut out,
+            &v,
+        );
+        assert_eq!(tags(&out), vec![b'C', b'Z'], "the literal: {out:?}");
+        assert!(String::from_utf8_lossy(&out).contains("INSERT 0 0"));
+
+        // And the same NULL as a parameter, through Parse/Bind/Execute.
+        let mut out = Vec::new();
+        c.advance(
+            &parse_msg("ins", "insert into t values ($1)", &[]),
+            &mut out,
+            &v,
+        );
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'B', |b| {
+                cstr(b, "");
+                cstr(b, "ins");
+                b.extend_from_slice(&0i16.to_be_bytes());
+                b.extend_from_slice(&1i16.to_be_bytes());
+                b.extend_from_slice(&(-1i32).to_be_bytes());
+                b.extend_from_slice(&0i16.to_be_bytes());
+            }),
+            &mut out,
+            &v,
+        );
+        let out = execute(&mut c, &v, "", 0);
+        assert_eq!(tags(&out), vec![b'C', b'Z'], "the bound NULL: {out:?}");
+    }
+
     /// **Execute's row limit truncates a multi-row answer.** `show global status`
     /// answers two rows; a portal asked for one gets one and `PortalSuspended`.
     #[test]
@@ -2902,6 +2943,7 @@ mod tests {
     /// what was bound, not only at the statement's text.
     #[test]
     fn a_bound_null_fails_an_insert() {
+        let _state = crate::tpcc::state_guard(true, 10);
         let (mut c, v) = connected();
         let mut out = Vec::new();
         c.advance(
@@ -2938,6 +2980,7 @@ mod tests {
     /// is 25P02 -- nothing runs until the transaction ends -- and not the NULL's 23502.
     #[test]
     fn a_failed_transaction_is_refused_before_the_injected_failure() {
+        let _state = crate::tpcc::state_guard(true, 10);
         let (mut c, v) = connected();
         // Prepared before the transaction fails: a Parse inside one is refused and
         // would be the only thing this test saw.
@@ -2982,6 +3025,7 @@ mod tests {
     /// success.
     #[test]
     fn an_injected_failure_is_refused_through_execute() {
+        let _state = crate::tpcc::state_guard(true, 10);
         let (mut c, v) = connected();
         let mut out = Vec::new();
         c.advance(
