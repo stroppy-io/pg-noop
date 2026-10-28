@@ -605,6 +605,11 @@ mod tests {
 
     /// The counters a client reads are the ones the statements counted, and the
     /// line on stderr says the same.
+    ///
+    /// The assertions are monotone rather than exact: the counters are
+    /// process-wide and the other tests in this binary count transactions too.
+    /// The exact arithmetic is pinned in `tests/wire.rs`, where each test owns a
+    /// server process.
     #[test]
     fn the_counters_are_reported() {
         let commits = com_commit();
@@ -613,9 +618,9 @@ mod tests {
         note_rollback();
         note(Kind::Payment);
 
-        assert_eq!(com_commit(), commits + 1, "a commit is counted");
+        assert!(com_commit() > commits, "a commit is counted");
         assert!(com_rollback() > 0);
-        assert_eq!(STATS.payment.load(Ordering::Relaxed), payments + 1);
+        assert!(STATS.payment.load(Ordering::Relaxed) > payments);
 
         let line = line();
         for field in [
