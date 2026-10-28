@@ -592,6 +592,47 @@ static CQSIZE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 /// Sizing the completion queue from it is what `CQSIZE` below is about.
 const ENTRIES: u32 = 4096;
 
+/// Everything a shard owns besides its ring: the connections on its slots, the
+/// slots that came free, the buffers to hand the next connection, and the
+/// provided-buffer ring they come from.
+#[derive(Default)]
+struct Shard {
+    slots: Vec<Option<Slot>>,
+    free: Vec<usize>,
+    spare: Vec<Spare>,
+    bufs: Option<BufRing>,
+}
+
+impl Ring<'_> {
+    /// Act on what a slot needs next: send, close, arm, park, or nothing.
+    ///
+    /// One place for the decision's consequences, so a completion and a deadline
+    /// cannot act on the same `Next` differently.
+    fn apply(
+        &mut self,
+        idx: usize,
+        next: Next,
+        shard: &mut Shard,
+        multishot: bool,
+    ) -> io::Result<()> {
+        match next {
+            Next::Send => submit_send(self, &mut shard.slots, idx)?,
+            Next::Close => begin_close(
+                &mut shard.slots,
+                &mut shard.free,
+                &mut shard.spare,
+                shard.bufs.as_mut(),
+                idx,
+            ),
+            Next::Arm => arm_recv(self, &mut shard.slots, shard.bufs.as_ref(), idx, multishot)?,
+            Next::Park => park_recv(self, &mut shard.slots, idx)?,
+            Next::Idle => {}
+        }
+
+        Ok(())
+    }
+}
+
 /// A shard's ring, with the submission and completion queues taken apart once.
 struct Ring<'a> {
     submit: io_uring::Submitter<'a>,
@@ -842,22 +883,14 @@ struct Stats {
 /// `run`, with the shard's knobs supplied rather than read from the process.
 fn run_until(listener: TcpListener, codec: Codec, tuning: Tuning) -> io::Result<Attempt> {
     // Slot 0 is reserved for the accept operation so an index is never ambiguous.
-    let mut slots: Vec<Option<Slot>> = vec![None];
-    let mut free_slots: Vec<usize> = Vec::new();
-    let mut spare: Vec<Spare> = Vec::new();
-    let mut bufs: Option<BufRing> = None;
+    let mut shard = Shard {
+        slots: vec![None],
+        ..Shard::default()
+    };
 
-    let outcome = passes(
-        listener,
-        codec,
-        tuning,
-        &mut slots,
-        &mut free_slots,
-        &mut spare,
-        &mut bufs,
-    );
+    let outcome = passes(listener, codec, tuning, &mut shard);
 
-    match finish(outcome, &mut slots)? {
+    match finish(outcome, &mut shard.slots)? {
         Passed::NoRing(listener) => Ok(Attempt::NoRing(listener)),
         Passed::Served => Ok(Attempt::Served),
     }
@@ -962,10 +995,7 @@ fn passes(
     listener: TcpListener,
     codec: Codec,
     tuning: Tuning,
-    slots: &mut Vec<Option<Slot>>,
-    free_slots: &mut Vec<usize>,
-    spare: &mut Vec<Spare>,
-    bufs: &mut Option<BufRing>,
+    shard: &mut Shard,
 ) -> io::Result<Passed> {
     let plan = plan();
     let setup = Setup {
@@ -998,7 +1028,7 @@ fn passes(
         }
     }
 
-    *bufs = match plan.pbuf {
+    shard.bufs = match plan.pbuf {
         Some(_granted_incremental) => register_buffers(
             &submit,
             tuning.pbuf_count,
@@ -1018,7 +1048,7 @@ fn passes(
 
     #[cfg(test)]
     if let Some(s) = &tuning.stats {
-        s.provided.store(bufs.is_some(), Ordering::Relaxed);
+        s.provided.store(shard.bufs.is_some(), Ordering::Relaxed);
     }
     #[cfg(test)]
     if let Some(up) = &tuning.up {
@@ -1053,7 +1083,7 @@ fn passes(
     // Multishot receive is discovered from the kernel's answer, not from a version
     // number: a kernel that does not know `IORING_RECV_MULTISHOT` answers the first
     // receive with EINVAL, and every receive after that is a one-shot into a provided
-    let mut multishot = bufs.is_some();
+    let mut multishot = shard.bufs.is_some();
     let mut scratch: Vec<usize> = Vec::new();
 
     arm_accept(&mut ring, listen_fd, &mut accept_armed)?;
@@ -1110,10 +1140,10 @@ fn passes(
                             set_nodelay(fd);
 
                             let admitted = tuning.startup_timeout.map(|t| Instant::now() + t);
-                            let recycled = spare.pop().unwrap_or_default();
-                            let idx = match free_slots.pop() {
+                            let recycled = shard.spare.pop().unwrap_or_default();
+                            let idx = match shard.free.pop() {
                                 Some(i) => {
-                                    slots[i] = Some(Slot::new(
+                                    shard.slots[i] = Some(Slot::new(
                                         fd,
                                         admitted,
                                         recycled,
@@ -1123,22 +1153,22 @@ fn passes(
                                     i
                                 }
                                 None => {
-                                    slots.push(Some(Slot::new(
+                                    shard.slots.push(Some(Slot::new(
                                         fd,
                                         admitted,
                                         recycled,
                                         &codec,
                                         tuning.water,
                                     )));
-                                    slots.len() - 1
+                                    shard.slots.len() - 1
                                 }
                             };
                             // MySQL speaks first.
                             if let Some(prelude) = codec.prelude() {
-                                if let Some(slot) = slots[idx].as_mut() {
+                                if let Some(slot) = shard.slots[idx].as_mut() {
                                     slot.send.extend_from_slice(prelude);
                                 }
-                                submit_send(&mut ring, slots, idx)?;
+                                submit_send(&mut ring, &mut shard.slots, idx)?;
                             }
                             // Only a connection with a deadline belongs in the list the
                             // expiry pass walks; without one it is an entry the pass
@@ -1147,7 +1177,13 @@ fn passes(
                                 startup.push(idx);
                                 earliest_startup = Some(earliest_startup.map_or(at, |e| e.min(at)));
                             }
-                            arm_recv(&mut ring, slots, bufs.as_ref(), idx, multishot)?;
+                            arm_recv(
+                                &mut ring,
+                                &mut shard.slots,
+                                shard.bufs.as_ref(),
+                                idx,
+                                multishot,
+                            )?;
                         } else {
                             let err = -res;
                             if accept_should_pause(err) {
@@ -1177,8 +1213,8 @@ fn passes(
                         let bid = cqueue::buffer_select(flags);
 
                         // The buffer is the shard's, not the connection's.
-                        let Some(slot) = slots.get_mut(idx).and_then(|s| s.as_mut()) else {
-                            if let (Some(bid), Some(b)) = (bid, bufs.as_mut()) {
+                        let Some(slot) = shard.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
+                            if let (Some(bid), Some(b)) = (bid, shard.bufs.as_mut()) {
                                 b.put(bid);
                             }
                             continue;
@@ -1201,7 +1237,7 @@ fn passes(
                         let mut src: *const u8 = std::ptr::null();
                         let mut n = 0usize;
 
-                        if let (Some(bid), Some(b)) = (bid, bufs.as_mut()) {
+                        if let (Some(bid), Some(b)) = (bid, shard.bufs.as_mut()) {
                             // A one-shot descriptor is the whole of one read: the bytes
                             // start at the buffer and the buffer goes back as soon as
                             // the codec has seen them.
@@ -1218,7 +1254,7 @@ fn passes(
 
                         if res <= 0 {
                             // An error can still carry a buffer.
-                            if let (Some(bid), Some(b)) = (release, bufs.as_mut()) {
+                            if let (Some(bid), Some(b)) = (release, shard.bufs.as_mut()) {
                                 b.put(bid);
                             }
 
@@ -1260,15 +1296,7 @@ fn passes(
                                 _ => Next::Close,
                             };
 
-                            match next {
-                                Next::Arm => {
-                                    arm_recv(&mut ring, slots, bufs.as_ref(), idx, multishot)?
-                                }
-                                Next::Close => {
-                                    begin_close(slots, free_slots, spare, bufs.as_mut(), idx)
-                                }
-                                _ => {}
-                            }
+                            ring.apply(idx, next, shard, multishot)?;
                             continue;
                         }
 
@@ -1298,7 +1326,7 @@ fn passes(
                         );
 
                         // Only now: the codec has read what the buffer held.
-                        if let (Some(bid), Some(b)) = (release, bufs.as_mut()) {
+                        if let (Some(bid), Some(b)) = (release, shard.bufs.as_mut()) {
                             b.put(bid);
                         }
 
@@ -1314,20 +1342,13 @@ fn passes(
                         }
 
                         let next = next_for(slot);
-                        match next {
-                            Next::Send => submit_send(&mut ring, slots, idx)?,
-                            Next::Close => {
-                                begin_close(slots, free_slots, spare, bufs.as_mut(), idx)
-                            }
-                            Next::Arm => arm_recv(&mut ring, slots, bufs.as_ref(), idx, multishot)?,
-                            Next::Park => park_recv(&mut ring, slots, idx)?,
-                            Next::Idle => {}
-                        }
+                        ring.apply(idx, next, shard, multishot)?;
                     }
 
                     OP_SEND => {
                         let next = {
-                            let Some(slot) = slots.get_mut(idx).and_then(|s| s.as_mut()) else {
+                            let Some(slot) = shard.slots.get_mut(idx).and_then(|s| s.as_mut())
+                            else {
                                 continue;
                             };
                             slot.sending = false;
@@ -1349,33 +1370,18 @@ fn passes(
                                 }
                             }
                         };
-                        match next {
-                            Next::Send => submit_send(&mut ring, slots, idx)?,
-                            Next::Close => {
-                                begin_close(slots, free_slots, spare, bufs.as_mut(), idx)
-                            }
-                            Next::Arm => arm_recv(&mut ring, slots, bufs.as_ref(), idx, multishot)?,
-                            Next::Park => park_recv(&mut ring, slots, idx)?,
-                            Next::Idle => {}
-                        }
+                        ring.apply(idx, next, shard, multishot)?;
                     }
 
                     OP_CANCEL => {
                         let next = {
-                            let Some(slot) = slots.get_mut(idx).and_then(|s| s.as_mut()) else {
+                            let Some(slot) = shard.slots.get_mut(idx).and_then(|s| s.as_mut())
+                            else {
                                 continue;
                             };
                             after_cancel_request(slot, res)
                         };
-                        match next {
-                            Next::Send => submit_send(&mut ring, slots, idx)?,
-                            Next::Close => {
-                                begin_close(slots, free_slots, spare, bufs.as_mut(), idx)
-                            }
-                            Next::Arm => arm_recv(&mut ring, slots, bufs.as_ref(), idx, multishot)?,
-                            Next::Park => park_recv(&mut ring, slots, idx)?,
-                            Next::Idle => {}
-                        }
+                        ring.apply(idx, next, shard, multishot)?;
                     }
 
                     _ => {
@@ -1411,7 +1417,8 @@ fn passes(
             let mut next: Option<Instant> = None;
             scratch.clear();
             for idx in startup.drain(..) {
-                let deadline = slots
+                let deadline = shard
+                    .slots
                     .get_mut(idx)
                     .and_then(|s| s.as_mut())
                     .and_then(|slot| slot.startup_deadline);
@@ -1426,7 +1433,7 @@ fn passes(
                     continue;
                 }
 
-                if let Some(slot) = slots.get_mut(idx).and_then(|s| s.as_mut()) {
+                if let Some(slot) = shard.slots.get_mut(idx).and_then(|s| s.as_mut()) {
                     if slot.session.awaiting_startup() {
                         eprintln!(
                             "dbnoop: connection did not complete startup within {}ms; closing",
@@ -1438,7 +1445,7 @@ fn passes(
 
                 // `shutdown`, not `close`: a receive in flight may not be freed, and
                 // shutting down makes it return 0 so the ordinary path reaps it.
-                begin_close(slots, free_slots, spare, bufs.as_mut(), idx);
+                ring.apply(idx, Next::Close, shard, multishot)?;
             }
             std::mem::swap(&mut startup, &mut scratch);
             earliest_startup = next;
