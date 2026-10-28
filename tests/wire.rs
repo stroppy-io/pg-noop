@@ -384,21 +384,23 @@ fn a_multi_statement_query_is_answered_in_order() {
     let mut client = Client::connect(server.mysql);
 
     let answer = client.query("set @x = 1; select 1; set @y = 2");
-    // OK, then the result set's column count, its definition and its
-    // terminator, then the last OK.
-    assert_eq!(answer.len(), 5, "{answer:?}");
+    // OK, then the result set's column count, its definition, its one row and
+    // its terminator, then the last OK.
+    assert_eq!(answer.len(), 6, "{answer:?}");
 
     // First: an OK packet with more to come.
     assert_eq!(answer[0].body[0], 0x00);
     assert_ne!(answer[0].status() & MORE_RESULTS_EXISTS, 0);
 
     // Second: the result set, whose terminator also says more.
-    assert_eq!(answer[3].body[0], 0xfe);
-    assert_ne!(answer[3].status() & MORE_RESULTS_EXISTS, 0);
+    assert_eq!(answer[2].body[0], 3, "a column definition");
+    assert_eq!(answer[3].body, b"\x01\x31", "one row: the constant 1");
+    assert_eq!(answer[4].body[0], 0xfe);
+    assert_ne!(answer[4].status() & MORE_RESULTS_EXISTS, 0);
 
     // Last: an OK packet with the sequence complete.
-    assert_eq!(answer[4].body[0], 0x00);
-    assert_eq!(answer[4].status() & MORE_RESULTS_EXISTS, 0);
+    assert_eq!(answer[5].body[0], 0x00);
+    assert_eq!(answer[5].status() & MORE_RESULTS_EXISTS, 0);
 }
 
 /// **A prepared statement is prepared, executed twice and closed**, and a closed
@@ -865,4 +867,49 @@ fn both_binary_names_serve() {
             "{binary} did not answer a query: {answer:?}"
         );
     }
+}
+
+/// **A prepared statement's row is in the binary protocol**, over a real socket:
+/// the client here sends the parameter types and reads the row bytes the way a
+/// driver does.
+#[test]
+fn a_prepared_select_answers_a_binary_row() {
+    let server = server();
+    let mut client = Client::connect(server.mysql);
+
+    client.command(COM_STMT_PREPARE, b"select 1");
+    let prepare = client.read();
+    assert_eq!(prepare.body[0], 0x00, "a prepare response");
+    let id = u32::from_le_bytes([
+        prepare.body[1],
+        prepare.body[2],
+        prepare.body[3],
+        prepare.body[4],
+    ]);
+    let columns = u16::from_le_bytes([prepare.body[5], prepare.body[6]]);
+    assert_eq!(columns, 1);
+    let definition = client.read();
+    assert_eq!(definition.body[0], 3, "the column's definition");
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&id.to_le_bytes());
+    body.push(0x00); // no cursor
+    body.extend_from_slice(&1u32.to_le_bytes()); // iteration count
+    body.push(0x00); // null bitmap
+    client.command(COM_STMT_EXECUTE, &body);
+
+    // The column count, the definition, the row, the terminator.
+    let count = client.read();
+    assert_eq!(count.body, vec![1]);
+    let _definition = client.read();
+    let row = client.read();
+    assert_eq!(row.body[0], 0x00, "the binary row header: {:?}", row.body);
+    assert_eq!(row.body[1], 0x00, "a NULL bitmap with nothing in it");
+    assert_eq!(
+        &row.body[2..10],
+        &1i64.to_le_bytes(),
+        "the value 1, as int8"
+    );
+    let terminator = client.read();
+    assert_eq!(terminator.body[0], 0xfe);
 }

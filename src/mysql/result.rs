@@ -65,7 +65,7 @@ pub fn err(out: &mut Vec<u8>, seq: &mut u8, code: u16, sqlstate: &str, message: 
 /// The type and width of one column, decided by what the answer holds rather
 /// than by any parsing of the statement: everything this server sends is either
 /// a decimal integer or a string.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     /// `MYSQL_TYPE_VAR_STRING`, which any client decodes as text.
     Text,
@@ -113,12 +113,6 @@ impl Column<'_> {
         out.extend_from_slice(&[0, 0]); // filler
         packet::end(out, at);
     }
-}
-
-/// One column-definition packet on its own: what a prepare response puts in
-/// front of its parameters and its result columns, with no count in front of it.
-pub fn definition(out: &mut Vec<u8>, seq: &mut u8, column: &Column<'_>) {
-    column.write(out, seq);
 }
 
 /// One definition per column, and -- unless the client deprecated it -- the EOF
@@ -172,6 +166,39 @@ pub fn row(out: &mut Vec<u8>, seq: &mut u8, values: &[Option<&str>]) {
         match value {
             Some(v) => packet::put_lenenc_bytes(out, v.as_bytes()),
             None => out.push(0xfb),
+        }
+    }
+    packet::end(out, at);
+}
+
+/// One value of a binary-protocol row.
+#[allow(dead_code)] // the text values are only reached once a rule answers text
+pub enum Value<'a> {
+    /// A `MYSQL_TYPE_LONGLONG`: eight bytes, little-endian.
+    LongLong(i64),
+    /// A string, in the binary protocol's length-encoded form.
+    Text(&'a str),
+}
+
+/// A **binary-protocol** row, which is what `COM_STMT_EXECUTE` answers with.
+///
+/// It is not the text row with other contents: the packet starts with a `0x00`
+/// header, then a NULL bitmap whose first two bits are reserved (so the bitmap
+/// is `(columns + 7 + 2) / 8` bytes, whatever the column count), then each value
+/// in the binary form of its type. A client that prepared a statement decodes
+/// exactly this; a text row leaves it reading a string where it expects eight
+/// bytes.
+pub fn binary_row(out: &mut Vec<u8>, seq: &mut u8, values: &[Value<'_>]) {
+    let at = packet::begin(out, seq);
+    out.push(0x00);
+    // The protocol's offset: two reserved bits precede the first column.
+    for _ in 0..(values.len() + 7 + 2) / 8 {
+        out.push(0x00); // no NULLs: every value this server sends is a value
+    }
+    for value in values {
+        match value {
+            Value::LongLong(n) => out.extend_from_slice(&n.to_le_bytes()),
+            Value::Text(text) => packet::put_lenenc_bytes(out, text.as_bytes()),
         }
     }
     packet::end(out, at);

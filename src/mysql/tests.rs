@@ -357,8 +357,8 @@ fn multi_statement_query_answers_each_statement_with_more_results_except_the_las
     // The second is a result set, also with more to come: its column count is
     // one, its definition follows, then the terminator.
     let packets = round_trip(&mut c, &query("select 1; select 2; select 3"));
-    let (columns, rows, status) = result_set(&packets[..3]);
-    assert_eq!((columns, rows), (1, 0));
+    let (columns, rows, status) = result_set(&packets[..4]);
+    assert_eq!((columns, rows), (1, 1), "a constant select answers one row");
     assert_eq!(
         status,
         AUTOCOMMIT | MORE_RESULTS_EXISTS,
@@ -375,14 +375,15 @@ fn every_statement_of_a_multi_statement_query_is_answered() {
     c.advance(&query("select 1; set @x = 2; select 3"), &mut out);
 
     let packets = packets(&out);
-    // select -> 1 + 1 definition + terminator = 3 packets, set -> 1, select -> 3.
-    assert_eq!(packets.len(), 7, "{packets:?}");
+    // select -> count + definition + one row + terminator = 4 packets, set -> 1,
+    // select -> 4.
+    assert_eq!(packets.len(), 9, "{packets:?}");
     assert_eq!(
-        result_set(&packets[..3]).2,
+        result_set(&packets[..4]).2,
         AUTOCOMMIT | MORE_RESULTS_EXISTS
     );
-    assert_eq!(ok_status(&packets[3]), AUTOCOMMIT | MORE_RESULTS_EXISTS);
-    assert_eq!(result_set(&packets[4..]).2, AUTOCOMMIT);
+    assert_eq!(ok_status(&packets[4]), AUTOCOMMIT | MORE_RESULTS_EXISTS);
+    assert_eq!(result_set(&packets[5..]).2, AUTOCOMMIT);
 }
 
 /// Empty statements between semicolons answer nothing at all: an answer the
@@ -694,8 +695,9 @@ fn pipelined_commands_are_answered_in_order() {
     let mut out = Vec::new();
     assert_eq!(c.advance(&input, &mut out), input.len());
 
-    // Three answers: a 3-packet result set, a 1-packet OK, a 5-packet result
-    // set. Every answer restarts its sequence at one.
+    // Three answers: a 4-packet result set (count, definition, row,
+    // terminator), a 1-packet OK, a 6-packet result set (three columns). Every
+    // answer restarts its sequence at one.
     let mut rest = &out[..];
     let mut sizes = vec![0usize];
     let mut expected = 1u8;
@@ -710,7 +712,7 @@ fn pipelined_commands_are_answered_in_order() {
         *sizes.last_mut().expect("an answer") += 1;
         rest = &rest[packet::HEADER + len..];
     }
-    assert_eq!(sizes, vec![0, 3, 1, 5], "3 + 1 + 5 packets");
+    assert_eq!(sizes, vec![0, 4, 1, 6], "4 + 1 + 6 packets");
 }
 
 /// **A command split across the protocol's 16 MiB packets is one command.**
@@ -844,6 +846,17 @@ fn definition_name(packet: &[u8]) -> String {
     String::from_utf8(r.lenenc_bytes().expect("the name").to_vec()).expect("utf-8")
 }
 
+/// Every value of a row packet.
+fn row_values(packet: &[u8]) -> Vec<String> {
+    let mut r = Reader::new(packet);
+    let mut values = Vec::new();
+    while !r.rest().is_empty() {
+        values.push(String::from_utf8(r.lenenc_bytes().expect("a value").to_vec()).expect("utf-8"));
+    }
+
+    values
+}
+
 /// The value of a one-column row packet: its body, without the length prefixes
 /// this server never has more than one of in a row.
 fn row_value(packet: &[u8]) -> String {
@@ -892,4 +905,138 @@ fn the_tpcc_rules_answer_with_numbers() {
     let (columns, rows, _) = result_set(&packets);
     assert_eq!((columns, rows), (2, 1));
     assert_eq!(row_value(&packets[3]), "1", "the first variable");
+}
+
+/// **A constant SELECT answers one row, the way PostgreSQL answers one.**
+///
+/// `select 1` answered zero rows, so `mariadb -e 'select 1'` printed nothing --
+/// which reads as a broken server rather than as a no-op one, and is what turned
+/// up in review. A select list of literals has a value the server can state
+/// without knowing anything: itself.
+#[test]
+fn a_constant_select_answers_one_row() {
+    let mut c = connected(CAPS);
+
+    let packets = round_trip(&mut c, &query("select 1"));
+    let (columns, rows, status) = result_set(&packets);
+    assert_eq!((columns, rows, status), (1, 1, AUTOCOMMIT));
+    assert_eq!(row_value(&packets[2]), "1");
+
+    // Several literals, and a string keeps its own text.
+    let packets = round_trip(&mut c, &query("select 2, 'abc', 42"));
+    let (columns, rows, _) = result_set(&packets);
+    assert_eq!((columns, rows), (3, 1));
+    let values = row_values(&packets[4]);
+    assert_eq!(values, vec!["2", "abc", "42"]);
+
+    // A select that names a table still answers no rows: the server has none.
+    let packets = round_trip(&mut c, &query("select 1 from warehouse"));
+    assert_eq!(result_set(&packets).1, 0, "{packets:?}");
+
+    // And a select of a column is not a constant.
+    let packets = round_trip(&mut c, &query("select w_id from warehouse"));
+    assert_eq!(result_set(&packets).1, 0);
+}
+
+/// **The variables a client reads at connect answer plausible values**, rather
+/// than an empty result set a driver cannot parse.
+#[test]
+fn the_connect_variables_answer_plausible_values() {
+    let mut c = connected(CAPS);
+
+    for (sql, expected) in [
+        ("select @@version", "8.0.0-db-noop"),
+        ("select @@max_allowed_packet", "16777216"),
+        ("select @@autocommit", "1"),
+        ("select @@tx_isolation", "REPEATABLE-READ"),
+        ("select @@transaction_isolation", "REPEATABLE-READ"),
+        ("select @@session.auto_increment_increment", "1"),
+        ("select @@session.tx_isolation", "REPEATABLE-READ"),
+        ("select @@sql_mode", ""),
+        ("select @@character_set_client", "utf8mb4"),
+    ] {
+        let packets = round_trip(&mut c, &query(sql));
+        let (columns, rows, _) = result_set(&packets);
+        assert_eq!((columns, rows), (1, 1), "{sql}: {packets:?}");
+        assert_eq!(row_value(&packets[2]), expected, "{sql}");
+    }
+
+    // A variable nobody asked us about has a plausible number rather than
+    // nothing: a client that reads it at connect must not get zero rows.
+    let packets = round_trip(&mut c, &query("select @@lower_case_table_names"));
+    assert_eq!(result_set(&packets).1, 1);
+}
+
+/// **`COM_STMT_EXECUTE` answers BINARY rows.**
+///
+/// The binary protocol's row is not the text one: a `0x00` header, a NULL
+/// bitmap whose offset is two bits, and each value in its type's own binary form
+/// -- a LONGLONG is eight bytes little-endian, not "1". A client that asked for
+/// a prepared statement reads those bytes as numbers, so a text row makes it
+/// print nonsense or lose the stream.
+#[test]
+fn a_prepared_statement_answers_binary_rows() {
+    let mut c = connected(CAPS);
+
+    let packets = round_trip(&mut c, &command(cmd::STMT_PREPARE, b"select 1"));
+    let mut r = Reader::new(&packets[0]);
+    r.u8().expect("header");
+    let id = r.u32().expect("statement id");
+    assert_eq!(r.u16(), Some(1), "one column");
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&id.to_le_bytes());
+    body.push(0x00);
+    body.extend_from_slice(&1u32.to_le_bytes());
+    let packets = round_trip(&mut c, &command(cmd::STMT_EXECUTE, &body));
+
+    // count, definition, one binary row, terminator.
+    assert_eq!(packets.len(), 4, "{packets:?}");
+    let row = &packets[2];
+    assert_eq!(row[0], 0x00, "the binary row header");
+    assert_eq!(row[1], 0x00, "a NULL bitmap: nothing is NULL");
+    assert_eq!(
+        &row[2..10],
+        &1i64.to_le_bytes(),
+        "a LONGLONG is eight bytes, little-endian"
+    );
+}
+
+/// **The district sum is binary too when it is executed as a prepared
+/// statement**, and its column is the LONGLONG a client decodes it as.
+#[test]
+fn a_prepared_district_sum_answers_a_binary_longe_long() {
+    let mut c = connected(CAPS);
+
+    let packets = round_trip(
+        &mut c,
+        &command(cmd::STMT_PREPARE, b"select sum(d_next_o_id) from district"),
+    );
+    let mut r = Reader::new(&packets[0]);
+    r.u8().expect("header");
+    let id = r.u32().expect("statement id");
+    let columns = r.u16().expect("column count");
+    assert_eq!(columns, 1);
+    // The definition's type: a client decodes the row by it.
+    let definition = &packets[1];
+    assert!(
+        definition.windows(2).any(|w| w == [0x08, 0x00]),
+        "MYSQL_TYPE_LONGLONG and no flags: {definition:?}"
+    );
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&id.to_le_bytes());
+    body.push(0x00);
+    body.extend_from_slice(&1u32.to_le_bytes());
+    let packets = round_trip(&mut c, &command(cmd::STMT_EXECUTE, &body));
+
+    let row = &packets[2];
+    assert_eq!(row[0], 0x00, "the binary row header");
+    let mut value = [0u8; 8];
+    value.copy_from_slice(&row[2..10]);
+    let sum = i64::from_le_bytes(value);
+    assert!(
+        (300100..=300100 + 1_000_000).contains(&sum),
+        "{sum} is not a district sum"
+    );
 }
