@@ -21,6 +21,9 @@ struct Server {
     child: Child,
     postgres: u16,
     mysql: u16,
+    /// Every line the server has written to stderr, so a test can read what the
+    /// banner claimed as well as what the ports answer.
+    log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Drop for Server {
@@ -46,6 +49,8 @@ fn banner(mut child: Child) -> Server {
     // by a thread that keeps reading afterwards rather than by a reader the
     // function drops.
     let (tx, rx) = std::sync::mpsc::channel();
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = std::sync::Arc::clone(&log);
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
         let mut line = String::new();
@@ -54,6 +59,9 @@ fn banner(mut child: Child) -> Server {
             match reader.read_line(&mut line) {
                 Ok(0) | Err(_) => return,
                 Ok(_) => {
+                    if let Ok(mut log) = recorded.lock() {
+                        log.push(line.clone());
+                    }
                     // Ignored: after the test ends nobody is listening, and the
                     // pipe still needs emptying.
                     let _ = tx.send(line.clone());
@@ -96,6 +104,7 @@ fn banner(mut child: Child) -> Server {
         child,
         postgres: postgres.expect("a postgres port"),
         mysql: mysql.expect("a mysql port"),
+        log,
     }
 }
 
@@ -563,25 +572,31 @@ fn each_port_speaks_its_own_protocol() {
 
 /// The `--warehouses` the rules start from, when a test says otherwise.
 fn server_with(args: &[&str]) -> Server {
-    let mut all: Vec<&str> = vec![
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "0",
-        "--mysql-port",
-        "0",
-        "--workers",
-        "1",
-    ];
+    server_with_env(&[], args)
+}
+
+/// A server with environment variables set, for the knobs a run needs.
+fn server_with_env(env: &[(&str, &str)], args: &[&str]) -> Server {
+    let mut all: Vec<&str> = vec!["--host", "127.0.0.1", "--port", "0", "--mysql-port", "0"];
+    // One shard per protocol unless the test says otherwise: clap refuses a flag
+    // given twice, so the default cannot simply be appended.
+    if !args.contains(&"--workers") {
+        all.extend_from_slice(&["--workers", "1"]);
+    }
     all.extend_from_slice(args);
 
-    let child = Command::new(env!("CARGO_BIN_EXE_pgnoop"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dbnoop"));
+    // **A small provided-buffer ring on purpose.** The default is 256 buffers,
+    // 8 MiB the kernel pins at registration; a box running several of these
+    // servers at once runs out, and the shard that cannot register is not what
+    // these tests are about.
+    command.env("DBNOOP_PBUF", "4");
+    for (name, value) in env {
+        command.env(name, value);
+    }
+
+    let child = command
         .args(&all)
-        // **A small provided-buffer ring on purpose.** The default is 256
-        // buffers, 8 MiB the kernel pins at registration; a box running several
-        // of these servers at once runs out, and the shard that cannot register
-        // is not what these tests are about.
-        .env("PGNOOP_PBUF", "4")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -1030,4 +1045,89 @@ fn a_postgres_function_call_is_a_tpcc_transaction() {
         after.ends_with("300102"),
         "the NewOrders moved it: {after:?}"
     );
+}
+
+/// **A shard that cannot have a ring serves on epoll; it does not die.**
+///
+/// Ring memory is charged to the USER, not to the shard that has it: on a 32-CPU
+/// box the default `--workers 0` is 64 shards, and 64 rings do not fit in the
+/// 8 MiB `RLIMIT_MEMLOCK` a default Linux host grants that user. The shards that
+/// could not have one used to *end* -- and a dead shard's listener stays in the
+/// `SO_REUSEPORT` group, so the kernel keeps routing connections to a port
+/// nobody accepts on. That is how a container answered `psql` and refused
+/// `mariadb` with ERROR 2002 on a server that was otherwise up.
+///
+/// `DBNOOP_FAIL_RING` refuses the first N shards a ring, which is the failure a
+/// box out of ring memory produces and cannot be asked for on demand. Both
+/// counts are tried: every shard refused (all on epoll) and half of them (some on
+/// each backend). In both, every shard of every protocol is serving and both
+/// ports answer.
+#[test]
+fn a_shard_without_a_ring_serves_on_epoll() {
+    for (case, fail) in [("every shard", "64"), ("half of them", "2")] {
+        let server = server_with_env(
+            &[("DBNOOP_FAIL_RING", fail)],
+            &["--workers", "2", "--io", "uring"],
+        );
+
+        // What the banner claims: every shard of both protocols reports itself
+        // serving, and the backends add up.
+        let log = server.log.lock().map(|l| l.join("\n")).unwrap_or_default();
+        for protocol in ["postgres", "mysql"] {
+            let line = log
+                .lines()
+                .find(|l| l.contains(&format!("{protocol} listening on")))
+                .unwrap_or_else(|| panic!("{case}: no {protocol} banner in\n{log}"));
+            assert!(
+                line.contains("serving 2/2"),
+                "{case}: {protocol} is not serving all its shards: {line}"
+            );
+        }
+
+        // And what the ports do: a query on each, answered.
+        let mut client = Client::connect(server.mysql);
+        let answer = client.query("select 1");
+        assert_eq!(row(&answer[2]), vec!["1"], "{case}: MySQL is not answering");
+
+        let mut pg = PgClient::connect(server.postgres);
+        let answer = pg.query("select 1");
+        assert!(
+            answer.iter().any(|(tag, _)| *tag == b'T'),
+            "{case}: PostgreSQL is not answering"
+        );
+    }
+}
+
+/// **The ring budget is what the process may lock, and the banner says how it
+/// was spent.** A plan that fits 8 MiB gives fewer shards a ring, not a shard
+/// that dies: the box that found this bug reported `io_uring refused the probed
+/// setup (ENOMEM)` and then a dead shard.
+#[test]
+fn the_banner_says_which_backend_each_shard_got() {
+    let server = server_with_env(&[], &["--workers", "1", "--io", "uring"]);
+    let log = server.log.lock().map(|l| l.join("\n")).unwrap_or_default();
+
+    for protocol in ["postgres", "mysql"] {
+        let line = log
+            .lines()
+            .find(|l| l.contains(&format!("{protocol} listening on")))
+            .unwrap_or_else(|| panic!("no {protocol} banner in\n{log}"));
+        // `serving 1/1, io_uring <n>, epoll <m>, pinned=1/1`, and the two add up.
+        // `io_uring 3, epoll 1)` -- the number after the label, up to whatever
+        // follows it.
+        let count = |label: &str| -> usize {
+            line.split(label)
+                .nth(1)
+                .map(|rest| {
+                    rest.trim_start()
+                        .chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                })
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("no {label} count in {line}"))
+        };
+        let (ring, epoll) = (count("io_uring "), count("epoll "));
+        assert_eq!(ring + epoll, 1, "{line}");
+    }
 }

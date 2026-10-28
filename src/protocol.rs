@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use crate::config::Io;
 use crate::handler::{CatalogView, NoopHandler};
 use crate::mysql;
 use crate::wire;
@@ -53,6 +54,11 @@ impl Codec {
         }
     }
 
+    /// Which protocol this codec speaks.
+    pub fn protocol(&self) -> Protocol {
+        self.protocol
+    }
+
     /// A new connection's state, at its first byte.
     pub fn session(&self) -> Session {
         match self.protocol {
@@ -78,6 +84,17 @@ impl Codec {
             Session::Mysql(conn) => conn.advance(input, out),
         }
     }
+}
+
+/// What a shard tells the process about itself, for the startup banner.
+///
+/// Two messages, because they are known at two moments: the pin before anything
+/// is decided, and the backend once its ring exists -- or does not, in which case
+/// the shard serves on epoll instead of dying and leaving a `SO_REUSEPORT` port
+/// with one listener fewer.
+pub enum Report {
+    Pinned { protocol: Protocol, pinned: bool },
+    Serving { protocol: Protocol, backend: Io },
 }
 
 /// One connection's protocol state.

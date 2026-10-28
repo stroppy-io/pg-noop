@@ -52,6 +52,13 @@ server keep working.
 - A provided-buffer ring the kernel refuses falls back to per-connection buffers
   instead of ending the shard; `DBNOOP_PBUF` is clamped to what the ring's index
   can address; a cancelled receive on a closing slot is reaped.
+- **A shard that cannot have a ring serves on epoll instead of dying.** Ring
+  memory is charged to the user, so a 64-shard process cannot have 64 rings; the
+  shards that could not used to end and leave their listeners in the
+  `SO_REUSEPORT` group, where connections kept being routed to a port nobody
+  accepted on. The ring budget is planned from `RLIMIT_MEMLOCK` before any shard
+  starts, the banner reports how many shards serve on each backend, and
+  `DBNOOP_FAIL_RING=<n>` refuses the first n shards a ring for testing.
 
 ### Everything else
 

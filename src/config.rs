@@ -88,6 +88,104 @@ fn parse_env<T: std::str::FromStr>(name: &str, value: Option<String>) -> Result<
     }
 }
 
+/// The bytes of memory this process may lock, from `RLIMIT_MEMLOCK`.
+///
+/// **A ring is charged to the USER, not to the process.** io_uring's rings and
+/// the pages a provided-buffer ring pins are accounted against `locked_vm` for
+/// the uid, so this is one budget shared by every shard of every protocol -- and
+/// by anything else that uid runs. `None` means "no limit" (or no such limit on
+/// this platform), which is taken to mean "do not ration".
+#[cfg(target_os = "linux")]
+pub fn memlock_bytes() -> Option<usize> {
+    // SAFETY: a plain kernel-filled struct.
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } != 0 {
+        return None;
+    }
+    if limit.rlim_cur == libc::RLIM_INFINITY {
+        return None;
+    }
+
+    Some(limit.rlim_cur as usize)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn memlock_bytes() -> Option<usize> {
+    None
+}
+
+/// What a shard may have of the ring budget.
+///
+/// Two numbers, because the budget can be spent two ways: fewer shards on
+/// io_uring with a usable ring each, or every shard on io_uring with a ring too
+/// small to be worth having. The first is what the default `--workers 0` on a
+/// 32-CPU box needs -- 64 shards cannot each pin a ring out of 8 MiB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingPlan {
+    /// How many shards may try io_uring. The rest serve on epoll.
+    pub uring_shards: usize,
+    /// Provided buffers per io_uring shard: 32 KiB each, pinned at registration.
+    pub buffers: u16,
+}
+
+/// What a ring costs besides its buffers: the submission and completion queues,
+/// with `CQSIZE` (4096 entries in, four times that out) and some slack.
+const RING_OVERHEAD: usize = 384 * 1024;
+
+/// One provided buffer: the page the kernel pins when the ring is registered.
+const BUFFER_BYTES: usize = 32 * 1024;
+
+/// The fewest provided buffers worth having a ring for. Below this the shard
+/// spends its life out of buffers and reads into the connection's own, which is
+/// what epoll does with less machinery.
+const MIN_BUFFERS: u16 = 8;
+
+/// The most provided buffers a shard may have: the production default, and the
+/// point past which a ring stops paying for what it pins.
+pub const MAX_BUFFERS: u16 = 256;
+
+/// **Plan from the budget, not from an assumption.** `shards` shards of every
+/// protocol share `budget` bytes; the plan says how many of them may have a ring
+/// and how large each ring's buffer pool may be. It is a pure function of the
+/// two so that the arithmetic is testable on a box with any budget, including
+/// one that is not this one's.
+pub fn ring_plan(shards: usize, budget: Option<usize>, max_buffers: u16) -> RingPlan {
+    let max_buffers = max_buffers.clamp(MIN_BUFFERS, MAX_BUFFERS);
+    let shards = shards.max(1);
+
+    let Some(budget) = budget else {
+        // No limit to respect: every shard may have a ring, with the pool the
+        // operator asked for.
+        return RingPlan {
+            uring_shards: shards,
+            buffers: max_buffers,
+        };
+    };
+
+    let one_shard = RING_OVERHEAD + MIN_BUFFERS as usize * BUFFER_BYTES;
+    // How many shards could have even the smallest useful ring.
+    let affordable = (budget / one_shard).max(1).min(shards);
+    // Give each of them as much of what is left as it may have.
+    let per_shard = budget / affordable;
+    let buffers = (per_shard.saturating_sub(RING_OVERHEAD) / BUFFER_BYTES)
+        .max(MIN_BUFFERS as usize)
+        .min(max_buffers as usize) as u16;
+
+    RingPlan {
+        uring_shards: affordable,
+        buffers,
+    }
+}
+
+/// `DBNOOP_PBUF` (`PGNOOP_PBUF` is the old name), when the operator set it.
+///
+/// The plan's number is a ceiling and this is a wish: `ring_plan` takes it as
+/// `max_buffers`, so asking for more than the budget allows is answered by the
+/// budget, and asking for less is honoured.
+pub fn pbuf_override() -> Option<u16> {
+    env("PBUF").and_then(|v| v.trim().parse::<u16>().ok())
+}
+
 /// The config file to read when `--config` does not name one.
 ///
 /// `./dbnoop.json` is the name; `./pgnoop.json` is read when it is the only one
@@ -373,6 +471,78 @@ mod tests {
             parse_env::<u16>("PORT", Some(" 5433 ".to_string())),
             Ok(Some(5433))
         );
+    }
+
+    /// **The plan is arithmetic on a budget, and the budget is the user's.**
+    /// 64 shards sharing 8 MiB cannot each have a ring: a ring's queues are
+    /// ~384 KiB and each provided buffer pins 32 KiB, so giving every shard a
+    /// ring is how shards came to die of `ENOMEM` at startup and left their
+    /// listeners behind in a `SO_REUSEPORT` group.
+    #[test]
+    fn the_ring_plan_spends_the_budget_it_has() {
+        // No limit: every shard on the ring, with the pool it asked for.
+        let plan = ring_plan(64, None, MAX_BUFFERS);
+        assert_eq!(
+            plan,
+            RingPlan {
+                uring_shards: 64,
+                buffers: MAX_BUFFERS
+            }
+        );
+
+        // 8 MiB and 64 shards: fewer shards with a usable ring, the rest on
+        // epoll, and never more memory than the budget.
+        let plan = ring_plan(64, Some(8 * 1024 * 1024), MAX_BUFFERS);
+        assert!(
+            (1..64).contains(&plan.uring_shards),
+            "{} of 64",
+            plan.uring_shards
+        );
+        assert!(plan.buffers >= MIN_BUFFERS, "{} buffers", plan.buffers);
+        let spent = plan.uring_shards * (RING_OVERHEAD + plan.buffers as usize * BUFFER_BYTES);
+        assert!(
+            spent <= 8 * 1024 * 1024,
+            "{spent} bytes planned out of 8 MiB"
+        );
+
+        // Four shards and the same budget: all of them, with a pool in
+        // proportion.
+        let plan = ring_plan(4, Some(8 * 1024 * 1024), MAX_BUFFERS);
+        assert_eq!(plan.uring_shards, 4);
+        assert!(plan.buffers > MIN_BUFFERS, "{} buffers", plan.buffers);
+
+        // A budget too small for even one useful ring still leaves one shard
+        // trying (it falls back to epoll if the kernel refuses), and never a
+        // zero or a panic.
+        let plan = ring_plan(64, Some(64 * 1024), MAX_BUFFERS);
+        assert_eq!(plan.uring_shards, 1);
+        assert_eq!(plan.buffers, MIN_BUFFERS);
+
+        // An operator asking for a small pool is honoured; asking for a large
+        // one is bounded by the budget.
+        assert_eq!(ring_plan(64, None, MIN_BUFFERS).buffers, MIN_BUFFERS);
+        assert_eq!(ring_plan(64, None, 9999).buffers, MAX_BUFFERS);
+    }
+
+    /// **This box's budget is read, not assumed.** `RLIMIT_MEMLOCK` is what the
+    /// kernel accounts a ring against on Linux, and the plan is only useful if
+    /// it is the real number.
+    #[test]
+    fn the_memlock_limit_is_read_from_the_kernel() {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: a plain kernel-filled struct.
+            let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) };
+            assert_eq!(rc, 0);
+            if limit.rlim_cur == libc::RLIM_INFINITY {
+                assert_eq!(memlock_bytes(), None, "unlimited is no limit");
+            } else {
+                assert_eq!(memlock_bytes(), Some(limit.rlim_cur as usize));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(memlock_bytes(), None);
     }
 
     /// **A value that does not parse is an error, not "disabled".** The
