@@ -18,7 +18,13 @@
 //! the same question -- run with `--depth 1` for the round-trip figure.
 //!
 //! It is deliberately dumb: pre-encoded bytes, no SQL, no parsing of replies
-//! beyond counting ReadyForQuery ('Z') bytes, no allocation in the loop.
+//! beyond counting the packets that end an answer -- ReadyForQuery for
+//! PostgreSQL, an OK or EOF terminator for MySQL -- and no allocation in the
+//! loop.
+//!
+//! `--proto mysql` drives the MySQL listener the same way: one `COM_QUERY`
+//! packet per query, `--depth` of them pipelined, and one answer per query
+//! counted.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -262,6 +268,114 @@ impl Frames {
     }
 }
 
+/// Count the packets that END an answer, through the MySQL framing.
+///
+/// A MySQL reply is `[len:3][seq:1][body]`, and the packet that ends one is an
+/// OK packet (`0x00`), or the EOF packet / EOF-marked OK packet that terminates
+/// a result set (`0xfe`), which is fewer than nine bytes -- that length is what
+/// tells a terminator from a row. Counting exactly those makes one query one
+/// answer, whatever the answer holds.
+struct MyAnswers {
+    /// The packet header being read, and how much of it is here.
+    head: [u8; 4],
+    head_len: usize,
+    /// Bytes of the current packet's body still to come, and its length.
+    remaining: usize,
+    len: usize,
+    /// The body's first byte, which is what a terminator is recognised by.
+    first: Option<u8>,
+    /// Answers counted so far, and how many of them have been reported.
+    answers: usize,
+    reported: usize,
+    /// Set when a packet header is not well formed; the stream cannot be
+    /// trusted after that, so the worker stops rather than measuring garbage.
+    bad: bool,
+}
+
+impl MyAnswers {
+    fn new() -> Self {
+        MyAnswers {
+            head: [0; 4],
+            head_len: 0,
+            remaining: 0,
+            len: 0,
+            first: None,
+            answers: 0,
+            reported: 0,
+            bad: false,
+        }
+    }
+
+    fn count(&mut self, buf: &[u8]) -> usize {
+        for &byte in buf {
+            if self.head_len < 4 {
+                self.head[self.head_len] = byte;
+                self.head_len += 1;
+                if self.head_len == 4 {
+                    let len = self.head[0] as usize
+                        | (self.head[1] as usize) << 8
+                        | (self.head[2] as usize) << 16;
+                    if len == 0 || len > MAX_FRAME as usize {
+                        self.bad = true;
+
+                        return self.take();
+                    }
+                    self.len = len;
+                    self.remaining = len;
+                    self.first = None;
+                }
+
+                continue;
+            }
+
+            if self.first.is_none() {
+                self.first = Some(byte);
+            }
+            self.remaining -= 1;
+            if self.remaining == 0 {
+                if let Some(first) = self.first {
+                    if (first == 0x00 || first == 0xfe) && self.len < 9 {
+                        self.answers += 1;
+                    }
+                }
+                self.head_len = 0;
+            }
+        }
+
+        self.take()
+    }
+
+    /// The answers counted since the last call.
+    fn take(&mut self) -> usize {
+        let n = self.answers - self.reported;
+        self.reported = self.answers;
+
+        n
+    }
+}
+
+/// Which protocol's answers are being counted.
+enum Answers {
+    Postgres(Frames),
+    Mysql(MyAnswers),
+}
+
+impl Answers {
+    fn count(&mut self, buf: &[u8]) -> usize {
+        match self {
+            Answers::Postgres(frames) => frames.count_ready(buf),
+            Answers::Mysql(answers) => answers.count(buf),
+        }
+    }
+
+    fn bad(&self) -> bool {
+        match self {
+            Answers::Postgres(frames) => frames.bad,
+            Answers::Mysql(answers) => answers.bad,
+        }
+    }
+}
+
 fn cstr(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(s.as_bytes());
     out.push(0);
@@ -279,7 +393,7 @@ fn msg(out: &mut Vec<u8>, tag: u8, body: impl FnOnce(&mut Vec<u8>)) {
 /// Startup, then Parse one statement and keep it for the whole run -- which is
 /// what a real driver does, and what makes the server's per-execute path the
 /// thing under test.
-fn handshake(sock: &mut TcpStream, sql: &str) -> std::io::Result<Frames> {
+fn handshake(sock: &mut TcpStream, sql: &str) -> std::io::Result<Answers> {
     let mut buf = Vec::new();
     let at = buf.len();
     buf.extend_from_slice(&0i32.to_be_bytes());
@@ -328,7 +442,77 @@ fn handshake(sock: &mut TcpStream, sql: &str) -> std::io::Result<Frames> {
         ));
     }
 
-    Ok(frames)
+    Ok(Answers::Postgres(frames))
+}
+
+/// A MySQL command packet: `[len:3][seq:0][command][body]`.
+fn my_packet(out: &mut Vec<u8>, command: u8, body: &[u8]) {
+    let len = 1 + body.len();
+    out.push((len & 0xff) as u8);
+    out.push(((len >> 8) & 0xff) as u8);
+    out.push(((len >> 16) & 0xff) as u8);
+    out.push(0); // every command starts a sequence of its own
+    out.push(command);
+    out.extend_from_slice(body);
+}
+
+/// The MySQL greeting, and the OK packet that answers the handshake.
+///
+/// The greeting is read and thrown away: what it says (the scramble, the server
+/// version) changes nothing about the load this generates -- there is no
+/// password to hash for a server that accepts any.
+fn my_handshake(sock: &mut TcpStream) -> std::io::Result<Answers> {
+    let mut head = [0u8; 4];
+    sock.read_exact(&mut head)?;
+    let len = head[0] as usize | (head[1] as usize) << 8 | (head[2] as usize) << 16;
+    let mut greeting = vec![0u8; len];
+    sock.read_exact(&mut greeting)?;
+
+    // Capabilities: protocol 4.1, secure connection, plugin auth, multi-results,
+    // deprecate EOF -- what a client sends that wants the modern framing.
+    const CAPS: u32 = 0x0000_0001
+        | 0x0000_0004
+        | 0x0000_0008
+        | 0x0000_0200
+        | 0x0000_2000
+        | 0x0000_8000
+        | 0x0001_0000
+        | 0x0002_0000
+        | 0x0004_0000
+        | 0x0008_0000
+        | 0x0100_0000;
+    let mut body = Vec::new();
+    body.extend_from_slice(&CAPS.to_le_bytes());
+    body.extend_from_slice(&16_777_216u32.to_le_bytes());
+    body.push(45);
+    body.extend_from_slice(&[0u8; 23]);
+    cstr(&mut body, "bench");
+    body.push(20);
+    body.extend_from_slice(&[0x41; 20]);
+    cstr(&mut body, "tpcc");
+    cstr(&mut body, "mysql_native_password");
+    let mut login = Vec::new();
+    let len = body.len();
+    login.push((len & 0xff) as u8);
+    login.push(((len >> 8) & 0xff) as u8);
+    login.push(((len >> 16) & 0xff) as u8);
+    login.push(1); // the handshake response follows the greeting
+    login.extend_from_slice(&body);
+    sock.write_all(&login)?;
+
+    let mut head = [0u8; 4];
+    sock.read_exact(&mut head)?;
+    let len = head[0] as usize | (head[1] as usize) << 8 | (head[2] as usize) << 16;
+    let mut ok = vec![0u8; len];
+    sock.read_exact(&mut ok)?;
+    if ok.first() != Some(&0x00) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the server did not accept the handshake",
+        ));
+    }
+
+    Ok(Answers::Mysql(MyAnswers::new()))
 }
 
 fn main() {
@@ -337,6 +521,18 @@ fn main() {
     let depth = arg("--depth", 32);
     let secs = arg("--secs", 8) as u64;
     let sql = arg_str("--sql", "select 1");
+    let proto = arg_str("--proto", "postgres");
+    let mysql = match proto.as_str() {
+        "postgres" | "pg" => false,
+        "mysql" | "mariadb" => true,
+        // A protocol this tool cannot speak is named, not guessed: measuring
+        // one protocol while the operator asked for another is a number
+        // nobody can use.
+        other => {
+            eprintln!("saturate: unknown --proto {other:?}; expected `postgres` or `mysql`");
+            std::process::exit(2);
+        }
+    };
 
     // depth 0 leaves `batch` empty and makes `got < depth` false at once, so the
     // worker spins pushing latency samples until memory runs out.
@@ -348,6 +544,11 @@ fn main() {
     // One pipelined batch, encoded once and reused forever.
     let mut batch = Vec::new();
     for _ in 0..depth {
+        if mysql {
+            my_packet(&mut batch, 0x03, sql.as_bytes());
+
+            continue;
+        }
         msg(&mut batch, b'B', |b| {
             cstr(b, "");
             cstr(b, "s1");
@@ -397,7 +598,12 @@ fn main() {
                 return;
             };
             let _ = sock.set_nodelay(true);
-            let Ok(mut frames) = handshake(&mut sock, &sql) else {
+            let handshake = if mysql {
+                my_handshake(&mut sock)
+            } else {
+                handshake(&mut sock, &sql)
+            };
+            let Ok(mut frames) = handshake else {
                 ready_workers.fetch_add(1, Ordering::Relaxed);
                 return;
             };
@@ -450,8 +656,8 @@ fn main() {
                         // batch, and discarding it biases the result low.
                         Ok(0) | Err(_) => break 'work,
                         Ok(n) => {
-                            got += frames.count_ready(&chunk[..n]);
-                            if frames.bad {
+                            got += frames.count(&chunk[..n]);
+                            if frames.bad() {
                                 break 'work;
                             }
                         }
