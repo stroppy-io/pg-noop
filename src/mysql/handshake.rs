@@ -1,35 +1,34 @@
 //! The MySQL handshake: what the server says first, and what it accepts back.
-//!
-//! One exchange, once per connection: `HandshakeV10` out, `HandshakeResponse41`
-//! in, an OK packet after it. Everything else the connection does is a command
-//! (`mod.rs`).
+//! One exchange, once per connection: `HandshakeV10` out, `HandshakeResponse41` in, an
+//! OK packet after it.
 
 use std::sync::OnceLock;
 
 use super::packet::{self, Reader};
 use super::AUTOCOMMIT;
 
-/// What the handshake claims to be. A client parses this, and some drivers
-/// compare it: a MariaDB connector seeing `8.0.0` stays on the MySQL dialect.
+/// What the handshake claims to be.
+/// A client parses this, and some drivers compare it: a MariaDB connector seeing
+/// `8.0.0` stays on the MySQL dialect.
 pub const SERVER_VERSION: &str = "8.0.0-db-noop";
 
-/// The two authentication plugins this server accepts. It advertises the first
-/// -- every MySQL and MariaDB client speaks it -- and answers the second when a
-/// client insists on it.
+/// The two authentication plugins this server accepts.
+/// It advertises the first -- every MySQL and MariaDB client speaks it -- and answers
+/// the second when a client insists on it.
 pub const NATIVE: &str = "mysql_native_password";
 pub const CACHING_SHA2: &str = "caching_sha2_password";
 
-/// The scramble offered in the greeting. Any user and any password are
-/// accepted, so this is never checked; it must not contain a NUL byte, because
-/// the fields it is split across are NUL-sensitive.
+/// The scramble offered in the greeting.
+/// Any user and any password are accepted, so this is never checked; it must not
+/// contain a NUL byte, because the fields it is split across are NUL-sensitive.
 const SCRAMBLE: [u8; 20] = *b"dbnoop-scramble-0001";
 
 /// `utf8mb4_general_ci`, which every client from 5.5 on knows.
 const CHARSET_UTF8MB4: u8 = 45;
 
-// The capability bits this server reads, by their names in
-// `include/mysql_com.h`. Those the server advertises are OR'd into
-// `CAPABILITIES`; the rest are here because a client may set them.
+// The capability bits this server reads, by their names in `include/mysql_com.h`.
+// Those the server advertises are OR'd into `CAPABILITIES`; the rest are here because a
+// client may set them.
 pub const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
 pub const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
 pub const CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
@@ -45,12 +44,6 @@ pub const CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
 pub const CLIENT_DEPRECATE_EOF: u32 = 0x0100_0000;
 
 /// What this server says it can do.
-///
-/// `CLIENT_SSL` is deliberately absent: there is no TLS in this server, and a
-/// capability it cannot honour is worse than one it does not claim -- a client
-/// that requires TLS should fail at its own configuration rather than after a
-/// handshake that lied. `CLIENT_SESSION_TRACK` and `CLIENT_COMPRESS` are absent
-/// for the same reason: both change the packet framing.
 pub const CAPABILITIES: u32 = CLIENT_LONG_PASSWORD
     | CLIENT_LONG_FLAG
     | CLIENT_CONNECT_WITH_DB
@@ -65,11 +58,6 @@ pub const CAPABILITIES: u32 = CLIENT_LONG_PASSWORD
     | CLIENT_DEPRECATE_EOF;
 
 /// `HandshakeV10`, built once.
-///
-/// The greeting is the one packet a server sends before the client has said
-/// anything, and it is identical for every connection -- a connection id that
-/// repeats is meaningless to a server with nothing to kill. Building it once is
-/// what lets the read loop write it before its first read.
 pub fn greeting() -> &'static [u8] {
     static GREETING: OnceLock<Vec<u8>> = OnceLock::new();
 
@@ -101,28 +89,24 @@ pub fn greeting() -> &'static [u8] {
 
 /// What a client answered the greeting with.
 pub enum Response {
-    /// `CLIENT_SSL`: the client wants TLS before it will authenticate. This
-    /// server has none and says so with an error packet, which is the answer a
+    /// `CLIENT_SSL`: the client wants TLS before it will authenticate.
+    /// This server has none and says so with an error packet, which is the answer a
     /// client expects and can report.
     Ssl,
-    /// A `HandshakeResponse41`, accepted whatever it named as user and
-    /// password. `plugin` is the authentication plugin the client chose, which
-    /// decides how the server answers (see `Conn::hello`).
+    /// A `HandshakeResponse41`, accepted whatever it named as user and password.
+    /// `plugin` is the authentication plugin the client chose, which decides how the
+    /// server answers (see `Conn::hello`).
     Login { caps: u32, plugin: Option<String> },
 }
 
 /// `HandshakeResponse41`, or the 32-byte `SSLRequest` that replaces it.
-///
-/// `None` is a body that runs out before a field it declares: a client that
-/// claims `CONNECT_WITH_DB` and does not name a database is not one whose
-/// `max_packet` field can be trusted to mean anything.
 pub fn parse_response(payload: &[u8]) -> Option<Response> {
     let mut r = Reader::new(payload);
 
     let caps = r.u32()?;
-    // Checked before the rest of the body is parsed: an SSLRequest is exactly
-    // the 32-byte prefix, and a client that asks for TLS gets an error rather
-    // than a handshake that cannot continue.
+    // Checked before the rest of the body is parsed: an SSLRequest is exactly the
+    // 32-byte prefix, and a client that asks for TLS gets an error rather than a
+    // handshake that cannot continue.
     if caps & CLIENT_SSL != 0 {
         return Some(Response::Ssl);
     }
@@ -190,9 +174,8 @@ mod tests {
         out
     }
 
-    /// The greeting is a well-formed `HandshakeV10` and says exactly what the
-    /// server can do: the flags a client decides how to talk from, the charset,
-    /// and no TLS.
+    /// The greeting is a well-formed `HandshakeV10` and says exactly what the server
+    /// can do: the flags a client decides how to talk from, the charset, and no TLS.
     #[test]
     fn the_greeting_offers_what_this_server_speaks() {
         let g = greeting();
@@ -236,8 +219,8 @@ mod tests {
         assert!(r.rest().is_empty(), "nothing follows the plugin name");
     }
 
-    /// Every encoding of the authentication response a client may use is read,
-    /// along with the optional database and the plugin name.
+    /// Every encoding of the authentication response a client may use is read, along
+    /// with the optional database and the plugin name.
     #[test]
     fn a_handshake_response_is_read_in_each_encoding() {
         for caps in [
@@ -267,10 +250,7 @@ mod tests {
         }
     }
 
-    /// **An SSL request is refused, not answered.** `CLIENT_SSL` with nothing
-    /// after the reserved bytes is the client asking for TLS; this server has
-    /// none, and the connection says so with an error instead of a handshake the
-    /// client would then try to speak TLS over.
+    /// An SSL request is refused, not answered.
     #[test]
     fn an_ssl_request_is_refused() {
         let mut body = Vec::new();
@@ -283,8 +263,8 @@ mod tests {
         assert!(matches!(parse_response(&body), Some(Response::Ssl)));
     }
 
-    /// A body that runs out before a field it declares is `None`, not a wrong
-    /// answer read from the next field's bytes.
+    /// A body that runs out before a field it declares is `None`, not a wrong answer
+    /// read from the next field's bytes.
     #[test]
     fn a_truncated_handshake_response_is_refused() {
         let full = response(

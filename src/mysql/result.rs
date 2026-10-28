@@ -1,18 +1,11 @@
-//! The packets a MySQL command is answered with: OK, ERR, EOF, a column
-//! definition and a result set.
-//!
-//! Nothing here decides what an answer should be; it writes the shape the
-//! protocol requires, which is the half a client is strict about.
+//! The packets a MySQL command is answered with: OK, ERR, EOF, a column definition and
+//! a result set. Nothing here decides what an answer should be.
 
 use super::packet;
 
 /// OK, with the affected-row count and the last insert id.
-///
-/// This server changes nothing, so both are zero -- except where a rule says
-/// otherwise (see `crate::tpcc`). The status flags are what a client reads to
-/// know whether a transaction is open and whether more results follow, and they
-/// are not decoration: a pool that sees `IN_TRANS` clear commits an open
-/// transaction it thinks is closed.
+/// This server changes nothing, so both are zero -- except where a rule says otherwise
+/// (see `crate::tpcc`).
 pub fn ok(out: &mut Vec<u8>, seq: &mut u8, affected: u64, last_insert_id: u64, status: u16) {
     let at = packet::begin(out, seq);
     out.push(0x00);
@@ -23,8 +16,8 @@ pub fn ok(out: &mut Vec<u8>, seq: &mut u8, affected: u64, last_insert_id: u64, s
     packet::end(out, at);
 }
 
-/// The end of a result set when the client negotiated `CLIENT_DEPRECATE_EOF`:
-/// an OK packet whose header is `0xfe`, so it cannot be read as a row.
+/// The end of a result set when the client negotiated `CLIENT_DEPRECATE_EOF`: an OK
+/// packet whose header is `0xfe`, so it cannot be read as a row.
 pub fn ok_eof(out: &mut Vec<u8>, seq: &mut u8, status: u16) {
     let at = packet::begin(out, seq);
     out.push(0xfe);
@@ -36,8 +29,8 @@ pub fn ok_eof(out: &mut Vec<u8>, seq: &mut u8, status: u16) {
 }
 
 /// The classic end of a result set: `0xfe`, zero warnings, the status flags.
-/// Five bytes, which is what keeps it from being read as a length-encoded
-/// integer: those need at least nine.
+/// Five bytes, which is what keeps it from being read as a length-encoded integer:
+/// those need at least nine.
 pub fn eof(out: &mut Vec<u8>, seq: &mut u8, status: u16) {
     let at = packet::begin(out, seq);
     out.push(0xfe);
@@ -46,9 +39,7 @@ pub fn eof(out: &mut Vec<u8>, seq: &mut u8, status: u16) {
     packet::end(out, at);
 }
 
-/// An ERR packet. The SQL state is five bytes and is shown to the client, so it
-/// is chosen for what it says rather than invented: `42000` for a statement this
-/// server will not run, `08S01` for a connection-level refusal.
+/// An ERR packet.
 pub fn err(out: &mut Vec<u8>, seq: &mut u8, code: u16, sqlstate: &str, message: &str) {
     let at = packet::begin(out, seq);
     out.push(0xff);
@@ -62,24 +53,24 @@ pub fn err(out: &mut Vec<u8>, seq: &mut u8, code: u16, sqlstate: &str, message: 
     packet::end(out, at);
 }
 
-/// The type and width of one column, decided by what the answer holds rather
-/// than by any parsing of the statement: everything this server sends is either
-/// a decimal integer or a string.
+/// The type and width of one column, decided by what the answer holds rather than by
+/// any parsing of the statement: everything this server sends is either a decimal
+/// integer or a string.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     /// `MYSQL_TYPE_VAR_STRING`, which any client decodes as text.
     Text,
-    /// `MYSQL_TYPE_LONGLONG`, for the one number this server really produces:
-    /// the TPC-C district sum in `crate::tpcc`.
+    /// `MYSQL_TYPE_LONGLONG`, for the one number this server really produces: the TPC-C
+    /// district sum in `crate::tpcc`.
     #[allow(dead_code)]
     LongLong,
 }
 
 impl Kind {
     fn wire(self) -> (u8, u16, u32, u16, u8) {
-        // (type, charset, display length, flags, decimals). A numeric column is
-        // in the binary charset, which is what a client uses to decide it may
-        // parse the text as a number.
+        // (type, charset, display length, flags, decimals).
+        // A numeric column is in the binary charset, which is what a client uses to
+        // decide it may parse the text as a number.
         match self {
             Kind::Text => (253, 45, 1024, 0, 0),
             Kind::LongLong => (8, 63, 20, 0, 0),
@@ -115,13 +106,9 @@ impl Column<'_> {
     }
 }
 
-/// One definition per column, and -- unless the client deprecated it -- the EOF
-/// that follows them.
-///
-/// **No column count.** A result set starts with the count and a prepare
-/// response does not: its counts are in the OK packet's own header. A count
-/// packet in front of the definitions is a packet the client is not expecting,
-/// and every driver desynchronises on it.
+/// One definition per column, and -- unless the client deprecated it -- the EOF that
+/// follows them.
+/// No column count.
 pub fn definitions(
     out: &mut Vec<u8>,
     seq: &mut u8,
@@ -132,15 +119,15 @@ pub fn definitions(
     for c in columns {
         c.write(out, seq);
     }
-    // Nothing to terminate when there was nothing: MySQL sends the EOF only
-    // after a non-empty list.
+    // Nothing to terminate when there was nothing: MySQL sends the EOF only after a
+    // non-empty list.
     if !deprecate && !columns.is_empty() {
         eof(out, seq, status);
     }
 }
 
-/// A result set's opening: the column count, the definitions, and the EOF that
-/// follows them unless the client deprecated it.
+/// A result set's opening: the column count, the definitions, and the EOF that follows
+/// them unless the client deprecated it.
 pub fn header(
     out: &mut Vec<u8>,
     seq: &mut u8,
@@ -156,9 +143,8 @@ pub fn header(
 }
 
 /// One row: every value length-encoded, and `None` as the NULL marker.
-///
-/// Only the TPC-C answers (`crate::tpcc`) have a row to send: every other result
-/// set this server produces is empty.
+/// Only the TPC-C answers (`crate::tpcc`) have a row to send: every other result set
+/// this server produces is empty.
 #[allow(dead_code)]
 pub fn row(out: &mut Vec<u8>, seq: &mut u8, values: &[Option<&str>]) {
     let at = packet::begin(out, seq);
@@ -180,14 +166,7 @@ pub enum Value<'a> {
     Text(&'a str),
 }
 
-/// A **binary-protocol** row, which is what `COM_STMT_EXECUTE` answers with.
-///
-/// It is not the text row with other contents: the packet starts with a `0x00`
-/// header, then a NULL bitmap whose first two bits are reserved (so the bitmap
-/// is `(columns + 7 + 2) / 8` bytes, whatever the column count), then each value
-/// in the binary form of its type. A client that prepared a statement decodes
-/// exactly this; a text row leaves it reading a string where it expects eight
-/// bytes.
+/// A binary-protocol row, which is what `COM_STMT_EXECUTE` answers with.
 pub fn binary_row(out: &mut Vec<u8>, seq: &mut u8, values: &[Value<'_>]) {
     let at = packet::begin(out, seq);
     out.push(0x00);
@@ -221,8 +200,8 @@ mod tests {
     const AUTOCOMMIT: u16 = 0x0002;
     const MORE_RESULTS: u16 = 0x0008;
 
-    /// An OK packet is `0x00`, the two length-encoded counts, and the flags a
-    /// client reads the transaction state from.
+    /// An OK packet is `0x00`, the two length-encoded counts, and the flags a client
+    /// reads the transaction state from.
     #[test]
     fn an_ok_packet_carries_its_counts_and_flags() {
         let mut out = Vec::new();
@@ -240,8 +219,9 @@ mod tests {
         assert!(r.rest().is_empty());
     }
 
-    /// With `DEPRECATE_EOF` the terminator is an OK packet whose header is
-    /// `0xfe`; without it, the five-byte EOF packet. Both carry the status.
+    /// With `DEPRECATE_EOF` the terminator is an OK packet whose header is `0xfe`;
+    /// without it, the five-byte EOF packet.
+    /// Both carry the status.
     #[test]
     fn the_terminator_follows_what_the_client_negotiated() {
         let mut out = Vec::new();
@@ -263,8 +243,8 @@ mod tests {
         assert_eq!(r.u16(), Some(MORE_RESULTS));
     }
 
-    /// An ERR packet names its code and SQL state, and the message is a C
-    /// string: a client shows it to a person.
+    /// An ERR packet names its code and SQL state, and the message is a C string: a
+    /// client shows it to a person.
     #[test]
     fn an_err_packet_carries_a_code_and_a_state() {
         let mut out = Vec::new();
@@ -278,8 +258,8 @@ mod tests {
         assert_eq!(r.bytes(5), Some(&b"08S01"[..]));
         assert_eq!(r.cstr(), Some("TLS is not supported"));
 
-        // A state shorter than five bytes is padded rather than truncating the
-        // packet length.
+        // A state shorter than five bytes is padded rather than truncating the packet
+        // length.
         let mut out = Vec::new();
         let mut seq = 0u8;
         err(&mut out, &mut seq, 1, "HY", "short state");
@@ -289,9 +269,9 @@ mod tests {
         assert_eq!(r.bytes(5), Some(&b"HY000"[..]));
     }
 
-    /// A result set is the column count, a definition per column, then rows,
-    /// then the terminator -- and with `DEPRECATE_EOF` there is no EOF between
-    /// the definitions and the rows.
+    /// A result set is the column count, a definition per column, then rows, then the
+    /// terminator -- and with `DEPRECATE_EOF` there is no EOF between the definitions
+    /// and the rows.
     #[test]
     fn a_result_set_is_framed_in_the_order_a_client_reads_it() {
         let columns = [

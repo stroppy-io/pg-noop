@@ -1,21 +1,17 @@
-//! The MySQL packet layer: `[len:u24 LE][seq:u8][payload]`, and the
-//! length-encoded integers and strings the payloads are made of.
-//!
-//! Nothing here knows what a command is. The framing is the same in the
-//! handshake, in a command and in a reply, so the codec has one reader and one
-//! writer for all three.
+//! The MySQL packet layer: `[len:u24 LE][seq:u8][payload]`, and the length-encoded
+//! integers and strings the payloads are made of.
+//! Nothing here knows what a command is.
 
 /// Three length bytes and one sequence byte in front of every payload.
 pub const HEADER: usize = 4;
 
-/// The largest payload one packet can carry. A payload of exactly this size
-/// means the command continues in the next packet -- the protocol's way of
-/// carrying something larger than its own length field.
+/// The largest payload one packet can carry.
+/// A payload of exactly this size means the command continues in the next packet -- the
+/// protocol's way of carrying something larger than its own length field.
 pub const MAX_PAYLOAD: usize = 0xFF_FFFF;
 
-/// Start a packet: four placeholder header bytes, then the body the caller
-/// appends, then `end`. The sequence number advances here, so a reply of
-/// several packets numbers them 1, 2, 3 without the caller counting.
+/// Start a packet: four placeholder header bytes, then the body the caller appends,
+/// then `end`.
 pub fn begin(out: &mut Vec<u8>, seq: &mut u8) -> usize {
     let at = out.len();
     out.extend_from_slice(&[0, 0, 0, *seq]);
@@ -25,11 +21,6 @@ pub fn begin(out: &mut Vec<u8>, seq: &mut u8) -> usize {
 }
 
 /// Fill in the header of a packet started at `at`.
-///
-/// A reply here is a handful of columns of plausible values; nothing this
-/// server builds comes near 16 MiB, and a body that did would be a bug rather
-/// than something to split. An assertion rather than a silent truncation,
-/// which is what writing the length into three bytes by hand would give.
 pub fn end(out: &mut [u8], at: usize) {
     let len = out.len() - at - HEADER;
     assert!(
@@ -50,10 +41,8 @@ pub fn write(out: &mut Vec<u8>, seq: &mut u8, body: &[u8]) {
 }
 
 /// The payload length of a packet whose header is `header`, and its sequence.
-///
-/// The length is three little-endian bytes, so the reader cannot be handed one
-/// that is negative or too large: unlike PostgreSQL's i32 length it has no
-/// sign bit to misread.
+/// The length is three little-endian bytes, so the reader cannot be handed one that is
+/// negative or too large: unlike PostgreSQL's i32 length it has no sign bit to misread.
 pub fn header(header: &[u8]) -> (usize, u8) {
     let len = header[0] as usize | (header[1] as usize) << 8 | (header[2] as usize) << 16;
 
@@ -62,8 +51,9 @@ pub fn header(header: &[u8]) -> (usize, u8) {
 
 // ------------------------------------------------------------ length encoding
 
-/// A length-encoded integer. `0xfb` is NULL in the places where that is
-/// meaningful, and is never written here: this server has no NULLs to send.
+/// A length-encoded integer.
+/// `0xfb` is NULL in the places where that is meaningful, and is never written here:
+/// this server has no NULLs to send.
 pub fn put_lenenc(out: &mut Vec<u8>, n: u64) {
     if n < 0xfb {
         out.push(n as u8);
@@ -91,9 +81,9 @@ pub fn put_cstr(out: &mut Vec<u8>, s: &str) {
     out.push(0);
 }
 
-/// Reading a payload: every getter is `Option`, so a truncated or malformed
-/// body is `None` at the point it runs out rather than a panic or a wrong
-/// answer read from the next field's bytes.
+/// Reading a payload: every getter is `Option`, so a truncated or malformed body is
+/// `None` at the point it runs out rather than a panic or a wrong answer read from the
+/// next field's bytes.
 pub struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -123,8 +113,8 @@ impl<'a> Reader<'a> {
         Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
-    /// Skip `n` bytes, which is how the fields this server does not read are
-    /// stepped over -- a fixed-size reservation has no other structure.
+    /// Skip `n` bytes, which is how the fields this server does not read are stepped
+    /// over -- a fixed-size reservation has no other structure.
     pub fn skip(&mut self, n: usize) -> Option<()> {
         self.bytes(n).map(|_| ())
     }
@@ -137,9 +127,7 @@ impl<'a> Reader<'a> {
         Some(b)
     }
 
-    /// A length-encoded integer. `0xfb` is NULL and is not a number, so it is
-    /// `None` -- the one place where running out of bytes and a NULL are
-    /// deliberately the same answer, because both mean "no count here".
+    /// A length-encoded integer.
     pub fn lenenc(&mut self) -> Option<u64> {
         match self.u8()? {
             n @ 0x00..=0xfa => Some(n as u64),
@@ -166,9 +154,9 @@ impl<'a> Reader<'a> {
         self.bytes(n)
     }
 
-    /// A NUL-terminated string, without its terminator. Invalid UTF-8 is
-    /// refused rather than replaced: every field read here is a name, and a
-    /// name this server cannot read is one it should not echo into a reply.
+    /// A NUL-terminated string, without its terminator.
+    /// Invalid UTF-8 is refused rather than replaced: every field read here is a name,
+    /// and a name this server cannot read is one it should not echo into a reply.
     pub fn cstr(&mut self) -> Option<&'a str> {
         let rest = &self.buf[self.pos..];
         let n = rest.iter().position(|&b| b == 0)?;
@@ -177,8 +165,9 @@ impl<'a> Reader<'a> {
         std::str::from_utf8(&rest[..n]).ok()
     }
 
-    /// Everything not yet read. The handshake response's connection
-    /// attributes, when a client sends them, are exactly this.
+    /// Everything not yet read.
+    /// The handshake response's connection attributes, when a client sends them, are
+    /// exactly this.
     #[cfg(test)]
     pub fn rest(&self) -> &'a [u8] {
         &self.buf[self.pos..]
@@ -189,8 +178,8 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
 
-    /// A packet carries its own length and sequence, little-endian in the
-    /// length. Round-tripped through a reader that only has the header.
+    /// A packet carries its own length and sequence, little-endian in the length.
+    /// Round-tripped through a reader that only has the header.
     #[test]
     fn a_packet_carries_its_length_and_sequence() {
         let mut out = Vec::new();
@@ -204,8 +193,8 @@ mod tests {
         assert_eq!(seq, 8, "the sequence advanced past the packet written");
     }
 
-    /// A three-byte length holds 16 MiB - 1: the largest payload one packet
-    /// can carry, which is what makes that size mean "continues".
+    /// A three-byte length holds 16 MiB - 1: the largest payload one packet can carry,
+    /// which is what makes that size mean "continues".
     #[test]
     fn the_largest_payload_is_the_continuation_marker() {
         let mut out = Vec::new();
@@ -218,8 +207,8 @@ mod tests {
         assert_eq!(&out[at..at + 3], &[0xff, 0xff, 0xff], "a three-byte length");
     }
 
-    /// The sequence wraps at 256 rather than panicking or pinning, which is
-    /// what the protocol says it does.
+    /// The sequence wraps at 256 rather than panicking or pinning, which is what the
+    /// protocol says it does.
     #[test]
     fn the_sequence_wraps() {
         let mut out = Vec::new();
@@ -230,8 +219,8 @@ mod tests {
         assert_eq!(out[3], 255);
     }
 
-    /// Every length-encoded integer is written in the shortest form that holds
-    /// it, and read back as itself.
+    /// Every length-encoded integer is written in the shortest form that holds it, and
+    /// read back as itself.
     #[test]
     fn length_encoded_integers_round_trip() {
         for n in [
@@ -263,8 +252,8 @@ mod tests {
         assert_eq!(out[0], 0xfc);
     }
 
-    /// A length-encoded string is its length and its bytes, so an empty string
-    /// is a zero and not a terminator.
+    /// A length-encoded string is its length and its bytes, so an empty string is a
+    /// zero and not a terminator.
     #[test]
     fn length_encoded_strings_round_trip() {
         let mut out = Vec::new();
@@ -277,8 +266,8 @@ mod tests {
         assert_eq!(r.lenenc_bytes(), None, "and running out is None");
     }
 
-    /// A NUL-terminated string is read without its terminator, and a body
-    /// without one is refused rather than read to the end and believed.
+    /// A NUL-terminated string is read without its terminator, and a body without one
+    /// is refused rather than read to the end and believed.
     #[test]
     fn cstrings_need_their_terminator() {
         let mut r = Reader::new(b"root\0talk\0");
