@@ -291,28 +291,40 @@ pub fn line() -> String {
 /// process-wide, and two tests that set it differently race.
 #[cfg(test)]
 pub fn profile_guard(on: bool) -> ProfileGuard {
+    state_guard(on, WAREHOUSES.load(Ordering::Relaxed))
+}
+
+/// Hold the process-wide TPC-C state -- the profile and the schema size -- for the
+/// life of a test: both are globals, and two tests that set them differently race.
+#[cfg(test)]
+pub fn state_guard(on: bool, warehouses: u64) -> ProfileGuard {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     let held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let before = profile();
+    let profile_before = profile();
+    let warehouses_before = WAREHOUSES.load(Ordering::Relaxed);
     set_profile(on);
+    set_warehouses(warehouses);
 
     ProfileGuard {
         _held: held,
-        before,
+        profile: profile_before,
+        warehouses: warehouses_before,
     }
 }
 
 #[cfg(test)]
 pub struct ProfileGuard {
     _held: std::sync::MutexGuard<'static, ()>,
-    before: bool,
+    profile: bool,
+    warehouses: u64,
 }
 
 #[cfg(test)]
 impl Drop for ProfileGuard {
     fn drop(&mut self) {
-        set_profile(self.before);
+        set_profile(self.profile);
+        set_warehouses(self.warehouses);
     }
 }
 
@@ -791,8 +803,8 @@ mod tests {
     /// said to have.
     #[test]
     fn the_district_sum_starts_at_3001_a_district_and_grows_by_new_orders() {
+        let _state = state_guard(false, 3);
         let before_kind = STATS.new_order.load(Ordering::Relaxed);
-        set_warehouses(3);
 
         let at_start = district_sum();
         assert_eq!(at_start, 3001 * 30 + before_kind, "3001 per district");
@@ -812,8 +824,7 @@ mod tests {
     /// Off, none of them is answered at all.
     #[test]
     fn the_population_answers_need_the_profile() {
-        let _profile = profile_guard(false);
-        set_warehouses(10);
+        let _state = state_guard(false, 10);
         for sql in [
             "select sum(d_next_o_id) from district",
             "select max(w_id) from warehouse",
