@@ -208,7 +208,7 @@ struct Slot {
 
 impl Slot {
     fn new(fd: RawFd, startup_deadline: Option<Instant>, spare: Spare, codec: &Codec) -> Self {
-        Slot {
+        let mut slot = Slot {
             fd,
             session: codec.session(),
             recv: spare.recv,
@@ -222,7 +222,20 @@ impl Slot {
             parked: false,
             closing: false,
             startup_deadline,
-        }
+        };
+
+        // **A recycled connection starts with nothing in it.** The buffers are
+        // handed on to save the allocations, not their contents: a connection
+        // that went away mid-message left the message in `pending`, and the next
+        // client's own bytes would be appended to another client's half packet.
+        // `recv` is a scratch buffer whose contents are never read past the
+        // bytes the kernel wrote, so it is kept as it is.
+        slot.pending.clear();
+        slot.send.clear();
+        slot.staged.clear();
+        slot.sent = 0;
+
+        slot
     }
 
     /// The reply this connection is holding: the part of `send` the kernel has
@@ -2303,7 +2316,15 @@ mod tests {
         ShardSlot
     }
 
-    fn spawn_shard(mut tuning: Tuning) -> Option<(SocketAddr, Arc<AtomicI32>, Shard)> {
+    fn spawn_shard(tuning: Tuning) -> Option<(SocketAddr, Arc<AtomicI32>, Shard)> {
+        spawn_shard_with(crate::protocol::Protocol::Postgres, tuning)
+    }
+
+    /// A shard on a fresh loopback port speaking `protocol`.
+    fn spawn_shard_with(
+        protocol: crate::protocol::Protocol,
+        mut tuning: Tuning,
+    ) -> Option<(SocketAddr, Arc<AtomicI32>, Shard)> {
         if plan().absent.is_some() {
             return None;
         }
@@ -2325,7 +2346,7 @@ mod tests {
                 Ordering::SeqCst,
             );
 
-            let codec = Codec::new(crate::protocol::Protocol::Postgres);
+            let codec = Codec::new(protocol);
             if let Err(e) = run_until(listener, codec, tuning) {
                 eprintln!("test shard ended: {e}");
             }
@@ -3029,6 +3050,119 @@ mod tests {
             stopped.saturating_sub(baseline + clients.len()),
             clients.len()
         );
+    }
+
+    /// The MySQL greeting, and a login that answers it.
+    fn mysql_login(s: &mut TcpStream) {
+        let mut head = [0u8; 4];
+        s.read_exact(&mut head).expect("a greeting header");
+        let len = head[0] as usize | (head[1] as usize) << 8 | (head[2] as usize) << 16;
+        let mut greeting = vec![0u8; len];
+        s.read_exact(&mut greeting).expect("a greeting");
+        assert_eq!(greeting[0], 10, "HandshakeV10");
+
+        const CAPS: u32 = 0x0000_0001
+            | 0x0000_0004
+            | 0x0000_0008
+            | 0x0000_0200
+            | 0x0000_2000
+            | 0x0000_8000
+            | 0x0001_0000
+            | 0x0002_0000
+            | 0x0004_0000
+            | 0x0008_0000
+            | 0x0100_0000;
+        let mut body = Vec::new();
+        body.extend_from_slice(&CAPS.to_le_bytes());
+        body.extend_from_slice(&16_777_216u32.to_le_bytes());
+        body.push(45);
+        body.extend_from_slice(&[0u8; 23]);
+        body.extend_from_slice(b"bench\0");
+        body.push(20);
+        body.extend_from_slice(&[0x41; 20]);
+        body.extend_from_slice(b"tpcc\0");
+        body.extend_from_slice(b"mysql_native_password\0");
+
+        let mut login = vec![
+            (body.len() & 0xff) as u8,
+            ((body.len() >> 8) & 0xff) as u8,
+            ((body.len() >> 16) & 0xff) as u8,
+            1,
+        ];
+        login.extend_from_slice(&body);
+        s.write_all(&login).expect("a handshake response");
+
+        let mut head = [0u8; 4];
+        s.read_exact(&mut head).expect("an answer to the login");
+        let len = head[0] as usize | (head[1] as usize) << 8 | (head[2] as usize) << 16;
+        let mut ok = vec![0u8; len];
+        s.read_exact(&mut ok).expect("an answer body");
+        assert_eq!(ok[0], 0x00, "an OK packet: {ok:?}");
+    }
+
+    /// **A recycled connection starts with nothing in it.**
+    ///
+    /// A slot's buffers are handed to the next connection on it, and a
+    /// connection that went away mid-message left the message in `pending`: the
+    /// next client's own first bytes were appended to another client's half
+    /// packet, and its handshake failed against a server that had done nothing
+    /// wrong. What a recycled slot carries over is its allocation, not its
+    /// contents.
+    #[test]
+    fn a_recycled_connection_starts_with_nothing_in_it() {
+        let Some((addr, _tid, _shard)) =
+            spawn_shard_with(crate::protocol::Protocol::Mysql, Tuning::default())
+        else {
+            return;
+        };
+
+        // A greeting, then half a handshake response, then the end of the
+        // stream: the shard reaps the slot with those six bytes still in it.
+        let mut first = TcpStream::connect(addr).expect("connect");
+        first
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        let mut head = [0u8; 4];
+        first.read_exact(&mut head).expect("the greeting header");
+        let len = head[0] as usize | (head[1] as usize) << 8 | (head[2] as usize) << 16;
+        let mut greeting = vec![0u8; len];
+        first.read_exact(&mut greeting).expect("the greeting");
+        // A header that claims 32 bytes, with two of them sent.
+        first
+            .write_all(&[0x20, 0x00, 0x00, 0x01, 0x00, 0x00])
+            .expect("half a response");
+        first
+            .shutdown(std::net::Shutdown::Write)
+            .expect("the end of the stream");
+        // The server closes when it sees the end; reading to 0 is how the client
+        // knows the slot is free for the next connection.
+        let mut byte = [0u8; 1];
+        let _ = first.read(&mut byte);
+        drop(first);
+
+        // The next connection, on the slot that just came free.
+        let mut second = TcpStream::connect(addr).expect("connect");
+        second
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        second.set_nodelay(true).expect("nodelay");
+        mysql_login(&mut second);
+
+        // And it can run a query, which is what a stale half packet would have
+        // made impossible.
+        second
+            .write_all(&[
+                0x09, 0x00, 0x00, 0x00, 0x03, b's', b'e', b'l', b'e', b'c', b't', b' ', b'1',
+            ])
+            .expect("a query");
+        let mut head = [0u8; 4];
+        second
+            .read_exact(&mut head)
+            .expect("an answer to the query");
+        let len = head[0] as usize | (head[1] as usize) << 8 | (head[2] as usize) << 16;
+        let mut body = vec![0u8; len];
+        second.read_exact(&mut body).expect("an answer body");
+        assert_eq!(body, vec![1], "a one-column result set");
     }
 
     /// **A parked receive is armed again once, not twice.**
