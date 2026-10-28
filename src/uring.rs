@@ -2734,7 +2734,12 @@ mod tests {
     /// -- before the rest of the frame arrives.
     #[test]
     fn a_query_split_across_reads_is_answered_once() {
-        let Some((addr, _tid, _shard)) = spawn_shard(Tuning::default()) else {
+        let stats = Arc::new(Stats::default());
+        let tuning = Tuning {
+            stats: Some(Arc::clone(&stats)),
+            ..Tuning::default()
+        };
+        let Some((addr, _tid, _shard)) = spawn_shard(tuning) else {
             return;
         };
 
@@ -2745,10 +2750,27 @@ mod tests {
         s.write_all(&startup_message()).expect("startup");
         read_until_ready(&mut s).expect("handshake reply");
 
+        // **The halves must arrive in separate receives, and that is what is
+        // waited for** -- a sleep says the bytes were probably apart, the
+        // shard's own read count says they were. Nothing is sent until the
+        // shard has read the first half, so the second half cannot be in the
+        // same receive.
+        let before = stats.reads.load(Ordering::Relaxed);
         let q = query_message("select 1, 1, 1");
         s.write_all(&q[..q.len() - 3]).expect("first half");
-        std::thread::sleep(Duration::from_millis(30));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while stats.reads.load(Ordering::Relaxed) == before {
+            assert!(
+                Instant::now() < deadline,
+                "the shard never read the first half of the query"
+            );
+            std::hint::spin_loop();
+        }
         s.write_all(&q[q.len() - 3..]).expect("second half");
+        assert!(
+            stats.reads.load(Ordering::Relaxed) == before + 1,
+            "the first half alone must be one receive"
+        );
 
         let frames = read_until_ready(&mut s).expect("reply to a split query");
         assert_eq!(frames.len(), 4, "one answer, not two: {frames:?}");
@@ -3000,8 +3022,18 @@ mod tests {
             return;
         };
 
+        // **The clients pipeline, and start together.** One buffer for one read
+        // at a time is only a shortage when more than one read wants it at
+        // once; four connections that each waited for a reply first would take
+        // turns and never ask. A barrier puts every connection's queries in the
+        // shard's queue at the same moment, which is what makes ENOBUFS a
+        // consequence rather than a coincidence of scheduling.
+        const CONNS: usize = 4;
+        const BATCH: usize = 8;
+        let ready = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut clients = Vec::new();
-        for conn in 0..4 {
+        for conn in 0..CONNS {
+            let ready = Arc::clone(&ready);
             clients.push(std::thread::spawn(move || {
                 let mut s = TcpStream::connect(addr).expect("connect");
                 s.set_nodelay(true).expect("nodelay");
@@ -3009,10 +3041,23 @@ mod tests {
                     .expect("read timeout");
                 s.write_all(&startup_message()).expect("startup");
                 read_until_ready(&mut s).expect("handshake reply");
-                for seq in 0..8 {
+
+                let mut batch = Vec::new();
+                for seq in 0..BATCH {
                     let cols = 1 + (conn + seq) % 3;
                     let sql = format!("select {}", vec!["1"; cols].join(", "));
-                    let frames = ask(&mut s, &sql).expect("reply");
+                    batch.extend_from_slice(&query_message(&sql));
+                }
+
+                ready.fetch_add(1, Ordering::SeqCst);
+                while ready.load(Ordering::SeqCst) < CONNS {
+                    std::hint::spin_loop();
+                }
+                s.write_all(&batch).expect("one pipelined write");
+
+                for seq in 0..BATCH {
+                    let cols = 1 + (conn + seq) % 3;
+                    let frames = read_until_ready(&mut s).expect("reply");
                     assert_eq!(frames.len(), 4, "conn {conn} seq {seq}");
                     assert_eq!(columns(&frames[0].1), cols, "conn {conn} seq {seq}");
                 }
@@ -3029,6 +3074,115 @@ mod tests {
             "the shard's only buffer must be back in the ring"
         );
         assert_eq!(stats.held.load(Ordering::Relaxed), 0);
+        // **And the fallback was really taken.** One buffer for four
+        // connections that are all reading at once is ENOBUFS by construction;
+        // without this the test would pass on a shard that never ran out of
+        // buffers and so never read into a connection's own.
+        assert!(
+            stats.enobufs.load(Ordering::Relaxed) > 0,
+            "one buffer served four connections without ever running out -- the \
+             private-buffer path was never exercised"
+        );
+    }
+
+    /// **Several messages in one receive are all answered, in order.**
+    ///
+    /// A pipelined batch arrives as one read: the codec is handed a buffer that
+    /// holds many whole queries and has to consume every one of them, in order,
+    /// without losing the tail. `saturate` and every real driver depend on it,
+    /// and a receive that answered only its first message would show up here as
+    /// a missing answer rather than as a slow run.
+    #[test]
+    fn several_messages_in_one_receive_are_all_answered_in_order() {
+        const BATCH: usize = 16;
+
+        let stats = Arc::new(Stats::default());
+        let tuning = Tuning {
+            pbuf_count: 32,
+            stats: Some(Arc::clone(&stats)),
+            ..Tuning::default()
+        };
+        let Some((addr, _tid, _shard)) = spawn_shard(tuning) else {
+            return;
+        };
+
+        let mut s = TcpStream::connect(addr).expect("connect");
+        s.set_nodelay(true).expect("nodelay");
+        s.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        s.write_all(&startup_message()).expect("startup");
+        read_until_ready(&mut s).expect("handshake reply");
+
+        // The answer's width identifies the query, so answers that arrive in the
+        // wrong order -- or not at all -- are caught one by one.
+        let mut batch = Vec::new();
+        for i in 0..BATCH {
+            let cols = 1 + i % 3;
+            let sql = format!("select {}", vec!["1"; cols].join(", "));
+            batch.extend_from_slice(&query_message(&sql));
+        }
+
+        let before = stats.reads.load(Ordering::Relaxed);
+        s.write_all(&batch).expect("one write of many queries");
+
+        for i in 0..BATCH {
+            let cols = 1 + i % 3;
+            let frames = read_until_ready(&mut s).expect("reply");
+            assert_eq!(frames.len(), 4, "answer {i}");
+            assert_eq!(frames[0].0, b'T');
+            assert_eq!(
+                columns(&frames[0].1),
+                cols,
+                "answer {i} is not the {i}th query's"
+            );
+        }
+
+        // They were not sixteen reads: a batch of this size fits one receive.
+        let reads = stats.reads.load(Ordering::Relaxed) - before;
+        assert!(
+            reads <= 2,
+            "{BATCH} pipelined queries took {reads} receives; the codec is not \
+             consuming a whole buffer"
+        );
+    }
+
+    /// **A message larger than the receive buffer is one message.**
+    ///
+    /// The provided-buffer ring hands out 32 KiB at a time, so a longer query
+    /// arrives in pieces: the codec must keep the pieces it cannot frame yet and
+    /// answer the message exactly once when its last byte lands. Nothing else in
+    /// this suite sends a message that does not fit one buffer.
+    #[test]
+    fn a_message_larger_than_the_receive_buffer_is_answered_once() {
+        let Some((addr, _tid, _shard)) = spawn_shard(Tuning::default()) else {
+            return;
+        };
+
+        let mut s = TcpStream::connect(addr).expect("connect");
+        s.set_nodelay(true).expect("nodelay");
+        s.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        s.write_all(&startup_message()).expect("startup");
+        read_until_ready(&mut s).expect("handshake reply");
+
+        // A comment four buffers long: the statement is still `select 1`, and
+        // the message is far too large for one receive.
+        let sql = format!("select 1 /* {} */", "x".repeat(4 * RECV_BUF));
+        let q = query_message(&sql);
+        assert!(q.len() > RECV_BUF, "the message must not fit one buffer");
+        s.write_all(&q).expect("one large query");
+
+        let frames = read_until_ready(&mut s).expect("reply to a large query");
+        assert_eq!(frames.len(), 4, "one answer, not one per piece: {frames:?}");
+        assert_eq!(frames[0].0, b'T');
+        assert_eq!(columns(&frames[0].1), 1);
+        assert_eq!(frames[1].0, b'D');
+
+        // And the connection is still whole afterwards: nothing of the large
+        // message was left in the carry-over buffer to be framed as a query.
+        let frames = ask(&mut s, "select 1, 1").expect("reply");
+        assert_eq!(frames.len(), 4);
+        assert_eq!(columns(&frames[0].1), 2);
     }
 
     /// **The kernel is asked to re-issue the receive by itself.**
