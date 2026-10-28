@@ -21,6 +21,10 @@ struct CliArgs {
     #[arg(long, env = "PGNOOP_PORT")]
     port: Option<u16>,
 
+    /// MySQL/MariaDB listen port (the protocol is served only when this is set)
+    #[arg(long, env = "PGNOOP_MYSQL_PORT")]
+    mysql_port: Option<u16>,
+
     /// Number of shards, one thread each (0 = number of logical CPUs)
     #[arg(long, env = "PGNOOP_WORKERS")]
     workers: Option<usize>,
@@ -37,6 +41,7 @@ struct CliArgs {
 struct FileConfig {
     host: Option<String>,
     port: Option<u16>,
+    mysql_port: Option<u16>,
     workers: Option<usize>,
     io: Option<String>,
 }
@@ -44,6 +49,9 @@ struct FileConfig {
 pub struct Config {
     pub host: String,
     pub port: u16,
+    /// The MySQL port, when one is served. Off by default: a server that opens a
+    /// second port nobody asked for is one an operator has to remember to close.
+    pub mysql_port: Option<u16>,
     pub workers: usize,
     pub io: Io,
 }
@@ -206,6 +214,7 @@ impl Config {
                 .or(file.host)
                 .unwrap_or_else(|| "0.0.0.0".to_string()),
             port: cli.port.or(file.port).unwrap_or(5432),
+            mysql_port: cli.mysql_port.or(file.mysql_port),
             workers: cli.workers.or(file.workers).unwrap_or(default_workers),
             io: cli
                 .io

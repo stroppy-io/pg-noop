@@ -48,8 +48,7 @@ use std::time::{Duration, Instant};
 
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 
-use crate::handler::CatalogView;
-use crate::wire::Conn;
+use crate::protocol::{Codec, Session};
 
 /// One provided buffer's size. The same as the per-connection receive buffer
 /// this replaced: a pipelined batch of queries fits in one read.
@@ -171,7 +170,7 @@ struct Spare {
 
 struct Slot {
     fd: RawFd,
-    conn: Conn,
+    session: Session,
     /// The connection's own receive buffer, used when the shard's ring has no
     /// buffer to lend it. Allocated on the first receive that needs it, so a
     /// connection the ring can serve never pays for one.
@@ -206,10 +205,10 @@ struct Slot {
 }
 
 impl Slot {
-    fn new(fd: RawFd, startup_deadline: Option<Instant>, spare: Spare) -> Self {
+    fn new(fd: RawFd, startup_deadline: Option<Instant>, spare: Spare, codec: &Codec) -> Self {
         Slot {
             fd,
-            conn: Conn::new(),
+            session: codec.session(),
             recv: spare.recv,
             pending: spare.pending,
             send: spare.send,
@@ -247,7 +246,7 @@ fn next_for(slot: &mut Slot) -> Next {
     if !slot.send.is_empty() && !slot.sending {
         return Next::Send;
     }
-    if slot.closing || slot.conn.is_closed() {
+    if slot.closing || slot.session.is_closed() {
         return Next::Close;
     }
     if slot.parked {
@@ -791,10 +790,10 @@ impl Ring<'_> {
 }
 
 /// Run one shard's loop until the listener fails. Never returns in normal use.
-pub fn run(listener: TcpListener, catalog: CatalogView, entries: u32) -> io::Result<()> {
+pub fn run(listener: TcpListener, codec: Codec, entries: u32) -> io::Result<()> {
     run_until(
         listener,
-        catalog,
+        codec,
         Tuning {
             entries,
             startup_timeout: crate::config::startup_timeout(),
@@ -821,6 +820,10 @@ struct Tuning {
     stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(test)]
     stats: Option<std::sync::Arc<Stats>>,
+    /// Set once the shard's ring exists: a test waiting for a shard learns
+    /// whether it is serving or whether this box refused it a ring.
+    #[cfg(test)]
+    up: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Default for Tuning {
@@ -838,12 +841,21 @@ impl Default for Tuning {
             // buffers, 8 MiB of mapping each.
             #[cfg(not(test))]
             pbuf_count: pbuf_count_from_env(),
+            // **A test process's rings share one mlock budget.** `MAX_LIVE_SHARDS`
+            // shards are alive at once in a test binary, and a provided buffer is
+            // 32 KiB that the kernel pins at registration: 16 of them per shard is
+            // 8 MiB across six, which is the whole of this box's `RLIMIT_MEMLOCK`
+            // and leaves nothing for the rings themselves. What the tests need to
+            // see is one buffer coming back, or four shared between sixteen
+            // connections; eight is room for both.
             #[cfg(test)]
-            pbuf_count: 16,
+            pbuf_count: 8,
             #[cfg(test)]
             stop: None,
             #[cfg(test)]
             stats: None,
+            #[cfg(test)]
+            up: None,
         }
     }
 }
@@ -871,6 +883,11 @@ struct Stats {
     /// `multi_arms` is one where the kernel is re-issuing the request, which is
     /// the whole point of arming it as multishot.
     reads: std::sync::atomic::AtomicUsize,
+    /// Whether the shard registered a provided-buffer ring. A box that refuses
+    /// one (the kernel charges a ring's memory to the user, so rings elsewhere
+    /// under the same account can exhaust it) serves with per-connection
+    /// buffers, and a test about the buffer ring has nothing to test there.
+    provided: std::sync::atomic::AtomicBool,
     /// Reads stopped because the connection was holding more reply than
     /// `STAGED_HIGH_WATER`, and the most reply a connection was ever holding.
     /// The second is the whole of the backpressure: without it a client that
@@ -900,7 +917,7 @@ struct Stats {
 /// has gone; declared inside `passes` -- which is where they used to be -- they
 /// were dropped before it, and only a ring with DEFER_TASKRUN kept that from
 /// being visible.
-fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io::Result<()> {
+fn run_until(listener: TcpListener, codec: Codec, tuning: Tuning) -> io::Result<()> {
     // Slot 0 is reserved for the accept operation so an index is never
     // ambiguous.
     let mut slots: Vec<Option<Slot>> = vec![None];
@@ -910,7 +927,7 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
 
     passes(
         listener,
-        catalog,
+        codec,
         tuning,
         &mut slots,
         &mut free_slots,
@@ -929,7 +946,7 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
 /// One shard's event loop, until the listener fails or a test asks it to stop.
 fn passes(
     listener: TcpListener,
-    catalog: CatalogView,
+    codec: Codec,
     tuning: Tuning,
     slots: &mut Vec<Option<Slot>>,
     free_slots: &mut Vec<usize>,
@@ -1002,6 +1019,19 @@ fn passes(
         ),
         None => None,
     };
+
+    // **Reported after the registration, not after the ring.** A box can give a
+    // shard a ring and refuse it the buffers, and the two mean different things
+    // to a test: the first is a shard, the second is a shard that reads into the
+    // connection's own buffer.
+    #[cfg(test)]
+    if let Some(s) = &tuning.stats {
+        s.provided.store(bufs.is_some(), Ordering::Relaxed);
+    }
+    #[cfg(test)]
+    if let Some(up) = &tuning.up {
+        up.store(true, Ordering::SeqCst);
+    }
 
     let mut ring = Ring {
         submit,
@@ -1117,14 +1147,23 @@ fn passes(
                             let recycled = spare.pop().unwrap_or_default();
                             let idx = match free_slots.pop() {
                                 Some(i) => {
-                                    slots[i] = Some(Slot::new(fd, admitted, recycled));
+                                    slots[i] = Some(Slot::new(fd, admitted, recycled, &codec));
                                     i
                                 }
                                 None => {
-                                    slots.push(Some(Slot::new(fd, admitted, recycled)));
+                                    slots.push(Some(Slot::new(fd, admitted, recycled, &codec)));
                                     slots.len() - 1
                                 }
                             };
+                            // **MySQL speaks first.** Its greeting goes out
+                            // before the client has written anything, because the
+                            // client waits for it; PostgreSQL has no such packet.
+                            if let Some(prelude) = codec.prelude() {
+                                if let Some(slot) = slots[idx].as_mut() {
+                                    slot.send.extend_from_slice(prelude);
+                                }
+                                submit_send(&mut ring, slots, idx)?;
+                            }
                             // Only a connection with a deadline belongs in the list
                             // the expiry pass walks; without one it is an entry the
                             // pass would drop for nothing.
@@ -1288,13 +1327,13 @@ fn passes(
                         let bytes = unsafe { std::slice::from_raw_parts(src, n) };
 
                         if slot.pending.is_empty() {
-                            let used = slot.conn.advance(bytes, out, &catalog);
+                            let used = codec.advance(&mut slot.session, bytes, out);
                             if used < n {
                                 slot.pending.extend_from_slice(&bytes[used..n]);
                             }
                         } else {
                             slot.pending.extend_from_slice(bytes);
-                            let used = slot.conn.advance(&slot.pending, out, &catalog);
+                            let used = codec.advance(&mut slot.session, &slot.pending, out);
                             slot.pending.drain(..used);
                         }
 
@@ -1305,7 +1344,7 @@ fn passes(
 
                         // Startup completed: this connection is no longer the one
                         // the startup deadline is about.
-                        if !slot.conn.awaiting_startup() {
+                        if !slot.session.awaiting_startup() {
                             slot.startup_deadline = None;
                         }
 
@@ -1435,7 +1474,7 @@ fn passes(
                 }
 
                 if let Some(slot) = slots.get_mut(idx).and_then(|s| s.as_mut()) {
-                    if slot.conn.awaiting_startup() {
+                    if slot.session.awaiting_startup() {
                         eprintln!(
                             "pgnoop: connection did not complete startup within {}ms; closing",
                             tuning.startup_timeout.map_or(0, |t| t.as_millis())
@@ -2232,7 +2271,7 @@ mod tests {
     /// memory with a process-wide budget that this box's default `mlock` limit
     /// bounds at about a dozen; a test binary running twenty at once is refused
     /// one, and that is the environment rather than the test.
-    const MAX_LIVE_SHARDS: usize = 6;
+    const MAX_LIVE_SHARDS: usize = 3;
 
     static LIVE_SHARDS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
     static SHARD_FREED: std::sync::Condvar = std::sync::Condvar::new();
@@ -2266,8 +2305,10 @@ mod tests {
         let addr = listener.local_addr().ok()?;
         let tid = Arc::new(AtomicI32::new(0));
         let stop = Arc::new(AtomicBool::new(false));
+        let up = Arc::new(AtomicBool::new(false));
         let _slot = shard_slot();
         tuning.stop = Some(Arc::clone(&stop));
+        tuning.up = Some(Arc::clone(&up));
 
         let published = Arc::clone(&tid);
         let thread = std::thread::spawn(move || {
@@ -2277,12 +2318,29 @@ mod tests {
                 Ordering::SeqCst,
             );
 
-            let catalog = CatalogView(Arc::new(crate::handler::NoopHandler::new()));
-            if let Err(e) = run_until(listener, catalog, tuning) {
+            let codec = Codec::new(crate::protocol::Protocol::Postgres);
+            if let Err(e) = run_until(listener, codec, tuning) {
                 eprintln!("test shard ended: {e}");
             }
         });
 
+        // **A box that refuses a ring right now is not a failing test.** The
+        // kernel charges a ring's memory to the USER rather than the process,
+        // so a box whose other rings are still up can answer ENOMEM to a shard
+        // that would build anywhere else. Waiting for the shard's own "my ring
+        // exists" tells the two apart: no ring, no shard, and nothing to test.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !up.load(Ordering::SeqCst) {
+            if thread.is_finished() {
+                eprintln!("skipping: this box would not give the shard a ring");
+
+                return None;
+            }
+            if Instant::now() > deadline {
+                panic!("the shard neither served nor ended within 30s");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
         for _ in 0..1000 {
             if tid.load(Ordering::SeqCst) != 0 {
                 break;
@@ -2789,6 +2847,18 @@ mod tests {
     /// which is this same test binary re-entered with one test selected.
     const FD_CHILD: &str = "PGNOOP_URING_FD_CHILD";
 
+    /// Does this shard have a provided-buffer ring? A box that refuses one
+    /// serves with per-connection buffers, and a test about the ring has nothing
+    /// to test there.
+    fn has_provided_buffers(stats: &Stats) -> bool {
+        let provided = stats.provided.load(Ordering::Relaxed);
+        if !provided {
+            eprintln!("skipping: this box would not give the shard a buffer ring");
+        }
+
+        provided
+    }
+
     /// This process's open descriptors, as `/proc` counts them.
     fn open_fds() -> usize {
         std::fs::read_dir("/proc/self/fd")
@@ -3021,6 +3091,9 @@ mod tests {
         let Some((addr, _tid, _shard)) = spawn_shard(tuning) else {
             return;
         };
+        if !has_provided_buffers(&stats) {
+            return;
+        }
 
         // **The clients pipeline, and start together.** One buffer for one read
         // at a time is only a shortage when more than one read wants it at
@@ -3207,6 +3280,9 @@ mod tests {
         let Some((addr, _tid, _shard)) = spawn_shard(tuning) else {
             return;
         };
+        if !has_provided_buffers(&stats) {
+            return;
+        }
 
         let mut clients = Vec::new();
         for conn in 0..4 {
@@ -3265,8 +3341,14 @@ mod tests {
             return;
         };
 
-        let mut s = TcpStream::connect(addr).expect("connect");
+        let s = TcpStream::connect(addr).expect("connect");
         s.set_nodelay(true).expect("nodelay");
+        // **A small receive window on purpose.** The reply has to back up on the
+        // server for the water mark to be reached at all, and the kernel's
+        // default window is megabytes: with it, the test would be measuring the
+        // size of this box's socket buffers rather than the shard's mark.
+        let _ = socket2::SockRef::from(&s).set_recv_buffer_size(4096);
+        let mut s = s;
         // The write side is bounded: once the server stops reading, the client's
         // own socket buffer fills and `write_all` would block forever.
         s.set_write_timeout(Some(Duration::from_millis(50)))
@@ -3391,6 +3473,9 @@ mod tests {
         let Some((addr, _tid, _shard)) = spawn_shard(tuning) else {
             return;
         };
+        if !has_provided_buffers(&stats) {
+            return;
+        }
 
         let mut clients = Vec::new();
         for conn in 0..CONNS {
