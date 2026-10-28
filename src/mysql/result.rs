@@ -121,11 +121,32 @@ pub fn definition(out: &mut Vec<u8>, seq: &mut u8, column: &Column<'_>) {
     column.write(out, seq);
 }
 
-/// The column count and the column definitions: everything before the rows.
+/// One definition per column, and -- unless the client deprecated it -- the EOF
+/// that follows them.
 ///
-/// The EOF that follows the definitions is sent only when the client did not ask
-/// to deprecate it. Sending one to a client that did is the mistake that makes a
-/// driver read the EOF as the first row.
+/// **No column count.** A result set starts with the count and a prepare
+/// response does not: its counts are in the OK packet's own header. A count
+/// packet in front of the definitions is a packet the client is not expecting,
+/// and every driver desynchronises on it.
+pub fn definitions(
+    out: &mut Vec<u8>,
+    seq: &mut u8,
+    columns: &[Column<'_>],
+    status: u16,
+    deprecate: bool,
+) {
+    for c in columns {
+        c.write(out, seq);
+    }
+    // Nothing to terminate when there was nothing: MySQL sends the EOF only
+    // after a non-empty list.
+    if !deprecate && !columns.is_empty() {
+        eof(out, seq, status);
+    }
+}
+
+/// A result set's opening: the column count, the definitions, and the EOF that
+/// follows them unless the client deprecated it.
 pub fn header(
     out: &mut Vec<u8>,
     seq: &mut u8,
@@ -137,12 +158,7 @@ pub fn header(
     packet::put_lenenc(out, columns.len() as u64);
     packet::end(out, at);
 
-    for c in columns {
-        c.write(out, seq);
-    }
-    if !deprecate {
-        eof(out, seq, status);
-    }
+    definitions(out, seq, columns, status, deprecate);
 }
 
 /// One row: every value length-encoded, and `None` as the NULL marker.
