@@ -794,415 +794,464 @@ impl Conn {
         }
 
         match t {
-            tag::TERMINATE => {
-                self.phase = Phase::Closed;
+            tag::TERMINATE => self.on_terminate(body, out, catalog),
+
+            tag::QUERY => self.on_query(body, out, catalog),
+
+            tag::COPY_DATA | tag::COPY_DONE | tag::COPY_FAIL => {
+                self.on_copy_message(body, out, catalog)
             }
 
-            tag::QUERY => {
-                // A Query without its NUL is malformed, not empty: this was
-                // `unwrap_or("")`, and `select 1` with no terminator answered
-                // EmptyQueryResponse where PostgreSQL answers 08P01.
-                let (sql, end) = cstr_at(body, 0)?;
-                exhausted(body, end)?;
-                // `PREPARE name AS body` registers a statement: a SQL-preparing
-                // client sends no Parse, and an unregistered name is 26000 on Bind.
-                if let Some((name, body)) = crate::sql::sql_prepare(sql) {
-                    if self.statements.contains_key(name) {
-                        self.error(
-                            out,
-                            "42P05",
-                            &format!("prepared statement \"{name}\" already exists"),
-                        );
-                    } else {
-                        let plan = PreparedPlan::build(body);
-                        let params = crate::handler::parameter_types(body, &[]).unwrap_or_default();
-                        self.statements.insert(
-                            name.to_string(),
-                            std::sync::Arc::new(Statement { plan, params }),
-                        );
-                        complete_raw(out, "PREPARE");
-                    }
-                    self.ready(out);
+            tag::PARSE => self.on_parse(body, out, catalog),
 
-                    return Some(());
-                }
+            tag::BIND => self.on_bind(body, out, catalog),
 
-                if let Some(failure) = crate::tpcc::failure(sql) {
-                    self.injected_failure(failure, out);
-                    self.ready(out);
+            tag::DESCRIBE => self.on_describe(body, out, catalog),
 
-                    return Some(());
-                }
+            tag::EXECUTE => self.on_execute(body, out, catalog),
 
-                let plan = PreparedPlan::build(sql);
+            tag::SYNC => self.on_sync(body, out, catalog),
 
-                // A failed transaction runs nothing until it is ended.
-                if self.failed() && !ends_transaction(&plan.kind) {
-                    return self.refuse(false, out, "25P02", ABORTED);
-                }
+            tag::FLUSH => self.on_flush(body, out, catalog),
 
-                // COPY is decided by its direction, once, in the plan.
-                // `COPY ...
-                if let PlanKind::Copy {
-                    direction,
-                    columns,
-                    format,
-                } = plan.kind
-                {
-                    match direction {
-                        CopyDirection::FromStdin => {
-                            self.enter_copy_in(columns, format, false, out);
+            tag::CLOSE => self.on_close(body, out, catalog),
 
-                            return Some(());
-                        }
-                        CopyDirection::ToStdout => {
-                            // The server would stream rows here.
-                            copy_out_response(out);
-                            copy_done(out);
-                            complete(out, "COPY", Some(0));
-                        }
-                        CopyDirection::FromFile => {
-                            // No conversation: the server reads a path.
-                            // It read nothing, so it copied nothing.
-                            complete(out, "COPY", Some(0));
-                        }
-                    }
+            _ => Some(()),
+        }
+    }
 
-                    self.ready(out);
+    /// One `TERMINATE` message.
+    fn on_terminate(
+        &mut self,
+        _body: &[u8],
+        _out: &mut Vec<u8>,
+        _catalog: &CatalogView,
+    ) -> Option<()> {
+        self.phase = Phase::Closed;
+        Some(())
+    }
 
-                    return Some(());
-                }
-
-                // A statement that opens, ends or fails a transaction changes what the
-                // NEXT `ReadyForQuery` must say, and it is noted before the answer is
-                // written so that the byte and the statement cannot disagree.
-                let failed = self.failed();
-                self.note_transaction(&plan.kind, failed);
-                self.note_statement(&plan.sql);
-
-                answer(
-                    &plan,
+    /// One `QUERY` message.
+    fn on_query(&mut self, body: &[u8], out: &mut Vec<u8>, catalog: &CatalogView) -> Option<()> {
+        // A Query without its NUL is malformed, not empty: this was
+        // `unwrap_or("")`, and `select 1` with no terminator answered
+        // EmptyQueryResponse where PostgreSQL answers 08P01.
+        let (sql, end) = cstr_at(body, 0)?;
+        exhausted(body, end)?;
+        // `PREPARE name AS body` registers a statement: a SQL-preparing
+        // client sends no Parse, and an unregistered name is 26000 on Bind.
+        if let Some((name, body)) = crate::sql::sql_prepare(sql) {
+            if self.statements.contains_key(name) {
+                self.error(
                     out,
-                    catalog,
-                    Run {
-                        describe: true,
-                        failed,
-                        formats: &Formats::TEXT,
-                        max_rows: 0,
+                    "42P05",
+                    &format!("prepared statement \"{name}\" already exists"),
+                );
+            } else {
+                let plan = PreparedPlan::build(body);
+                let params = crate::handler::parameter_types(body, &[]).unwrap_or_default();
+                self.statements.insert(
+                    name.to_string(),
+                    std::sync::Arc::new(Statement { plan, params }),
+                );
+                complete_raw(out, "PREPARE");
+            }
+            self.ready(out);
+
+            return Some(());
+        }
+
+        if let Some(failure) = crate::tpcc::failure(sql) {
+            self.injected_failure(failure, out);
+            self.ready(out);
+
+            return Some(());
+        }
+
+        let plan = PreparedPlan::build(sql);
+
+        // A failed transaction runs nothing until it is ended.
+        if self.failed() && !ends_transaction(&plan.kind) {
+            return self.refuse(false, out, "25P02", ABORTED);
+        }
+
+        // COPY is decided by its direction, once, in the plan.
+        // `COPY ...
+        if let PlanKind::Copy {
+            direction,
+            columns,
+            format,
+        } = plan.kind
+        {
+            match direction {
+                CopyDirection::FromStdin => {
+                    self.enter_copy_in(columns, format, false, out);
+
+                    return Some(());
+                }
+                CopyDirection::ToStdout => {
+                    // The server would stream rows here.
+                    copy_out_response(out);
+                    copy_done(out);
+                    complete(out, "COPY", Some(0));
+                }
+                CopyDirection::FromFile => {
+                    // No conversation: the server reads a path.
+                    // It read nothing, so it copied nothing.
+                    complete(out, "COPY", Some(0));
+                }
+            }
+
+            self.ready(out);
+
+            return Some(());
+        }
+
+        // A statement that opens, ends or fails a transaction changes what the
+        // NEXT `ReadyForQuery` must say, and it is noted before the answer is
+        // written so that the byte and the statement cannot disagree.
+        let failed = self.failed();
+        self.note_transaction(&plan.kind, failed);
+        self.note_statement(&plan.sql);
+
+        answer(
+            &plan,
+            out,
+            catalog,
+            Run {
+                describe: true,
+                failed,
+                formats: &Formats::TEXT,
+                max_rows: 0,
+                consumed: false,
+            },
+        );
+        self.ready(out);
+        Some(())
+    }
+
+    /// One `COPY_DATA`/`COPY_DONE`/`COPY_FAIL` message.
+    fn on_copy_message(
+        &mut self,
+        _body: &[u8],
+        out: &mut Vec<u8>,
+        _catalog: &CatalogView,
+    ) -> Option<()> {
+        // A COPY message outside a COPY is the client desynchronised, not
+        // something to absorb quietly: absorbing it is what lets the two sides
+        // disagree for the rest of the connection.
+        self.error(out, "08P01", "COPY message outside a COPY operation");
+        self.ready(out);
+        Some(())
+    }
+
+    /// One `PARSE` message.
+    fn on_parse(&mut self, body: &[u8], out: &mut Vec<u8>, _catalog: &CatalogView) -> Option<()> {
+        // [stmt_name][query][n_params:i16][types...]
+        let (name, after) = cstr_at(body, 0)?;
+        let (sql, after) = cstr_at(body, after)?;
+        let (declared, end) = oid_list(body, after)?;
+        exhausted(body, end)?;
+        let plan = PreparedPlan::build(sql);
+
+        if self.failed() && !ends_transaction(&plan.kind) {
+            return self.refuse(true, out, "25P02", ABORTED);
+        }
+
+        // A named statement is not replaced in place: PostgreSQL answers 42P05,
+        // and a driver that wants the name back closes it first.
+        if !name.is_empty() && self.statements.contains_key(name) {
+            return self.refuse(
+                true,
+                out,
+                "42P05",
+                &format!("prepared statement \"{name}\" already exists"),
+            );
+        }
+
+        let params = match crate::handler::parameter_types(sql, &declared) {
+            Ok(params) => params,
+            Err(e) => {
+                return self.refuse(true, out, e.sqlstate(), &e.message());
+            }
+        };
+        self.statements
+            .insert(name.to_string(), Arc::new(Statement { plan, params }));
+        msg(out, b'1', |_| {});
+        Some(())
+    }
+
+    /// One `BIND` message.
+    fn on_bind(&mut self, body: &[u8], out: &mut Vec<u8>, catalog: &CatalogView) -> Option<()> {
+        // [portal][stmt][n_pfmt][pfmt..][n_params][(len, bytes)..]
+        // [n_rfmt][rfmt..].
+        let (portal, after) = cstr_at(body, 0)?;
+        let (stmt, after) = cstr_at(body, after)?;
+        let bind = bind_tail(body, after)?;
+
+        // A statement that was never prepared -- or was closed -- is not bound
+        // to; it is reported.
+        let Some(statement) = self.statements.get(stmt) else {
+            return self.refuse(
+                true,
+                out,
+                "26000",
+                &format!("prepared statement \"{stmt}\" does not exist"),
+            );
+        };
+
+        let Statement { plan, params } = &**statement;
+
+        if self.failed() && !ends_transaction(&plan.kind) {
+            return self.refuse(true, out, "25P02", ABORTED);
+        }
+
+        // The counts PostgreSQL checks, with its SQLSTATE and wording.
+        if bind.params != params.len() {
+            let want = params.len();
+            return self.refuse(
+                    true,
+                    out,
+                    "08P01",
+                    &format!(
+                        "bind message supplies {} parameters, but prepared statement \"{stmt}\" requires {want}",
+                        bind.params
+                    ),
+                );
+        }
+
+        if let Some(mismatch) = bind.format_mismatch {
+            return self.refuse(
+                true,
+                out,
+                "08P01",
+                &format!(
+                    "bind message has {mismatch} parameter formats but {} parameters",
+                    bind.params
+                ),
+            );
+        }
+
+        // A per-column result-format list has to be one per column.
+        // Two codes for a one-column query answered BindComplete; PostgreSQL
+        // refuses it.
+        if bind.result_formats > 1 {
+            let columns = match plan.kind {
+                PlanKind::SelectMeta { .. }
+                | PlanKind::SelectStub { .. }
+                | PlanKind::Constant(_) => resolve_columns(plan, catalog).len(),
+                _ => 0,
+            };
+            if bind.result_formats != columns {
+                return self.refuse(
+                    true,
+                    out,
+                    "08P01",
+                    &format!(
+                        "bind message has {} result formats but query has {columns} columns",
+                        bind.result_formats
+                    ),
+                );
+            }
+        }
+
+        // A named portal is not rebound in place either: 42P03, as PostgreSQL
+        // answers, until it is closed.
+        if !portal.is_empty() && self.portals.contains_key(portal) {
+            return self.refuse(
+                true,
+                out,
+                "42P03",
+                &format!("portal \"{portal}\" already exists"),
+            );
+        }
+
+        // One String allocation per query if done unconditionally, and a driver
+        // binds the unnamed portal to the SAME statement forever.
+        let statement = Arc::clone(statement);
+        match self.portals.get_mut(portal) {
+            Some(cur) => {
+                cur.statement = statement;
+                cur.formats = bind.formats;
+                cur.consumed = false;
+            }
+            None => {
+                self.portals.insert(
+                    portal.to_string(),
+                    Portal {
+                        statement,
+                        formats: bind.formats,
                         consumed: false,
                     },
                 );
-                self.ready(out);
             }
+        }
+        msg(out, b'2', |_| {});
+        Some(())
+    }
 
-            tag::COPY_DATA | tag::COPY_DONE | tag::COPY_FAIL => {
-                // A COPY message outside a COPY is the client desynchronised, not
-                // something to absorb quietly: absorbing it is what lets the two sides
-                // disagree for the rest of the connection.
-                self.error(out, "08P01", "COPY message outside a COPY operation");
-                self.ready(out);
-            }
+    /// One `DESCRIBE` message.
+    fn on_describe(&mut self, body: &[u8], out: &mut Vec<u8>, catalog: &CatalogView) -> Option<()> {
+        // ['S'|'P'][name].
+        let kind = subtype(body)?;
+        let (name, end) = cstr_at(body, 1)?;
+        exhausted(body, end)?;
 
-            tag::PARSE => {
-                // [stmt_name][query][n_params:i16][types...]
-                let (name, after) = cstr_at(body, 0)?;
-                let (sql, after) = cstr_at(body, after)?;
-                let (declared, end) = oid_list(body, after)?;
-                exhausted(body, end)?;
-                let plan = PreparedPlan::build(sql);
+        let Some((Statement { plan, params }, formats)) = self.described(kind, name) else {
+            let (code, what) = if kind == b'S' {
+                ("26000", "prepared statement")
+            } else {
+                ("34000", "portal")
+            };
+            return self.refuse(
+                true,
+                out,
+                code,
+                &format!("{what} \"{name}\" does not exist"),
+            );
+        };
 
-                if self.failed() && !ends_transaction(&plan.kind) {
-                    return self.refuse(true, out, "25P02", ABORTED);
-                }
-
-                // A named statement is not replaced in place: PostgreSQL answers 42P05,
-                // and a driver that wants the name back closes it first.
-                if !name.is_empty() && self.statements.contains_key(name) {
-                    return self.refuse(
-                        true,
-                        out,
-                        "42P05",
-                        &format!("prepared statement \"{name}\" already exists"),
-                    );
-                }
-
-                let params = match crate::handler::parameter_types(sql, &declared) {
-                    Ok(params) => params,
-                    Err(e) => {
-                        return self.refuse(true, out, e.sqlstate(), &e.message());
-                    }
-                };
-                self.statements
-                    .insert(name.to_string(), Arc::new(Statement { plan, params }));
-                msg(out, b'1', |_| {});
-            }
-
-            tag::BIND => {
-                // [portal][stmt][n_pfmt][pfmt..][n_params][(len, bytes)..]
-                // [n_rfmt][rfmt..].
-                let (portal, after) = cstr_at(body, 0)?;
-                let (stmt, after) = cstr_at(body, after)?;
-                let bind = bind_tail(body, after)?;
-
-                // A statement that was never prepared -- or was closed -- is not bound
-                // to; it is reported.
-                let Some(statement) = self.statements.get(stmt) else {
-                    return self.refuse(
-                        true,
-                        out,
-                        "26000",
-                        &format!("prepared statement \"{stmt}\" does not exist"),
-                    );
-                };
-
-                let Statement { plan, params } = &**statement;
-
-                if self.failed() && !ends_transaction(&plan.kind) {
-                    return self.refuse(true, out, "25P02", ABORTED);
-                }
-
-                // The counts PostgreSQL checks, with its SQLSTATE and wording.
-                if bind.params != params.len() {
-                    let want = params.len();
-                    return self.refuse(
-                        true,
-                        out,
-                        "08P01",
-                        &format!(
-                            "bind message supplies {} parameters, but prepared statement \"{stmt}\" requires {want}",
-                            bind.params
-                        ),
-                    );
-                }
-
-                if let Some(mismatch) = bind.format_mismatch {
-                    return self.refuse(
-                        true,
-                        out,
-                        "08P01",
-                        &format!(
-                            "bind message has {mismatch} parameter formats but {} parameters",
-                            bind.params
-                        ),
-                    );
-                }
-
-                // A per-column result-format list has to be one per column.
-                // Two codes for a one-column query answered BindComplete; PostgreSQL
-                // refuses it.
-                if bind.result_formats > 1 {
-                    let columns = match plan.kind {
-                        PlanKind::SelectMeta { .. }
-                        | PlanKind::SelectStub { .. }
-                        | PlanKind::Constant(_) => resolve_columns(plan, catalog).len(),
-                        _ => 0,
-                    };
-                    if bind.result_formats != columns {
-                        return self.refuse(
-                            true,
-                            out,
-                            "08P01",
-                            &format!(
-                                "bind message has {} result formats but query has {columns} columns",
-                                bind.result_formats
-                            ),
-                        );
-                    }
-                }
-
-                // A named portal is not rebound in place either: 42P03, as PostgreSQL
-                // answers, until it is closed.
-                if !portal.is_empty() && self.portals.contains_key(portal) {
-                    return self.refuse(
-                        true,
-                        out,
-                        "42P03",
-                        &format!("portal \"{portal}\" already exists"),
-                    );
-                }
-
-                // One String allocation per query if done unconditionally, and a driver
-                // binds the unnamed portal to the SAME statement forever.
-                let statement = Arc::clone(statement);
-                match self.portals.get_mut(portal) {
-                    Some(cur) => {
-                        cur.statement = statement;
-                        cur.formats = bind.formats;
-                        cur.consumed = false;
-                    }
-                    None => {
-                        self.portals.insert(
-                            portal.to_string(),
-                            Portal {
-                                statement,
-                                formats: bind.formats,
-                                consumed: false,
-                            },
-                        );
-                    }
-                }
-                msg(out, b'2', |_| {});
-            }
-
-            tag::DESCRIBE => {
-                // ['S'|'P'][name].
-                let kind = subtype(body)?;
-                let (name, end) = cstr_at(body, 1)?;
-                exhausted(body, end)?;
-
-                let Some((Statement { plan, params }, formats)) = self.described(kind, name) else {
-                    let (code, what) = if kind == b'S' {
-                        ("26000", "prepared statement")
-                    } else {
-                        ("34000", "portal")
-                    };
-                    return self.refuse(
-                        true,
-                        out,
-                        code,
-                        &format!("{what} \"{name}\" does not exist"),
-                    );
-                };
-
-                // PostgreSQL refuses to describe a statement that returns rows inside a
-                // failed transaction, and only those: a client that blindly describes
-                // its ROLLBACK must still be able to send it.
-                if self.failed()
-                    && matches!(
-                        plan.kind,
-                        PlanKind::SelectMeta { .. } | PlanKind::SelectStub { .. }
-                    )
-                {
-                    return self.refuse(true, out, "25P02", ABORTED);
-                }
-
-                // A described STATEMENT also gets its parameter types.
-                if kind == b'S' {
-                    msg(out, b't', |b| {
-                        b.extend_from_slice(&(params.len() as i16).to_be_bytes());
-                        for oid in params {
-                            b.extend_from_slice(&oid.to_be_bytes());
-                        }
-                    });
-                }
-
-                if !row_description(plan, catalog, formats, out) {
-                    msg(out, b'n', |_| {});
-                }
-            }
-
-            tag::EXECUTE => {
-                // [portal][max_rows:i32].
-                // Zero is no limit.
-                let (name, after) = cstr_at(body, 0)?;
-                let max_rows = i32::from_be_bytes(body.get(after..after + 4)?.try_into().ok()?);
-                exhausted(body, after + 4)?;
-                let failed = self.failed();
-
-                // **The injected failure is refused here too**, or a NULL written
-                // through the extended protocol answers OK. Detected before the
-                // mutable borrow, because the error path needs `self`.
-                let injected = self
-                    .portals
-                    .get(name)
-                    .and_then(|p| crate::tpcc::failure(&p.statement.plan.sql));
-                if let Some(failure) = injected {
-                    self.injected_failure(failure, out);
-                    self.phase = Phase::AwaitingSync;
-
-                    return Some(());
-                }
-
-                // No clone: `answer` is a free function precisely so the plan can stay
-                // borrowed out of `self`.
-                // The plan is the portal's own, so one lookup finds both.
-                let Some(portal) = self.portals.get_mut(name) else {
-                    // PostgreSQL reports it, and so does this.
-                    return self.refuse(
-                        true,
-                        out,
-                        "34000",
-                        &format!("portal \"{name}\" does not exist"),
-                    );
-                };
-                let statement = Arc::clone(&portal.statement);
-                let p = &statement.plan;
-
-                if failed && !ends_transaction(&p.kind) {
-                    return self.refuse(true, out, "25P02", ABORTED);
-                }
-
-                // A COPY that streams from the client needs the connection to change
-                // phase, which is not something a free function writing into `out` can
-                // do.
-                let streams_rows = match &p.kind {
-                    PlanKind::Copy {
-                        direction: CopyDirection::FromStdin,
-                        format,
-                        ..
-                    } => Some(*format),
-                    _ => None,
-                };
-
-                // Execute does NOT re-send RowDescription; Describe did.
-                portal.consumed = answer(
-                    p,
-                    out,
-                    catalog,
-                    Run {
-                        describe: false,
-                        failed,
-                        formats: &portal.formats,
-                        max_rows,
-                        consumed: portal.consumed,
-                    },
-                );
-
-                // The extended protocol's Execute is where a statement actually runs,
-                // so it is where the transaction state changes.
-                // `SYNC` is what asks for the byte, later.
-                self.note_transaction(&p.kind, failed);
-                self.note_statement(&p.sql);
-
-                if let Some(format) = streams_rows {
-                    self.copy_binary = BinaryState::default();
-                    self.copy_lines = LineState::default();
-                    self.phase = Phase::CopyIn {
-                        rows: 0,
-                        format,
-                        extended: true,
-                    };
-                }
-            }
-
-            tag::SYNC => {
-                exhausted(body, 0)?;
-                self.ready(out);
-            }
-
-            // Flush means "send what you have".
-            // The caller writes `out` after this call returns, so there is nothing to
-            // do but not swallow it.
-            tag::FLUSH => exhausted(body, 0)?,
-
-            tag::CLOSE => {
-                // ['S'|'P'][name], strictly: Close `X` answered CloseComplete where
-                // PostgreSQL answers 08P01.
-                let kind = subtype(body)?;
-                let (name, end) = cstr_at(body, 1)?;
-                exhausted(body, end)?;
-                if kind == b'S' {
-                    self.statements.remove(name);
-                } else {
-                    self.portals.remove(name);
-                }
-                msg(out, b'3', |_| {});
-            }
-
-            // Unknown: consumed and ignored, which is what a blackhole is for.
-            _ => {}
+        // PostgreSQL refuses to describe a statement that returns rows inside a
+        // failed transaction, and only those: a client that blindly describes
+        // its ROLLBACK must still be able to send it.
+        if self.failed()
+            && matches!(
+                plan.kind,
+                PlanKind::SelectMeta { .. } | PlanKind::SelectStub { .. }
+            )
+        {
+            return self.refuse(true, out, "25P02", ABORTED);
         }
 
+        // A described STATEMENT also gets its parameter types.
+        if kind == b'S' {
+            msg(out, b't', |b| {
+                b.extend_from_slice(&(params.len() as i16).to_be_bytes());
+                for oid in params {
+                    b.extend_from_slice(&oid.to_be_bytes());
+                }
+            });
+        }
+
+        if !row_description(plan, catalog, formats, out) {
+            msg(out, b'n', |_| {});
+        }
+        Some(())
+    }
+
+    /// One `EXECUTE` message.
+    fn on_execute(&mut self, body: &[u8], out: &mut Vec<u8>, catalog: &CatalogView) -> Option<()> {
+        // [portal][max_rows:i32].
+        // Zero is no limit.
+        let (name, after) = cstr_at(body, 0)?;
+        let max_rows = i32::from_be_bytes(body.get(after..after + 4)?.try_into().ok()?);
+        exhausted(body, after + 4)?;
+        let failed = self.failed();
+
+        // **The injected failure is refused here too**, or a NULL written
+        // through the extended protocol answers OK. Detected before the
+        // mutable borrow, because the error path needs `self`.
+        let injected = self
+            .portals
+            .get(name)
+            .and_then(|p| crate::tpcc::failure(&p.statement.plan.sql));
+        if let Some(failure) = injected {
+            self.injected_failure(failure, out);
+            self.phase = Phase::AwaitingSync;
+
+            return Some(());
+        }
+
+        // No clone: `answer` is a free function precisely so the plan can stay
+        // borrowed out of `self`.
+        // The plan is the portal's own, so one lookup finds both.
+        let Some(portal) = self.portals.get_mut(name) else {
+            // PostgreSQL reports it, and so does this.
+            return self.refuse(
+                true,
+                out,
+                "34000",
+                &format!("portal \"{name}\" does not exist"),
+            );
+        };
+        let statement = Arc::clone(&portal.statement);
+        let p = &statement.plan;
+
+        if failed && !ends_transaction(&p.kind) {
+            return self.refuse(true, out, "25P02", ABORTED);
+        }
+
+        // A COPY that streams from the client needs the connection to change
+        // phase, which is not something a free function writing into `out` can
+        // do.
+        let streams_rows = match &p.kind {
+            PlanKind::Copy {
+                direction: CopyDirection::FromStdin,
+                format,
+                ..
+            } => Some(*format),
+            _ => None,
+        };
+
+        // Execute does NOT re-send RowDescription; Describe did.
+        portal.consumed = answer(
+            p,
+            out,
+            catalog,
+            Run {
+                describe: false,
+                failed,
+                formats: &portal.formats,
+                max_rows,
+                consumed: portal.consumed,
+            },
+        );
+
+        // The extended protocol's Execute is where a statement actually runs,
+        // so it is where the transaction state changes.
+        // `SYNC` is what asks for the byte, later.
+        self.note_transaction(&p.kind, failed);
+        self.note_statement(&p.sql);
+
+        if let Some(format) = streams_rows {
+            self.copy_binary = BinaryState::default();
+            self.copy_lines = LineState::default();
+            self.phase = Phase::CopyIn {
+                rows: 0,
+                format,
+                extended: true,
+            };
+        }
+        Some(())
+    }
+
+    /// One `SYNC` message.
+    fn on_sync(&mut self, body: &[u8], out: &mut Vec<u8>, _catalog: &CatalogView) -> Option<()> {
+        exhausted(body, 0)?;
+        self.ready(out);
+        Some(())
+    }
+
+    /// One `FLUSH` message.
+    fn on_flush(&mut self, body: &[u8], _out: &mut Vec<u8>, _catalog: &CatalogView) -> Option<()> {
+        exhausted(body, 0)?;
+
+        Some(())
+    }
+
+    /// One `CLOSE` message.
+    fn on_close(&mut self, body: &[u8], out: &mut Vec<u8>, _catalog: &CatalogView) -> Option<()> {
+        // ['S'|'P'][name], strictly: Close `X` answered CloseComplete where
+        // PostgreSQL answers 08P01.
+        let kind = subtype(body)?;
+        let (name, end) = cstr_at(body, 1)?;
+        exhausted(body, end)?;
+        if kind == b'S' {
+            self.statements.remove(name);
+        } else {
+            self.portals.remove(name);
+        }
+        msg(out, b'3', |_| {});
         Some(())
     }
 
