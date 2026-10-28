@@ -4,6 +4,8 @@
 
 use std::fmt::Debug;
 
+use crate::sql::Dialect;
+
 pub(crate) fn starts_with_keyword(sql: &str, kw: &str) -> bool {
     let bytes = sql.trim_start().as_bytes();
     let kw_bytes = kw.as_bytes();
@@ -163,7 +165,7 @@ pub(crate) fn copy_format(sql: &str) -> CopyFormat {
         }
         if let Some(inner) = word.strip_prefix('(') {
             let inner = inner.strip_suffix(')').unwrap_or(inner);
-            for option in crate::sql::split_top_level(inner) {
+            for option in crate::sql::split_top_level(inner, Dialect::Postgres) {
                 let mut kv = SqlWords::new(option);
                 if kv.next_is("FORMAT") {
                     return match kv.next().map(|v| v.trim_matches('\'')) {
@@ -203,7 +205,7 @@ impl<'a> SqlWords<'a> {
             if self.rest.is_empty() {
                 return None;
             }
-            match crate::sql::skip_comment(self.rest.as_bytes(), 0) {
+            match crate::sql::skip_comment(self.rest.as_bytes(), 0, Dialect::Postgres) {
                 Some(next) if next > 0 => self.rest = &self.rest[next..],
                 _ => break,
             }
@@ -211,16 +213,16 @@ impl<'a> SqlWords<'a> {
 
         let bytes = self.rest.as_bytes();
         let end = match bytes[0] {
-            b'\'' | b'"' | b'`' | b'$' => {
-                crate::sql::skip_literal(bytes, 0).max(1).min(bytes.len())
-            }
-            b'(' => crate::sql::matching_paren(bytes, 0).unwrap_or(bytes.len()),
+            b'\'' | b'"' | b'`' | b'$' => crate::sql::skip_literal(bytes, 0, Dialect::Postgres)
+                .max(1)
+                .min(bytes.len()),
+            b'(' => crate::sql::matching_paren(bytes, 0, Dialect::Postgres).unwrap_or(bytes.len()),
             _ => (0..bytes.len())
                 .find(|&i| {
                     bytes[i].is_ascii_whitespace()
                         || bytes[i] == b'('
                         || bytes[i] == b';'
-                        || crate::sql::skip_comment(bytes, i).is_some()
+                        || crate::sql::skip_comment(bytes, i, Dialect::Postgres).is_some()
                 })
                 .unwrap_or(bytes.len())
                 .max(1),
@@ -255,7 +257,7 @@ pub(crate) fn count_copy_columns(sql: &str) -> usize {
                 return 1;
             }
 
-            return crate::sql::split_top_level(inner).len();
+            return crate::sql::split_top_level(inner, Dialect::Postgres).len();
         }
 
         // The direction keyword, with no column list between the table and it.
@@ -336,12 +338,12 @@ fn placeholders(sql: &str) -> Result<Vec<(usize, usize)>, PlaceholderError> {
     while i < b.len() {
         match b[i] {
             b'\'' | b'"' => {
-                i = crate::sql::skip_literal(b, i);
+                i = crate::sql::skip_literal(b, i, Dialect::Postgres);
 
                 continue;
             }
             b'-' | b'#' | b'/' => {
-                if let Some(next) = crate::sql::skip_comment(b, i) {
+                if let Some(next) = crate::sql::skip_comment(b, i, Dialect::Postgres) {
                     i = next;
 
                     continue;
@@ -372,7 +374,7 @@ fn placeholders(sql: &str) -> Result<Vec<(usize, usize)>, PlaceholderError> {
 
                     continue;
                 }
-                i = crate::sql::skip_literal(b, i);
+                i = crate::sql::skip_literal(b, i, Dialect::Postgres);
 
                 continue;
             }
@@ -765,7 +767,7 @@ pub struct PreparedPlan {
 
 impl PreparedPlan {
     pub fn build(sql: &str) -> Self {
-        let head = crate::sql::first_word(sql);
+        let head = crate::sql::first_word(sql, Dialect::Postgres);
 
         let kind = if head.eq_ignore_ascii_case("SELECT")
             || head.eq_ignore_ascii_case("WITH")
@@ -775,7 +777,7 @@ impl PreparedPlan {
             // A literal answers a row; anything naming data answers none.
             // `select 1` and `select @@version` are values the server can state without
             // knowing anything, and both protocols answer them the same way.
-            if let Some(items) = crate::sql::constant_select(sql) {
+            if let Some(items) = crate::sql::constant_select(sql, Dialect::Postgres) {
                 PlanKind::Constant(items)
             } else {
                 match parse_metadata_select(sql) {
@@ -1111,6 +1113,27 @@ mod placeholder_tests {
         parameter_types(sql, &[]).expect(sql).len()
     }
 
+    /// **A PostgreSQL backslash is not an escape outside an E string.** Counting it
+    /// as one swallowed the rest of `('a\\', $1)` into a literal, so the statement
+    /// declared no parameters and a Bind with one was 08P01.
+    #[test]
+    fn a_pg_backslash_does_not_hide_a_parameter() {
+        assert_eq!(
+            parameter_types("insert into t values ('a\\', $1)", &[])
+                .expect("a statement")
+                .len(),
+            1,
+            "the literal ends at the second quote"
+        );
+        assert_eq!(
+            parameter_types("insert into t values (E'a\\', $1)", &[])
+                .expect("a statement")
+                .len(),
+            0,
+            "an E string escapes the quote, so $1 is inside it"
+        );
+    }
+
     /// **A leading comment does not hide the statement.** The keyword scanner
     /// started at the comment, so `/* x */ INSERT` classified as unknown text and
     /// PostgreSQL answered `SELECT 0` where MySQL answered the insert.
@@ -1121,7 +1144,11 @@ mod placeholder_tests {
             ("-- x\nupdate t set a = 1", "update"),
             ("/* a /* nested */ b */ delete from t", "delete"),
         ] {
-            assert_eq!(crate::sql::first_word(sql), want, "{sql}");
+            assert_eq!(
+                crate::sql::first_word(sql, Dialect::Postgres),
+                want,
+                "{sql}"
+            );
             let plan = PreparedPlan::build(sql);
             assert!(
                 matches!(

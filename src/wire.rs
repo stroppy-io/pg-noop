@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::catalog::CatalogView;
 use crate::plan::{CopyDirection, CopyFormat, PlanKind, PreparedPlan};
+use crate::sql::Dialect;
 
 /// Frontend messages the blackhole understands.
 /// Anything else is consumed and answered as though it succeeded, which is the whole
@@ -397,7 +398,7 @@ impl Conn {
 
     /// Note what a statement does to the counters.
     fn note_statement(&mut self, sql: &str) {
-        let Some(kind) = crate::tpcc::statement_kind(sql) else {
+        let Some(kind) = crate::tpcc::statement_kind(sql, Dialect::Postgres) else {
             return;
         };
         // `Pending` owns the rule, including autocommit: a statement outside a
@@ -846,7 +847,7 @@ impl Conn {
         exhausted(body, end)?;
         // `PREPARE name AS body` registers a statement: a SQL-preparing
         // client sends no Parse, and an unregistered name is 26000 on Bind.
-        if let Some((name, body)) = crate::sql::sql_prepare(sql) {
+        if let Some((name, body)) = crate::sql::sql_prepare(sql, Dialect::Postgres) {
             if self.statements.contains_key(name) {
                 self.error(
                     out,
@@ -867,7 +868,7 @@ impl Conn {
             return Some(());
         }
 
-        if let Some(failure) = crate::tpcc::failure(sql) {
+        if let Some(failure) = crate::tpcc::failure(sql, Dialect::Postgres) {
             self.injected_failure(failure, out);
             self.ready(out);
 
@@ -1160,7 +1161,7 @@ impl Conn {
         let injected = self
             .portals
             .get(name)
-            .and_then(|p| crate::tpcc::failure(&p.statement.plan.sql));
+            .and_then(|p| crate::tpcc::failure(&p.statement.plan.sql, Dialect::Postgres));
         if let Some(failure) = injected {
             self.injected_failure(failure, out);
             self.phase = Phase::AwaitingSync;
@@ -1394,12 +1395,12 @@ impl Conn {
 /// `SELECT 0`, which is what PostgreSQL does too.
 fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Run<'_>) -> bool {
     // The statements answered with a number are the TPC-C profile's.
-    if let Some((name, value)) = crate::tpcc::number_query(&plan.sql) {
+    if let Some((name, value)) = crate::tpcc::number_query(&plan.sql, Dialect::Postgres) {
         return number_answer(out, run, name, value);
     }
 
     if crate::tpcc::profile() {
-        if let Some(filter) = crate::tpcc::show_status(&plan.sql) {
+        if let Some(filter) = crate::tpcc::show_status(&plan.sql, Dialect::Postgres) {
             return status_answer(out, run, filter.as_deref());
         }
     }
@@ -1793,12 +1794,12 @@ fn row_description(
 ) -> bool {
     // Described as it is answered: one int8 column named `sum`, so a driver that
     // decodes the value in binary reads the type it was told.
-    if let Some((name, _)) = crate::tpcc::number_query(&plan.sql) {
+    if let Some((name, _)) = crate::tpcc::number_query(&plan.sql, Dialect::Postgres) {
         number_description(formats, out, name);
 
         return true;
     }
-    if crate::tpcc::profile() && crate::tpcc::show_status(&plan.sql).is_some() {
+    if crate::tpcc::profile() && crate::tpcc::show_status(&plan.sql, Dialect::Postgres).is_some() {
         status_description(out);
 
         return true;
