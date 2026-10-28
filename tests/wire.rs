@@ -1,15 +1,4 @@
 //! Drive the server over a real socket, in both protocols.
-//!
-//! There is no MySQL client crate in this workspace's registry, and a sandbox
-//! without a network cannot fetch one, so the MySQL client here is written
-//! against the same protocol the server speaks -- which has an advantage for
-//! this job: a driver would hide exactly the packets being tested (a
-//! terminator, a sequence number, a status flag). The PostgreSQL side uses the
-//! same approach, in a few hundred bytes of framing.
-//!
-//! What it drives is the REAL server: the binary this workspace builds, on a
-//! port the kernel picks, through the same accept, receive and send path
-//! `saturate` measures.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -21,8 +10,8 @@ struct Server {
     child: Child,
     postgres: u16,
     mysql: u16,
-    /// Every line the server has written to stderr, so a test can read what the
-    /// banner claimed as well as what the ports answer.
+    /// Every line the server has written to stderr, so a test can read what the banner
+    /// claimed as well as what the ports answer.
     log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
@@ -33,21 +22,16 @@ impl Drop for Server {
     }
 }
 
-/// A server on both protocols with the kernel's own ports, discovered from its
-/// banner.
+/// A server on both protocols with the kernel's own ports, discovered from its banner.
 fn server() -> Server {
     server_with(&[])
 }
 
-/// The banner of a spawned server: the two ports the kernel gave it, read from
-/// its stderr.
+/// The banner of a spawned server: the two ports the kernel gave it, read from its
+/// stderr.
 fn banner(mut child: Child) -> Server {
     let stderr = child.stderr.take().expect("stderr is piped");
-    // **The pipe has to stay drained for the life of the child.** A child whose
-    // stderr nobody reads blocks when the pipe fills, and one that writes to a
-    // pipe whose reader has gone dies -- which is why the banner lines are read
-    // by a thread that keeps reading afterwards rather than by a reader the
-    // function drops.
+    // The pipe has to stay drained for the life of the child.
     let (tx, rx) = std::sync::mpsc::channel();
     let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let recorded = std::sync::Arc::clone(&log);
@@ -62,8 +46,8 @@ fn banner(mut child: Child) -> Server {
                     if let Ok(mut log) = recorded.lock() {
                         log.push(line.clone());
                     }
-                    // Ignored: after the test ends nobody is listening, and the
-                    // pipe still needs emptying.
+                    // Ignored: after the test ends nobody is listening, and the pipe
+                    // still needs emptying.
                     let _ = tx.send(line.clone());
                 }
             }
@@ -84,7 +68,8 @@ fn banner(mut child: Child) -> Server {
             ("mysql listening on ", &mut mysql),
         ] {
             if let Some(at) = line.find(protocol) {
-                // `... listening on 127.0.0.1:PORT (N shards, ...)`.
+                // `...
+                // listening on 127.0.0.1:PORT (N shards, ...)`.
                 let addr = line[at + protocol.len()..]
                     .split('(')
                     .next()
@@ -296,9 +281,9 @@ impl Client {
         self.answer()
     }
 
-    /// Read one answer: a result set up to its terminator, or a single OK or ERR
-    /// packet -- and, while the status says another answer follows, the next one
-    /// too, so a multi-statement query's answers come back in order.
+    /// Read one answer: a result set up to its terminator, or a single OK or ERR packet
+    /// -- and, while the status says another answer follows, the next one too, so a
+    /// multi-statement query's answers come back in order.
     fn answer(&mut self) -> Vec<Packet> {
         let mut all = Vec::new();
         loop {
@@ -316,9 +301,9 @@ impl Client {
                     return all;
                 }
                 _ => {
-                    // A result set: the column count, a definition per column,
-                    // then rows until a terminator -- which is fewer than nine
-                    // bytes, and that is what tells it from a row.
+                    // A result set: the column count, a definition per column, then
+                    // rows until a terminator -- which is fewer than nine bytes, and
+                    // that is what tells it from a row.
                     let (columns, _) = first.lenenc(0);
                     all.push(first);
                     for _ in 0..columns {
@@ -348,7 +333,7 @@ impl Client {
     }
 }
 
-/// **A connection, a query and a reply, over a real socket.**
+/// A connection, a query and a reply, over a real socket.
 #[test]
 fn a_client_connects_queries_and_quits() {
     let server = server();
@@ -360,9 +345,9 @@ fn a_client_connects_queries_and_quits() {
     assert_eq!(answer[0].body[0], 0x00, "an OK packet");
     assert_eq!(answer[0].status() & AUTOCOMMIT, AUTOCOMMIT);
 
-    // A SELECT answers a well-formed result set with no rows: the column count,
-    // the definitions, and the terminator -- which the server sends as an OK
-    // packet with a `0xfe` header, because this client gave up EOF.
+    // A SELECT answers a well-formed result set with no rows: the column count, the
+    // definitions, and the terminator -- which the server sends as an OK packet with a
+    // `0xfe` header, because this client gave up EOF.
     let answer = client.query("select w_id, w_name from warehouse");
     assert_eq!(answer.len(), 4, "{answer:?}");
     assert_eq!(answer[0].lenenc(0).0, 2, "two columns");
@@ -387,17 +372,17 @@ fn a_client_connects_queries_and_quits() {
     );
 }
 
-/// **A multi-statement query is answered one statement at a time**, with
-/// `MORE_RESULTS_EXISTS` on every answer but the last -- which is what a client
-/// loops on.
+/// A multi-statement query is answered one statement at a time, with
+/// `MORE_RESULTS_EXISTS` on every answer but the last -- which is what a client loops
+/// on.
 #[test]
 fn a_multi_statement_query_is_answered_in_order() {
     let server = server();
     let mut client = Client::connect(server.mysql);
 
     let answer = client.query("set @x = 1; select 1; set @y = 2");
-    // OK, then the result set's column count, its definition, its one row and
-    // its terminator, then the last OK.
+    // OK, then the result set's column count, its definition, its one row and its
+    // terminator, then the last OK.
     assert_eq!(answer.len(), 6, "{answer:?}");
 
     // First: an OK packet with more to come.
@@ -415,8 +400,8 @@ fn a_multi_statement_query_is_answered_in_order() {
     assert_eq!(answer[5].status() & MORE_RESULTS_EXISTS, 0);
 }
 
-/// **A prepared statement is prepared, executed twice and closed**, and a closed
-/// one is refused: the client's statement cache is what this exists for.
+/// A prepared statement is prepared, executed twice and closed, and a closed one is
+/// refused: the client's statement cache is what this exists for.
 #[test]
 fn a_prepared_statement_survives_being_executed_twice() {
     let server = server();
@@ -437,9 +422,8 @@ fn a_prepared_statement_survives_being_executed_twice() {
     let columns = u16::from_le_bytes([prepare.body[5], prepare.body[6]]);
     let params = u16::from_le_bytes([prepare.body[7], prepare.body[8]]);
     assert_eq!((columns, params), (1, 1));
-    // **One definition per parameter, then one per column -- and no count
-    // packet in front of them.** Reading one packet too many would leave the
-    // stream one answer behind for the rest of the test.
+    // One definition per parameter, then one per column -- and no count packet in front
+    // of them.
     for expected in ["?", "d_next_o_id"] {
         let definition = client.read();
         assert_eq!(definition.body[0], 3, "a definition: {:?}", definition.body);
@@ -480,8 +464,8 @@ fn a_prepared_statement_survives_being_executed_twice() {
     assert_eq!(answer[0].error().0, 1243);
 }
 
-/// **A transaction's state is visible in the status flags**, which is how a pool
-/// knows the connection it is about to hand out has one open.
+/// A transaction's state is visible in the status flags, which is how a pool knows the
+/// connection it is about to hand out has one open.
 #[test]
 fn a_transaction_shows_in_the_status_of_every_answer() {
     let server = server();
@@ -509,9 +493,9 @@ fn a_transaction_shows_in_the_status_of_every_answer() {
     assert_eq!(answer[0].status() & IN_TRANS, 0);
 }
 
-/// **Pipelined commands are answered in order, one answer per command.** A
-/// client that writes three commands before reading any gets three answers, in
-/// the order it asked, each numbered from one.
+/// Pipelined commands are answered in order, one answer per command.
+/// A client that writes three commands before reading any gets three answers, in the
+/// order it asked, each numbered from one.
 #[test]
 fn pipelined_commands_are_answered_in_order() {
     let server = server();
@@ -532,9 +516,9 @@ fn pipelined_commands_are_answered_in_order() {
     }
 }
 
-/// **A MySQL connection is greeted before it says anything**, and a client that
-/// connects to the PostgreSQL port is not greeted at all: the two protocols are
-/// separate listeners with separate codecs.
+/// A MySQL connection is greeted before it says anything, and a client that connects to
+/// the PostgreSQL port is not greeted at all: the two protocols are separate listeners
+/// with separate codecs.
 #[test]
 fn each_port_speaks_its_own_protocol() {
     let server = server();
@@ -581,24 +565,21 @@ fn server_with(args: &[&str]) -> Server {
 /// A server with environment variables set, for the knobs a run needs.
 fn server_with_env(env: &[(&str, &str)], args: &[&str]) -> Server {
     let mut all: Vec<&str> = vec!["--host", "127.0.0.1", "--port", "0", "--mysql-port", "0"];
-    // One shard per protocol unless the test says otherwise: clap refuses a flag
-    // given twice, so the default cannot simply be appended.
+    // One shard per protocol unless the test says otherwise: clap refuses a flag given
+    // twice, so the default cannot simply be appended.
     if !args.contains(&"--workers") {
         all.extend_from_slice(&["--workers", "1"]);
     }
-    // **The TPC-C profile, unless a test says otherwise**: the numbers this
-    // server states are what a TPC-C client reads, and a test that checks them is
-    // checking the profile.
+    // The TPC-C profile, unless a test says otherwise: the numbers this server states
+    // are what a TPC-C client reads, and a test that checks them is checking the
+    // profile.
     if !args.contains(&"--profile") {
         all.extend_from_slice(&["--profile", "tpcc"]);
     }
     all.extend_from_slice(args);
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_dbnoop"));
-    // **A small provided-buffer ring on purpose.** The default is 256 buffers,
-    // 8 MiB the kernel pins at registration; a box running several of these
-    // servers at once runs out, and the shard that cannot register is not what
-    // these tests are about.
+    // A small provided-buffer ring on purpose.
     command.env("DBNOOP_PBUF", "4");
     for (name, value) in env {
         command.env(name, value);
@@ -616,12 +597,8 @@ fn server_with_env(env: &[(&str, &str)], args: &[&str]) -> Server {
 
 // ---------------------------------------------------------------- TPC-C rules
 
-/// **The district sum is answered with the schema's own number, and grows by one
-/// per NewOrder.**
-///
-/// This is the figure HammerDB reads before and after its window and reports as
-/// NOPM, and it is per PROCESS: the counters belong to the server, not to a
-/// connection, so a test with its own server sees its own arithmetic.
+/// The district sum is answered with the schema's own number, and grows by one per
+/// NewOrder.
 #[test]
 fn the_district_sum_is_what_a_tpcc_client_reads_for_nopm() {
     let server = server();
@@ -650,8 +627,8 @@ fn the_district_sum_is_what_a_tpcc_client_reads_for_nopm() {
         );
     }
 
-    // The same query in another case, with the schema prefix a client may use,
-    // is the same query.
+    // The same query in another case, with the schema prefix a client may use, is the
+    // same query.
     let answer = client.query("SELECT SUM(D_NEXT_O_ID) FROM tpcc.district");
     assert_eq!(row(&answer[2])[0], "300103");
 
@@ -665,8 +642,8 @@ fn the_district_sum_is_what_a_tpcc_client_reads_for_nopm() {
     assert_eq!(row(&answer[2])[0], "300104", "the insert counts too");
 }
 
-/// `--warehouses` sets how many districts the schema has: the sum a client reads
-/// at the start is 3001 per district.
+/// `--warehouses` sets how many districts the schema has: the sum a client reads at the
+/// start is 3001 per district.
 #[test]
 fn the_district_sum_follows_the_warehouse_count() {
     let server = server_with(&["--warehouses", "5"]);
@@ -680,8 +657,8 @@ fn the_district_sum_follows_the_warehouse_count() {
     );
 }
 
-/// **`show global status` answers the commit counters a TPC-C client reads for
-/// TPM**, unfiltered and with the `LIKE` a client asks one at a time with.
+/// `show global status` answers the commit counters a TPC-C client reads for TPM,
+/// unfiltered and with the `LIKE` a client asks one at a time with.
 #[test]
 fn the_commit_counters_are_what_a_tpcc_client_reads_for_tpm() {
     let server = server();
@@ -725,8 +702,8 @@ fn counter(client: &mut Client, name: &str) -> u64 {
     rows[0][1].parse().expect("a number")
 }
 
-/// A PostgreSQL DataRow's values: an i16 count, then an i32 length and that many
-/// bytes for each.
+/// A PostgreSQL DataRow's values: an i16 count, then an i32 length and that many bytes
+/// for each.
 fn pg_values(body: &[u8]) -> Vec<String> {
     let count = i16::from_be_bytes([body[0], body[1]]) as usize;
     let mut at = 2;
@@ -753,8 +730,8 @@ fn row(packet: &Packet) -> Vec<String> {
     values
 }
 
-/// **A stored procedure's OUT parameters read back as one row of numbers**, which
-/// is what a client does straight after its `CALL`.
+/// A stored procedure's OUT parameters read back as one row of numbers, which is what a
+/// client does straight after its `CALL`.
 #[test]
 fn out_parameters_answer_one_plausible_row() {
     let server = server();
@@ -769,8 +746,8 @@ fn out_parameters_answer_one_plausible_row() {
     assert_eq!(values, vec!["1", "1"], "numbers, and never NULL");
 }
 
-/// **The same rules answer on the PostgreSQL port**, where a TPC-C client's
-/// NOPM reads the same district query.
+/// The same rules answer on the PostgreSQL port, where a TPC-C client's NOPM reads the
+/// same district query.
 #[test]
 fn the_district_sum_is_answered_on_the_postgres_port() {
     let server = server();
@@ -805,8 +782,7 @@ fn the_district_sum_is_answered_on_the_postgres_port() {
     assert!(values[1].parse::<u64>().is_ok(), "and a number: {values:?}");
 }
 
-/// A minimal PostgreSQL client: enough to send a simple query and read its
-/// frames.
+/// A minimal PostgreSQL client: enough to send a simple query and read its frames.
 struct PgClient {
     stream: TcpStream,
 }
@@ -869,9 +845,9 @@ impl PgClient {
     }
 }
 
-/// **Both binary names serve.** `dbnoop` is the name; `pgnoop` is what the
-/// scripts written for the PostgreSQL-only server call, and an upgrade that
-/// dropped it would break them at their next run.
+/// Both binary names serve.
+/// `dbnoop` is the name; `pgnoop` is what the scripts written for the PostgreSQL-only
+/// server call, and an upgrade that dropped it would break them at their next run.
 #[test]
 fn both_binary_names_serve() {
     for binary in [env!("CARGO_BIN_EXE_dbnoop"), env!("CARGO_BIN_EXE_pgnoop")] {
@@ -906,9 +882,8 @@ fn both_binary_names_serve() {
     }
 }
 
-/// **A prepared statement's row is in the binary protocol**, over a real socket:
-/// the client here sends the parameter types and reads the row bytes the way a
-/// driver does.
+/// A prepared statement's row is in the binary protocol, over a real socket: the client
+/// here sends the parameter types and reads the row bytes the way a driver does.
 #[test]
 fn a_prepared_select_answers_a_binary_row() {
     let server = server();
@@ -951,11 +926,7 @@ fn a_prepared_select_answers_a_binary_row() {
     assert_eq!(terminator.body[0], 0xfe);
 }
 
-/// **A stored routine's body does not leave the session in a transaction.**
-///
-/// The body's own `BEGIN` was split out as a statement, so `in_trans` stayed set
-/// for the rest of the session and every later autocommit CALL stopped counting
-/// a commit -- a TPC-C run's TPM read zero from an otherwise working server.
+/// A stored routine's body does not leave the session in a transaction.
 #[test]
 fn a_routine_body_leaves_no_transaction_behind() {
     let server = server();
@@ -977,8 +948,7 @@ fn a_routine_body_leaves_no_transaction_behind() {
         "the body's BEGIN is not a transaction"
     );
 
-    // The next statement is still autocommit, and an explicit transaction still
-    // works.
+    // The next statement is still autocommit, and an explicit transaction still works.
     client.query("call PAYMENT(1, 2, 3)");
     assert_eq!(counter(&mut client, "Com_commit"), 1, "the CALL committed");
 
@@ -994,12 +964,9 @@ fn a_routine_body_leaves_no_transaction_behind() {
     assert_eq!(counter(&mut client, "Com_commit"), 2);
 }
 
-/// **A PostgreSQL TPC-C client's function call counts**, so its NOPM is not zero.
-///
-/// HammerDB's PG TPROC-C calls `neword(...)` as a function inside a SELECT --
-/// plain and prepared -- rather than as a `CALL`. Counting only `CALL` left the
-/// district sum standing still while the run worked, which is the one failure
-/// mode a no-op server must not have.
+/// A PostgreSQL TPC-C client's function call counts, so its NOPM is not zero.
+/// HammerDB's PG TPROC-C calls `neword(...)` as a function inside a SELECT -- plain and
+/// prepared -- rather than as a `CALL`.
 #[test]
 fn a_postgres_function_call_is_a_tpcc_transaction() {
     let server = server();
@@ -1059,8 +1026,8 @@ fn a_postgres_function_call_is_a_tpcc_transaction() {
         pg.until_ready();
     }
 
-    // One district sum read after three NewOrders -- the first two statements --
-    // and two Payments, which move no district.
+    // One district sum read after three NewOrders -- the first two statements -- and
+    // two Payments, which move no district.
     let answer = pg.query("select sum(d_next_o_id) from district");
     let after = String::from_utf8_lossy(&answer[1].1).to_string();
     assert!(
@@ -1069,21 +1036,7 @@ fn a_postgres_function_call_is_a_tpcc_transaction() {
     );
 }
 
-/// **A shard that cannot have a ring serves on epoll; it does not die.**
-///
-/// Ring memory is charged to the USER, not to the shard that has it: on a 32-CPU
-/// box the default `--workers 0` is 64 shards, and 64 rings do not fit in the
-/// 8 MiB `RLIMIT_MEMLOCK` a default Linux host grants that user. The shards that
-/// could not have one used to *end* -- and a dead shard's listener stays in the
-/// `SO_REUSEPORT` group, so the kernel keeps routing connections to a port
-/// nobody accepts on. That is how a container answered `psql` and refused
-/// `mariadb` with ERROR 2002 on a server that was otherwise up.
-///
-/// `DBNOOP_FAIL_RING` refuses the first N shards a ring, which is the failure a
-/// box out of ring memory produces and cannot be asked for on demand. Both
-/// counts are tried: every shard refused (all on epoll) and half of them (some on
-/// each backend). In both, every shard of every protocol is serving and both
-/// ports answer.
+/// A shard that cannot have a ring serves on epoll; it does not die.
 #[test]
 fn a_shard_without_a_ring_serves_on_epoll() {
     for (case, fail) in [("every shard", "64"), ("half of them", "2")] {
@@ -1092,8 +1045,8 @@ fn a_shard_without_a_ring_serves_on_epoll() {
             &["--workers", "2", "--io", "uring"],
         );
 
-        // What the banner claims: every shard of both protocols reports itself
-        // serving, and the backends add up.
+        // What the banner claims: every shard of both protocols reports itself serving,
+        // and the backends add up.
         let log = server.log.lock().map(|l| l.join("\n")).unwrap_or_default();
         for protocol in ["postgres", "mysql"] {
             let line = log
@@ -1120,10 +1073,7 @@ fn a_shard_without_a_ring_serves_on_epoll() {
     }
 }
 
-/// **The ring budget is what the process may lock, and the banner says how it
-/// was spent.** A plan that fits 8 MiB gives fewer shards a ring, not a shard
-/// that dies: the box that found this bug reported `io_uring refused the probed
-/// setup (ENOMEM)` and then a dead shard.
+/// The ring budget is what the process may lock, and the banner says how it was spent.
 #[test]
 fn the_banner_says_which_backend_each_shard_got() {
     let server = server_with_env(&[], &["--workers", "1", "--io", "uring"]);
@@ -1135,8 +1085,8 @@ fn the_banner_says_which_backend_each_shard_got() {
             .find(|l| l.contains(&format!("{protocol} listening on")))
             .unwrap_or_else(|| panic!("no {protocol} banner in\n{log}"));
         // `serving 1/1, io_uring <n>, epoll <m>, pinned=1/1`, and the two add up.
-        // `io_uring 3, epoll 1)` -- the number after the label, up to whatever
-        // follows it.
+        // `io_uring 3, epoll 1)` -- the number after the label, up to whatever follows
+        // it.
         let count = |label: &str| -> usize {
             line.split(label)
                 .nth(1)
@@ -1154,15 +1104,9 @@ fn the_banner_says_which_backend_each_shard_got() {
     }
 }
 
-/// **One answer shape on both protocols.** A row is something the server can
-/// state only for a constant select list; everything that names data answers
-/// none. PostgreSQL used to answer a row of `1`s for a table it had not seen
-/// DDL for, while MySQL answered none -- so the same plain-SQL client found
-/// every item on one protocol and nothing on the other, and its own code paths
-/// (and therefore its cost) differed by protocol.
-///
-/// The row counts here are the whole point, so they are asserted directly and on
-/// both ports.
+/// One answer shape on both protocols.
+/// A row is something the server can state only for a constant select list; everything
+/// that names data answers none.
 #[test]
 fn a_select_answers_the_same_shape_on_both_protocols() {
     let server = server();
@@ -1211,13 +1155,7 @@ fn a_select_answers_the_same_shape_on_both_protocols() {
     assert_eq!(&answer[0].1, b"DELETE 0\0");
 }
 
-/// **A transaction is counted when it commits; a rollback counts nothing.**
-///
-/// A NewOrder used to be counted when its statement ran, so a rolled-back
-/// NewOrder raised the district sum anyway and NOPM was inflated by every failed
-/// transaction. On PostgreSQL a counted statement outside `BEGIN` was not counted
-/// as a commit at all, so HammerDB's PostgreSQL TPM -- `xact_commit +
-/// xact_rollback` -- read zero on a run that worked.
+/// A transaction is counted when it commits; a rollback counts nothing.
 #[test]
 fn a_transaction_is_counted_at_commit_on_both_protocols() {
     let server = server();
@@ -1272,8 +1210,8 @@ fn a_transaction_is_counted_at_commit_on_both_protocols() {
     pg.query("commit");
     assert_eq!(sum(&mut pg), before + 1, "a committed one is");
 
-    // **Autocommit on PostgreSQL counts a commit too**, which is what a TPM
-    // read off `xact_commit` needs.
+    // Autocommit on PostgreSQL counts a commit too, which is what a TPM read off
+    // `xact_commit` needs.
     let commits = |pg: &mut PgClient| -> u64 {
         let answer = pg.query("show global status like 'Com_commit'");
         pg_values(&answer[1].1)[1].parse().expect("a number")
@@ -1292,14 +1230,7 @@ fn a_transaction_is_counted_at_commit_on_both_protocols() {
     );
 }
 
-/// **The failures a client injects are errors, on both protocols.**
-///
-/// A benchmark exercises its rollback path on purpose: stroppy-rust's MySQL
-/// NewOrder writes a NULL into a NOT NULL column one time in a hundred and ends
-/// the transaction with `SIGNAL SQLSTATE '45000'`, and HammerDB's PostgreSQL arm
-/// raises. A server that answers OK to all of them turns every injected rollback
-/// into a commit -- the counters move, and the client's error handling never
-/// runs -- so each one has to answer with the error the client is expecting.
+/// The failures a client injects are errors, on both protocols.
 #[test]
 fn an_injected_failure_is_an_error_on_both_protocols() {
     let server = server();
@@ -1334,8 +1265,8 @@ fn an_injected_failure_is_an_error_on_both_protocols() {
         assert!(text.contains(state), "{sql}: expected {state} in {text:?}");
     }
 
-    // And a failure inside a transaction aborts it, so the rollback the client
-    // sends next is answered -- and counts nothing.
+    // And a failure inside a transaction aborts it, so the rollback the client sends
+    // next is answered -- and counts nothing.
     let mut mysql = Client::connect(server.mysql);
     let sum = |client: &mut Client| -> u64 {
         let answer = client.query("select sum(d_next_o_id) from district");
@@ -1352,12 +1283,7 @@ fn an_injected_failure_is_an_error_on_both_protocols() {
     );
 }
 
-/// **The synthetic answers need `--profile tpcc`, and say so when they are on.**
-///
-/// A server that answers a district sum without being asked is asserting numbers
-/// it has no data for, and a figure taken with the answers on must never be read
-/// as a measurement: the stats line says `synthetic NOPM`, and the README says
-/// what the profile is.
+/// The synthetic answers need `--profile tpcc`, and say so when they are on.
 #[test]
 fn the_synthetic_answers_need_the_profile() {
     let plain = server_with_env(&[], &["--profile", "none"]);
