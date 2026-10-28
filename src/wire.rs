@@ -873,6 +873,31 @@ impl Conn {
                 // EmptyQueryResponse where PostgreSQL answers 08P01.
                 let (sql, end) = cstr_at(body, 0)?;
                 exhausted(body, end)?;
+                // **`PREPARE name AS body` registers a statement**, which is how
+                // a SQL-preparing client (HammerDB's PostgreSQL TPC-C at login)
+                // makes one: the name has to be found by a later Bind, or every
+                // execution is 26000.
+                if let Some((name, body)) = crate::sql::sql_prepare(sql) {
+                    if self.statements.contains_key(name) {
+                        self.error(
+                            out,
+                            "42P05",
+                            &format!("prepared statement \"{name}\" already exists"),
+                        );
+                    } else {
+                        let plan = PreparedPlan::build(body);
+                        let params = crate::handler::parameter_types(body, &[]).unwrap_or_default();
+                        self.statements.insert(
+                            name.to_string(),
+                            std::sync::Arc::new(Statement { plan, params }),
+                        );
+                        complete_raw(out, "PREPARE");
+                    }
+                    self.ready(out);
+
+                    return Some(());
+                }
+
                 let plan = PreparedPlan::build(sql);
 
                 // A failed transaction runs nothing until it is ended. This
@@ -2325,6 +2350,74 @@ mod tests {
         *at += 1 + len;
 
         (tag, body)
+    }
+
+    /// **SQL `PREPARE name AS body` registers `name` for Bind/Execute.**
+    ///
+    /// HammerDB's PostgreSQL TPROC-C prepares its stored procedures this way at
+    /// login (`PREPARE neword AS select ...`) and then executes them by name. The
+    /// codec answered the PREPARE like any other statement and kept nothing, so
+    /// the first Bind of the name was 26000 "prepared statement does not exist"
+    /// and the run measured zero. The name is registered against its body, which
+    /// from then on behaves exactly as if it had been prepared with a Parse.
+    #[test]
+    fn a_sql_prepare_registers_a_statement_for_bind() {
+        let (mut c, v) = (Conn::new(), view());
+        let mut out = Vec::new();
+        c.advance(&startup_msg(), &mut out, &v);
+
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'Q', |b| cstr(b, "PREPARE neword AS select 1")),
+            &mut out,
+            &v,
+        );
+        assert_eq!(out[0], b'C', "a CommandComplete: {out:?}");
+        assert!(String::from_utf8_lossy(&out).contains("PREPARE"));
+
+        // The name is an ordinary prepared statement from here: Bind/Execute it.
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'B', |b| {
+                cstr(b, "");
+                cstr(b, "neword");
+                b.extend_from_slice(&0i16.to_be_bytes());
+                b.extend_from_slice(&0i16.to_be_bytes());
+                b.extend_from_slice(&0i16.to_be_bytes());
+            }),
+            &mut out,
+            &v,
+        );
+        assert_eq!(out[0], b'2', "BindComplete, not 26000: {out:?}");
+
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'E', |b| {
+                cstr(b, "");
+                b.extend_from_slice(&0i32.to_be_bytes());
+            }),
+            &mut out,
+            &v,
+        );
+        c.advance(&tagged(b'S', |_| {}), &mut out, &v);
+        assert!(out.contains(&b'D'), "executing it answers its row: {out:?}");
+    }
+
+    /// A `PREPARE` of a name already in use is PostgreSQL's 42P05, and a name
+    /// that was never prepared is still 26000.
+    #[test]
+    fn a_sql_prepare_refuses_a_duplicate_name() {
+        let (mut c, v) = (Conn::new(), view());
+        let mut out = Vec::new();
+        c.advance(&startup_msg(), &mut out, &v);
+
+        let mut twice = tagged(b'Q', |b| cstr(b, "PREPARE s AS select 1"));
+        twice.extend(tagged(b'Q', |b| cstr(b, "PREPARE s AS select 2")));
+        let mut out = Vec::new();
+        c.advance(&twice, &mut out, &v);
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("PREPARE"), "{text}");
+        assert!(text.contains("42P05"), "a second PREPARE of s: {text}");
     }
 
     #[test]
