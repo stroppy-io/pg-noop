@@ -1,24 +1,5 @@
-//! A load generator that can actually saturate pg-noop.
-//!
-//! # Why this exists
-//!
-//! Measured on a 16-core / 32-thread x86-64 host: driving pg-noop with four stroppy processes
-//! at 256 connections reached 825,238 q/s with **pgnoop at 4% of one core and
-//! the clients at 2259%** -- 22.6 of 32 cores. At that point the number is a
-//! measurement of the load generator, and every further improvement to the
-//! server is invisible. DESIGN-perf-pfn.md makes exactly this point about
-//! knowing the tool's own ceiling; this is that argument turned on the tool.
-//!
-//! # What it measures, and what it does not
-//!
-//! It PIPELINES: each connection keeps `--depth` Bind/Execute/Sync exchanges in
-//! flight rather than waiting for each reply. That is the honest way to ask
-//! "how fast can this server answer", because one-query-per-round-trip measures
-//! LATENCY and the network, not the server. Both are useful and they are not
-//! the same question -- run with `--depth 1` for the round-trip figure.
-//!
-//! It is deliberately dumb: pre-encoded bytes, no SQL, no parsing of replies
-//! beyond counting ReadyForQuery ('Z') bytes, no allocation in the loop.
+//! A load generator that can actually saturate db-noop.
+//! It pipelines pre-encoded messages so the server, not the client, is the limit.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -26,26 +7,21 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Latency samples retained per worker. Unbounded, a 5s run at 3M q/s keeps
-/// 15M samples per worker and the final clone doubles it.
-///
-/// Bounded how matters. The worker used to keep its FIRST `MAX_SAMPLES` and
-/// drop every later one; at the documented throughput that filled within the
-/// first second, so p99 and max described the warm-up and never saw a
-/// steady-state or late-run stall. The reservoir below keeps a uniform sample
-/// of everything the worker saw instead.
+/// Latency samples retained per worker.
+/// Unbounded, a 5s run at 3M q/s keeps 15M samples per worker and the final clone
+/// doubles it.
 const MAX_SAMPLES: usize = 1 << 17;
 
-/// A uniform sample of at most `cap` values from a stream of any length:
-/// Algorithm R. Every value that arrives has the same chance of being in the
-/// reservoir at the end, whether it came first or last.
+/// A uniform sample of at most `cap` values from a stream of any length: Algorithm R.
+/// Every value that arrives has the same chance of being in the reservoir at the end,
+/// whether it came first or last.
 struct Reservoir {
     samples: Vec<u64>,
     /// How many values were offered, which is what the samples stand for.
     seen: u64,
-    /// The largest value offered, kept exactly. P100 of the sample is only
-    /// the largest value the reservoir happened to keep, and a late isolated
-    /// stall is exactly the value it is likeliest to drop.
+    /// The largest value offered, kept exactly.
+    /// P100 of the sample is only the largest value the reservoir happened to keep, and
+    /// a late isolated stall is exactly the value it is likeliest to drop.
     max: u64,
     cap: usize,
     rng: u64,
@@ -80,8 +56,8 @@ impl Reservoir {
         }
     }
 
-    /// xorshift64*: enough randomness to pick a slot, no dependency, no
-    /// allocation, and nothing in the loop that could stall a worker.
+    /// xorshift64*: enough randomness to pick a slot, no dependency, no allocation, and
+    /// nothing in the loop that could stall a worker.
     fn next(&mut self) -> u64 {
         let mut x = self.rng;
         x ^= x >> 12;
@@ -96,21 +72,19 @@ impl Reservoir {
     }
 }
 
-/// What one worker hands back: its reservoir, how many batches it stands
-/// for, and the exact maximum among them.
+/// What one worker hands back: its reservoir, how many batches it stands for, and the
+/// exact maximum among them.
 type WorkerSamples = (Vec<u64>, u64, u64);
 
-/// Percentiles over every worker's reservoir, weighted by what each worker
-/// saw: a sample from a worker that completed a thousand batches stands for
-/// more than one from a worker that completed a hundred, and merging the
-/// reservoirs as equals would let the slow connection's tail dominate.
+/// Percentiles over every worker's reservoir, weighted by what each worker saw: a
+/// sample from a worker that completed a thousand batches stands for more than one from
+/// a worker that completed a hundred, and merging the reservoirs as equals would let
 struct Percentiles {
     /// (value, weight), sorted by value.
     weighted: Vec<(u64, f64)>,
     total: f64,
     seen: u64,
-    /// The exact maximum across workers: a maximum of maxima, not a
-    /// weighted anything.
+    /// The exact maximum across workers: a maximum of maxima, not a weighted anything.
     max: u64,
 }
 
@@ -193,15 +167,14 @@ fn arg_str(name: &str, default: &str) -> String {
 }
 
 /// Count ReadyForQuery messages by walking the frame headers.
-///
-/// Scanning for the byte b'Z' counts payload bytes too -- a ParameterStatus
-/// value or a column name containing 'Z' would end a batch early and corrupt
-/// the measurement. `carry` holds a header split across reads.
+/// Scanning for the byte b'Z' counts payload bytes too -- a ParameterStatus value or a
+/// column name containing 'Z' would end a batch early and corrupt the measurement.
 struct Frames {
     carry: Vec<u8>,
     remaining: usize,
-    /// Set when a frame header is not well formed. The stream cannot be trusted
-    /// after that point, so the worker stops rather than measuring garbage.
+    /// Set when a frame header is not well formed.
+    /// The stream cannot be trusted after that point, so the worker stops rather than
+    /// measuring garbage.
     bad: bool,
 }
 
@@ -241,12 +214,7 @@ impl Frames {
             let tag = self.carry[0];
             let len = i32::from_be_bytes(self.carry[1..5].try_into().unwrap());
 
-            // Validate BEFORE updating state. A negative len cast to usize makes
-            // `remaining` enormous and the reader then discards real input and
-            // blocks; a Z frame with len < 4 would also be counted before it was
-            // known to be well formed. This is the same defect that existed in
-            // the server's own framing, written again in the code added to
-            // avoid it.
+            // Validate BEFORE updating state.
             if !(4..=MAX_FRAME).contains(&len) {
                 self.bad = true;
 
@@ -258,6 +226,108 @@ impl Frames {
             }
             self.remaining = (len as usize) - 4;
             self.carry.clear();
+        }
+    }
+}
+
+/// Count the packets that END an answer, through the MySQL framing.
+struct MyAnswers {
+    /// The packet header being read, and how much of it is here.
+    head: [u8; 4],
+    head_len: usize,
+    /// Bytes of the current packet's body still to come, and its length.
+    remaining: usize,
+    len: usize,
+    /// The body's first byte, which is what a terminator is recognised by.
+    first: Option<u8>,
+    /// Answers counted so far, and how many of them have been reported.
+    answers: usize,
+    reported: usize,
+    /// Set when a packet header is not well formed; the stream cannot be trusted after
+    /// that, so the worker stops rather than measuring garbage.
+    bad: bool,
+}
+
+impl MyAnswers {
+    fn new() -> Self {
+        MyAnswers {
+            head: [0; 4],
+            head_len: 0,
+            remaining: 0,
+            len: 0,
+            first: None,
+            answers: 0,
+            reported: 0,
+            bad: false,
+        }
+    }
+
+    fn count(&mut self, buf: &[u8]) -> usize {
+        for &byte in buf {
+            if self.head_len < 4 {
+                self.head[self.head_len] = byte;
+                self.head_len += 1;
+                if self.head_len == 4 {
+                    let len = self.head[0] as usize
+                        | (self.head[1] as usize) << 8
+                        | (self.head[2] as usize) << 16;
+                    if len == 0 || len > MAX_FRAME as usize {
+                        self.bad = true;
+
+                        return self.take();
+                    }
+                    self.len = len;
+                    self.remaining = len;
+                    self.first = None;
+                }
+
+                continue;
+            }
+
+            if self.first.is_none() {
+                self.first = Some(byte);
+            }
+            self.remaining -= 1;
+            if self.remaining == 0 {
+                if let Some(first) = self.first {
+                    if (first == 0x00 || first == 0xfe) && self.len < 9 {
+                        self.answers += 1;
+                    }
+                }
+                self.head_len = 0;
+            }
+        }
+
+        self.take()
+    }
+
+    /// The answers counted since the last call.
+    fn take(&mut self) -> usize {
+        let n = self.answers - self.reported;
+        self.reported = self.answers;
+
+        n
+    }
+}
+
+/// Which protocol's answers are being counted.
+enum Answers {
+    Postgres(Frames),
+    Mysql(MyAnswers),
+}
+
+impl Answers {
+    fn count(&mut self, buf: &[u8]) -> usize {
+        match self {
+            Answers::Postgres(frames) => frames.count_ready(buf),
+            Answers::Mysql(answers) => answers.count(buf),
+        }
+    }
+
+    fn bad(&self) -> bool {
+        match self {
+            Answers::Postgres(frames) => frames.bad,
+            Answers::Mysql(answers) => answers.bad,
         }
     }
 }
@@ -276,10 +346,9 @@ fn msg(out: &mut Vec<u8>, tag: u8, body: impl FnOnce(&mut Vec<u8>)) {
     out[at..at + 4].copy_from_slice(&len.to_be_bytes());
 }
 
-/// Startup, then Parse one statement and keep it for the whole run -- which is
-/// what a real driver does, and what makes the server's per-execute path the
-/// thing under test.
-fn handshake(sock: &mut TcpStream, sql: &str) -> std::io::Result<Frames> {
+/// Startup, then Parse one statement and keep it for the whole run -- which is what a
+/// real driver does, and what makes the server's per-execute path the thing under test.
+fn handshake(sock: &mut TcpStream, sql: &str) -> std::io::Result<Answers> {
     let mut buf = Vec::new();
     let at = buf.len();
     buf.extend_from_slice(&0i32.to_be_bytes());
@@ -300,8 +369,8 @@ fn handshake(sock: &mut TcpStream, sql: &str) -> std::io::Result<Frames> {
     msg(&mut buf, b'S', |_| {});
     sock.write_all(&buf)?;
 
-    // Drain until the second ReadyForQuery (startup's, then Parse's), framed
-    // rather than scanned.
+    // Drain until the second ReadyForQuery (startup's, then Parse's), framed rather
+    // than scanned.
     let mut frames = Frames::new();
     let mut seen = 0;
     let mut chunk = [0u8; 4096];
@@ -319,8 +388,8 @@ fn handshake(sock: &mut TcpStream, sql: &str) -> std::io::Result<Frames> {
         }
     }
 
-    // Returning Ok here would let a worker treat a truncated handshake as
-    // success and count a connection that never became usable.
+    // Returning Ok here would let a worker treat a truncated handshake as success and
+    // count a connection that never became usable.
     if seen < 2 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -328,7 +397,73 @@ fn handshake(sock: &mut TcpStream, sql: &str) -> std::io::Result<Frames> {
         ));
     }
 
-    Ok(frames)
+    Ok(Answers::Postgres(frames))
+}
+
+/// A MySQL command packet: `[len:3][seq:0][command][body]`.
+fn my_packet(out: &mut Vec<u8>, command: u8, body: &[u8]) {
+    let len = 1 + body.len();
+    out.push((len & 0xff) as u8);
+    out.push(((len >> 8) & 0xff) as u8);
+    out.push(((len >> 16) & 0xff) as u8);
+    out.push(0); // every command starts a sequence of its own
+    out.push(command);
+    out.extend_from_slice(body);
+}
+
+/// The MySQL greeting, and the OK packet that answers the handshake.
+fn my_handshake(sock: &mut TcpStream) -> std::io::Result<Answers> {
+    let mut head = [0u8; 4];
+    sock.read_exact(&mut head)?;
+    let len = head[0] as usize | (head[1] as usize) << 8 | (head[2] as usize) << 16;
+    let mut greeting = vec![0u8; len];
+    sock.read_exact(&mut greeting)?;
+
+    // Capabilities: protocol 4.1, secure connection, plugin auth, multi-results,
+    // deprecate EOF -- what a client sends that wants the modern framing.
+    const CAPS: u32 = 0x0000_0001
+        | 0x0000_0004
+        | 0x0000_0008
+        | 0x0000_0200
+        | 0x0000_2000
+        | 0x0000_8000
+        | 0x0001_0000
+        | 0x0002_0000
+        | 0x0004_0000
+        | 0x0008_0000
+        | 0x0100_0000;
+    let mut body = Vec::new();
+    body.extend_from_slice(&CAPS.to_le_bytes());
+    body.extend_from_slice(&16_777_216u32.to_le_bytes());
+    body.push(45);
+    body.extend_from_slice(&[0u8; 23]);
+    cstr(&mut body, "bench");
+    body.push(20);
+    body.extend_from_slice(&[0x41; 20]);
+    cstr(&mut body, "tpcc");
+    cstr(&mut body, "mysql_native_password");
+    let mut login = Vec::new();
+    let len = body.len();
+    login.push((len & 0xff) as u8);
+    login.push(((len >> 8) & 0xff) as u8);
+    login.push(((len >> 16) & 0xff) as u8);
+    login.push(1); // the handshake response follows the greeting
+    login.extend_from_slice(&body);
+    sock.write_all(&login)?;
+
+    let mut head = [0u8; 4];
+    sock.read_exact(&mut head)?;
+    let len = head[0] as usize | (head[1] as usize) << 8 | (head[2] as usize) << 16;
+    let mut ok = vec![0u8; len];
+    sock.read_exact(&mut ok)?;
+    if ok.first() != Some(&0x00) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the server did not accept the handshake",
+        ));
+    }
+
+    Ok(Answers::Mysql(MyAnswers::new()))
 }
 
 fn main() {
@@ -337,9 +472,20 @@ fn main() {
     let depth = arg("--depth", 32);
     let secs = arg("--secs", 8) as u64;
     let sql = arg_str("--sql", "select 1");
+    let proto = arg_str("--proto", "postgres");
+    let mysql = match proto.as_str() {
+        "postgres" | "pg" => false,
+        "mysql" | "mariadb" => true,
+        // A protocol this tool cannot speak is named, not guessed: measuring one
+        // protocol while the operator asked for another is a number nobody can use.
+        other => {
+            eprintln!("saturate: unknown --proto {other:?}; expected `postgres` or `mysql`");
+            std::process::exit(2);
+        }
+    };
 
-    // depth 0 leaves `batch` empty and makes `got < depth` false at once, so the
-    // worker spins pushing latency samples until memory runs out.
+    // depth 0 leaves `batch` empty and makes `got < depth` false at once, so the worker
+    // spins pushing latency samples until memory runs out.
     if depth == 0 {
         eprintln!("saturate: --depth must be >= 1");
         std::process::exit(2);
@@ -348,6 +494,11 @@ fn main() {
     // One pipelined batch, encoded once and reused forever.
     let mut batch = Vec::new();
     for _ in 0..depth {
+        if mysql {
+            my_packet(&mut batch, 0x03, sql.as_bytes());
+
+            continue;
+        }
         msg(&mut batch, b'B', |b| {
             cstr(b, "");
             cstr(b, "s1");
@@ -365,21 +516,17 @@ fn main() {
 
     let done = Arc::new(AtomicBool::new(false));
     let total = Arc::new(AtomicU64::new(0));
-    // Workers that finish their handshake early would otherwise run before the
-    // clock starts: their queries land in the numerator while part of their
-    // execution is outside the denominator.
+    // Workers that finish their handshake early would otherwise run before the clock
+    // starts: their queries land in the numerator while part of their execution is
+    // outside the denominator.
     let ready_workers = Arc::new(AtomicUsize::new(0));
-    // Separate from ready_workers: a failed worker still has to arrive at the
-    // barrier, but it must not be reported as a connection that generated load.
+    // Separate from ready_workers: a failed worker still has to arrive at the barrier,
+    // but it must not be reported as a connection that generated load.
     let live_workers = Arc::new(AtomicUsize::new(0));
     let go = Arc::new(AtomicBool::new(false));
-    // Per-batch round-trip times, nanoseconds. At --depth 1 a batch IS a query,
-    // so these are query latencies; above that they are the time to answer a
-    // pipelined batch and the label says so.
-    //
-    // Why this is measured at all: throughput medians hide the tail, and the
-    // tail is where a scheduler shows itself. Two backends can agree on median
-    // q/s and disagree completely about p99.
+    // Per-batch round-trip times, nanoseconds.
+    // At --depth 1 a batch IS a query, so these are query latencies; above that they
+    // are the time to answer a pipelined batch and the label says so.
     let lat: Arc<Mutex<Vec<WorkerSamples>>> = Arc::new(Mutex::new(Vec::new()));
     let mut threads = Vec::new();
 
@@ -397,31 +544,25 @@ fn main() {
                 return;
             };
             let _ = sock.set_nodelay(true);
-            let Ok(mut frames) = handshake(&mut sock, &sql) else {
+            let handshake = if mysql {
+                my_handshake(&mut sock)
+            } else {
+                handshake(&mut sock, &sql)
+            };
+            let Ok(mut frames) = handshake else {
                 ready_workers.fetch_add(1, Ordering::Relaxed);
                 return;
             };
 
-            // **Finite deadlines for the measurement phase.**
-            //
-            // `write_all` and `read` are blocking, and `done` is only checked
-            // BETWEEN batches. A server that stalls mid-batch parks the worker
-            // inside a syscall where no flag can reach it, `join` never returns,
-            // and the harness hangs rather than reporting a bad run. Found in
-            // review.
-            //
-            // Derived from the run rather than picked: a batch that has not been
-            // answered in the time the whole run was meant to take is not slow,
-            // it is a stall, and the `Err(_) => break 'work` arm already keeps
-            // whatever the worker completed before it. The `.max(5)` is for very
-            // short runs, where a per-batch bound below a few seconds would start
-            // reporting scheduler noise as a failure.
+            // Finite deadlines for the measurement phase.
+            // `write_all` and `read` are blocking, and `done` is only checked BETWEEN
+            // batches.
             let stall = Duration::from_secs(secs.max(5));
             if sock.set_read_timeout(Some(stall)).is_err()
                 || sock.set_write_timeout(Some(stall)).is_err()
             {
-                // A worker that cannot be bounded is not one to run: it is the
-                // exact thread that would hang the join.
+                // A worker that cannot be bounded is not one to run: it is the exact
+                // thread that would hang the join.
                 ready_workers.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -445,13 +586,13 @@ fn main() {
                 let mut got = 0usize;
                 while got < depth {
                     match sock.read(&mut chunk) {
-                        // `break` and not `return`: a connection that dies
-                        // mid-run has still completed everything before this
-                        // batch, and discarding it biases the result low.
+                        // `break` and not `return`: a connection that dies mid-run has
+                        // still completed everything before this batch, and discarding
+                        // it biases the result low.
                         Ok(0) | Err(_) => break 'work,
                         Ok(n) => {
-                            got += frames.count_ready(&chunk[..n]);
-                            if frames.bad {
+                            got += frames.count(&chunk[..n]);
+                            if frames.bad() {
                                 break 'work;
                             }
                         }
@@ -468,8 +609,8 @@ fn main() {
         }));
     }
 
-    // A peer can accept a connection and never finish the handshake, which
-    // would hold this loop forever.
+    // A peer can accept a connection and never finish the handshake, which would hold
+    // this loop forever.
     let setup_deadline = Instant::now() + Duration::from_secs(30);
     while ready_workers.load(Ordering::Relaxed) < conns {
         if Instant::now() > setup_deadline {
@@ -489,11 +630,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    // The clock starts BEFORE the release, not after. Reversed, a worker can
-    // complete batches between `go.store` and `Instant::now()`: those queries
-    // land in the numerator while their time is outside the denominator, and
-    // q/s is overstated. This ordering errs the other way -- the window
-    // strictly contains every worker's execution.
+    // The clock starts BEFORE the release, not after.
     let start = Instant::now();
     go.store(true, Ordering::Release);
 
@@ -512,9 +649,9 @@ fn main() {
     let percentiles = Percentiles::from_workers(workers);
     let pct = |p: f64| -> f64 { percentiles.at(p) as f64 / 1e6 };
 
-    // `n` is how many samples the percentiles were computed from and `of` how
-    // many batches they stand for; when the two differ, the samples are a
-    // uniform draw across the whole run, not its first seconds.
+    // `n` is how many samples the percentiles were computed from and `of` how many
+    // batches they stand for; when the two differ, the samples are a uniform draw
+    // across the whole run, not its first seconds.
     let unit = if depth == 1 { "query" } else { "batch" };
     println!(
         "{} conns, depth {}, {:.1}s: {} queries, {:.0} q/s | {} ms p50 {:.3} p90 {:.3} p99 {:.3} p999 {:.3} max {:.3} (n={} of {})",
@@ -549,12 +686,9 @@ mod tests {
         assert_eq!(r.seen, 5);
     }
 
-    /// **The samples describe the whole run, not its first seconds.** The
-    /// worker used to record its first MAX_SAMPLES latencies and drop every
-    /// later one, so at documented throughput p99 and max were a property of
-    /// the warm-up. A reservoir draws uniformly from everything it saw: the
-    /// cap holds, `seen` is the true count, and the late part of the stream
-    /// is represented in proportion.
+    /// The samples describe the whole run, not its first seconds.
+    /// A reservoir draws uniformly from everything it saw: the cap holds, `seen` is the
+    /// true count, and the late part of the stream is represented in proportion.
     #[test]
     fn a_reservoir_over_its_cap_represents_the_late_stream() {
         const CAP: usize = 1000;
@@ -567,8 +701,8 @@ mod tests {
         assert_eq!(r.samples.len(), CAP);
         assert_eq!(r.seen, N);
 
-        // The last tenth of the stream should hold about a tenth of the
-        // samples. A prefix sampler holds none of it.
+        // The last tenth of the stream should hold about a tenth of the samples.
+        // A prefix sampler holds none of it.
         let late = r.samples.iter().filter(|&&v| v >= N * 9 / 10).count();
         assert!(
             (50..=150).contains(&late),
@@ -584,10 +718,8 @@ mod tests {
         );
     }
 
-    /// Two workers' reservoirs are merged by weight: a worker that saw ten
-    /// times the samples contributes ten times the mass, whatever the two
-    /// reservoirs' lengths. Otherwise a slow connection's samples would
-    /// count as much as a fast one's and the percentiles would drift high.
+    /// Two workers' reservoirs are merged by weight: a worker that saw ten times the
+    /// samples contributes ten times the mass, whatever the two reservoirs' lengths.
     #[test]
     fn percentiles_weight_each_worker_by_what_it_saw() {
         let fast = (vec![1u64; 10], 1000u64, 1u64);
@@ -602,12 +734,7 @@ mod tests {
         assert_eq!(p.at(1.0), 100);
     }
 
-    /// **The maximum is a scalar, not a percentile of a sample.** `pct(1.0)`
-    /// was printed as `max`, but P100 of a reservoir is the largest value the
-    /// reservoir happened to keep: in this very stream the sampled maximum
-    /// was 199944 while the true one, 199999, was not retained. A late
-    /// isolated stall can vanish that way while the output claims an exact
-    /// maximum. The reservoir tracks the exact maximum separately.
+    /// The maximum is a scalar, not a percentile of a sample.
     #[test]
     fn the_maximum_is_exact_whatever_the_reservoir_kept() {
         let mut r = Reservoir::new(1000, 7);

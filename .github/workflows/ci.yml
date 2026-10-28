@@ -25,6 +25,130 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
 
+  clients:
+    name: Real clients (mariadb, psql)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release --bin dbnoop
+
+      # **The official clients, not a test harness.** db-noop exists to make
+      # real clients fast to measure; the one thing a hand-written test client
+      # cannot tell you is whether a real one accepts the greeting, the
+      # prepared-statement stream and the result sets.
+      #
+      # The images are used for their client binaries only -- nothing connects
+      # to the MariaDB or PostgreSQL in them.
+      - name: Which clients
+        run: |
+          set -euo pipefail
+          if docker info >/dev/null 2>&1; then
+            echo "MYSQL_CLIENT=docker run --rm --network host mariadb:11.8.9 mariadb" >> "$GITHUB_ENV"
+            echo "PG_CLIENT=docker run --rm --network host postgres:17 psql" >> "$GITHUB_ENV"
+          else
+            # `act` without the docker socket, and any runner without docker.
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends mariadb-client postgresql-client
+            echo "MYSQL_CLIENT=mariadb" >> "$GITHUB_ENV"
+            echo "PG_CLIENT=psql" >> "$GITHUB_ENV"
+          fi
+
+      - name: Start the server
+        run: |
+          set -euo pipefail
+          ./target/release/dbnoop --host 127.0.0.1 --port 15432 --mysql-port 13306 \
+            --workers 2 --warehouses 10 --profile tpcc >server.log 2>&1 &
+          echo $! > server.pid
+          for _ in {1..200}; do
+            # PostgreSQL says nothing until spoken to; MySQL greets first, so the
+            # greeting is what proves the listener is up.
+            if python3 -c 'import socket; s=socket.create_connection(("127.0.0.1",13306),1); g=s.recv(64); s.close(); assert g[4]==10' 2>/dev/null; then
+              echo "both listeners are up"
+              cat server.log
+              exit 0
+            fi
+            sleep 0.05
+          done
+          cat server.log
+          exit 1
+
+      - name: MySQL - select 1, NOPM, transaction, status
+        run: |
+          set -euo pipefail
+          # **The district sum is a DELTA, not a figure.** The counters are the
+          # server's, shared by both protocols and every connection: a NewOrder on
+          # one port moves the sum the other port reads, and the CI steps run one
+          # after another. What a TPC-C client reports is the difference across
+          # its own window, so that is what is checked here.
+          nopm() { $MYSQL_CLIENT -h 127.0.0.1 -P 13306 -u root -N -e "select sum(d_next_o_id) from district"; }
+
+          out=$($MYSQL_CLIENT -h 127.0.0.1 -P 13306 -u root -e "select 1")
+          echo "$out"
+          echo "$out" | grep -Eq '(^|[^0-9])1([^0-9]|$)'
+
+          before=$(nopm)
+          echo "district sum before: $before"
+
+          # One NewOrder: a CALL (its own transaction), then the COMMIT a TPM
+          # check counts.
+          $MYSQL_CLIENT -h 127.0.0.1 -P 13306 -u root -e "call NEWORD(1,2,3,4); commit"
+
+          after=$(nopm)
+          echo "district sum after: $after"
+          [ "$after" -eq "$((before + 1))" ] || {
+            echo "one NewOrder must move the district sum by one: $before -> $after"
+            exit 1
+          }
+
+          out=$($MYSQL_CLIENT -h 127.0.0.1 -P 13306 -u root -e "show global status like 'Com_commit'")
+          echo "$out"
+          echo "$out" | grep -Eq 'Com_commit[[:space:]]+[1-9]'
+
+          # A transaction's status flags are the client's to read, and the CALL
+          # inside it does not commit on its own.
+          $MYSQL_CLIENT -h 127.0.0.1 -P 13306 -u root -e "begin; select 1; commit"
+
+      - name: PostgreSQL - select 1, NOPM, transaction
+        run: |
+          set -euo pipefail
+          # The same delta rule as the MySQL step: the counter is the server's and
+          # the step before this one has already counted a NewOrder.
+          nopm() { $PG_CLIENT -h 127.0.0.1 -p 15432 -U any -d any -Atc "select sum(d_next_o_id) from district"; }
+
+          out=$($PG_CLIENT -h 127.0.0.1 -p 15432 -U any -d any -Atc "select 1")
+          echo "$out"
+          echo "$out" | grep -Eq '^1$'
+
+          before=$(nopm)
+          echo "district sum before: $before"
+
+          # A plain-SQL NewOrder on the PostgreSQL side: the INSERT into
+          # new_order is the one table only that transaction writes.
+          $PG_CLIENT -h 127.0.0.1 -p 15432 -U any -d any -c \
+            "insert into new_order values (1, 1, 3001)" >/dev/null
+
+          after=$(nopm)
+          echo "district sum after: $after"
+          [ "$after" -eq "$((before + 1))" ] || {
+            echo "one NewOrder must move the district sum by one: $before -> $after"
+            exit 1
+          }
+
+          $PG_CLIENT -h 127.0.0.1 -p 15432 -U any -d any -c "begin; select 1; commit" >/dev/null
+          out=$($PG_CLIENT -h 127.0.0.1 -p 15432 -U any -d any -Atc "show global status like 'Com_commit'")
+          echo "$out"
+          echo "$out" | grep -q Com_commit
+
+      - name: Stop the server
+        if: always()
+        run: |
+          [ -f server.pid ] && kill "$(cat server.pid)" 2>/dev/null || true
+          cat server.log || true
+
   build:
     name: Build (${{ matrix.os }})
     strategy:
@@ -51,12 +175,12 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked --release --bin pgnoop
+      - run: cargo build --locked --release --bin dbnoop --bin pgnoop
       - name: Start and connect
         shell: bash
         run: |
           set -euo pipefail
-          ./target/release/pgnoop --host 127.0.0.1 --port 15432 --workers 1 >server.log 2>&1 &
+          ./target/release/dbnoop --host 127.0.0.1 --port 15432 --mysql-port 15433 --workers 1 >server.log 2>&1 &
           server_pid=$!
           trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
 
@@ -65,11 +189,29 @@ jobs:
               cat server.log
               exit 1
             fi
-            if python3 -c 'import socket; socket.create_connection(("127.0.0.1", 15432), 1).close()'; then
+            if python3 -c 'import socket; socket.create_connection(("127.0.0.1", 15432), 1).close()' 2>/dev/null; then
+              # PostgreSQL says nothing until it is spoken to; MySQL greets first,
+              # so the greeting is what proves the second listener is up.
+              python3 -c 'import socket; s = socket.create_connection(("127.0.0.1", 15433), 1); g = s.recv(64); s.close(); assert g and g[4] == 10, "no HandshakeV10 from the MySQL listener"'
               exit 0
             fi
             sleep 0.05
           done
 
           cat server.log
+          exit 1
+      - name: The old binary name still serves
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/pgnoop --host 127.0.0.1 --port 15434 --workers 1 >pgnoop.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+          for _ in {1..100}; do
+            if python3 -c 'import socket; socket.create_connection(("127.0.0.1", 15434), 1).close()' 2>/dev/null; then
+              exit 0
+            fi
+            sleep 0.05
+          done
+          cat pgnoop.log
           exit 1

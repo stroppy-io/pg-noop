@@ -1,0 +1,967 @@
+//! db-noop: a no-op database server for benchmark clients.
+//! It answers the PostgreSQL and MySQL wire protocols with valid, empty
+//! responses, so a benchmark measures the client and not the database.
+
+pub(crate) mod catalog;
+pub(crate) mod config;
+pub(crate) mod mysql;
+pub(crate) mod plan;
+pub(crate) mod protocol;
+pub(crate) mod sql;
+pub(crate) mod tpcc;
+#[cfg(target_os = "linux")]
+pub(crate) mod uring;
+pub(crate) mod wire;
+
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+use std::net::SocketAddr;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+use config::{Config, Io};
+use protocol::{Codec, Protocol, Report};
+
+/// Pin the calling thread to one CPU, so a shard stays where its data is.
+/// Best effort: a failure here costs locality, not correctness, and a container with a
+/// restricted cpuset is a normal reason to fail.
+#[cfg(target_os = "linux")]
+fn pin_to_cpu(cpu: usize) -> bool {
+    // SAFETY: cpu_set_t is a plain bitmask; we zero it, set one bit within range, and
+    // hand it to sched_setaffinity with its own size.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
+    }
+}
+
+/// Resolve `host:port` into the socket addresses it names, in order.
+/// Names, not just literals.
+fn resolve_bind_addrs(host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+    use std::net::ToSocketAddrs;
+
+    let addrs: Vec<SocketAddr> = (host, port).to_socket_addrs()?.collect();
+
+    if addrs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{host}:{port} resolved to no addresses"),
+        ));
+    }
+
+    Ok(addrs)
+}
+
+/// One listener per shard, on the first candidate address where every shard can have
+/// one.
+/// Bound here, before any shard exists, for two reasons.
+fn bind_shards(
+    candidates: &[SocketAddr],
+    shards: usize,
+    backlog: i32,
+) -> std::io::Result<(SocketAddr, Vec<std::net::TcpListener>)> {
+    let mut last = std::io::Error::new(std::io::ErrorKind::InvalidInput, "no addresses to bind");
+
+    for &candidate in candidates {
+        match bind_shards_to(candidate, shards, backlog) {
+            Ok(bound) => return Ok(bound),
+            Err(e) => last = e,
+        }
+    }
+
+    Err(last)
+}
+
+fn bind_shards_to(
+    candidate: SocketAddr,
+    shards: usize,
+    backlog: i32,
+) -> std::io::Result<(SocketAddr, Vec<std::net::TcpListener>)> {
+    let first = shard_listener(candidate, backlog)?;
+    let addr = first.local_addr()?;
+    let mut listeners = Vec::with_capacity(shards);
+    listeners.push(first);
+
+    for _ in 1..shards {
+        listeners.push(shard_listener(addr, backlog)?);
+    }
+
+    Ok((addr, listeners))
+}
+
+/// The CPUs this process may run on, in order, from its affinity mask.
+#[cfg(target_os = "linux")]
+fn allowed_cpus() -> Vec<usize> {
+    // SAFETY: cpu_set_t is a plain bitmask that the kernel fills; it is zeroed first
+    // and read only through CPU_ISSET within its own size.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return Vec::new();
+        }
+
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
+            .collect()
+    }
+}
+
+/// No mask to read, so nothing to pin to: the scheduler places the shards.
+#[cfg(not(target_os = "linux"))]
+fn allowed_cpus() -> Vec<usize> {
+    Vec::new()
+}
+
+/// The CPU shard `id` is pinned to, or none when the shards outnumber the CPUs -- two
+/// shards pinned to one CPU is worse than two the scheduler may move, so then nothing
+/// is pinned.
+fn cpu_for_shard(allowed: &[usize], id: usize) -> Option<usize> {
+    allowed.get(id).copied()
+}
+
+/// The backend to actually serve with, decided once before any shard starts.
+#[cfg(target_os = "linux")]
+fn resolve_io(requested: Io) -> Io {
+    io_to_serve(requested, crate::uring::probe())
+}
+
+/// The decision itself, separate from the probe so both branches are testable on a box
+/// where the ring works and one where it does not.
+#[cfg(target_os = "linux")]
+fn io_to_serve(requested: Io, probe: std::io::Result<()>) -> Io {
+    match (requested, probe) {
+        (Io::Uring, Ok(())) => Io::Uring,
+        (Io::Uring, Err(e)) => {
+            eprintln!(
+                "dbnoop: io_uring unavailable ({e}); serving with epoll. \
+                 Under Docker this is the default seccomp profile denying \
+                 io_uring_setup; --io epoll makes the choice explicit."
+            );
+            Io::Epoll
+        }
+        (Io::Epoll, _) => Io::Epoll,
+    }
+}
+
+/// One listener per shard on the SAME port, via SO_REUSEPORT.
+/// This is the half that makes share-nothing possible.
+fn shard_listener(addr: SocketAddr, backlog: i32) -> std::io::Result<std::net::TcpListener> {
+    let domain = socket2::Domain::for_address(addr);
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+
+    socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(backlog)?;
+
+    Ok(socket.into())
+}
+
+/// One connection, read-process-write, with ONE write per read batch.
+/// This is the half that sans-io buys.
+async fn serve(mut socket: TcpStream, codec: Codec) {
+    let mut conn = codec.session();
+    let mut pending: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut out: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let mut chunk = vec![0u8; 64 * 1024];
+
+    // MySQL speaks first.
+    // Its client waits for the greeting before writing anything, so a shard that read
+    // first would wait for a client that is waiting for it.
+    if let Some(prelude) = codec.prelude() {
+        if socket.write_all(prelude).await.is_err() {
+            return;
+        }
+    }
+
+    // The deadline is on the *connection*, not on each read: it is the startup
+    // handshake that has to finish, and a client that dribbles its startup packet out
+    // one byte at a time would otherwise extend it indefinitely.
+    let startup_deadline = config::startup_timeout().map(|t| tokio::time::Instant::now() + t);
+
+    loop {
+        // A client that has not completed startup may legitimately have sent nothing
+        // yet, and `read` would wait for it forever: the socket is open, the shard has
+        // a slot, and neither is ever given back.
+        let n = if conn.awaiting_startup() {
+            match startup_deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline, socket.read(&mut chunk))
+                    .await
+                {
+                    Ok(Ok(n)) if n > 0 => n,
+                    // Closed or failed: both end the connection, and the error is
+                    // worth a line -- a dropped connection a run cannot explain is a
+                    // measurement it cannot trust.
+                    Ok(Ok(_)) => return,
+                    Ok(Err(e)) => {
+                        if !a_connection_ending(&e) {
+                            eprintln!("dbnoop: read failed during startup: {e}");
+                        }
+
+                        return;
+                    }
+                    Err(_elapsed) => {
+                        eprintln!("dbnoop: connection did not complete startup in time; closing");
+                        return;
+                    }
+                },
+                None => match socket.read(&mut chunk).await {
+                    Ok(0) => return,
+                    Ok(n) => n,
+                    Err(e) => {
+                        if !a_connection_ending(&e) {
+                            eprintln!("dbnoop: read failed: {e}");
+                        }
+
+                        return;
+                    }
+                },
+            }
+        } else {
+            match socket.read(&mut chunk).await {
+                Ok(0) => return,
+                Ok(n) => n,
+                Err(e) => {
+                    if !a_connection_ending(&e) {
+                        eprintln!("dbnoop: read failed: {e}");
+                    }
+
+                    return;
+                }
+            }
+        };
+
+        out.clear();
+        protocol::feed(&codec, &mut conn, &mut pending, &chunk[..n], &mut out);
+
+        if !out.is_empty() && socket.write_all(&out).await.is_err() {
+            return;
+        }
+
+        if conn.is_closed() {
+            return;
+        }
+    }
+}
+
+/// What one shard is asked to serve, and how.
+struct ShardSpec {
+    protocol: Protocol,
+    /// Where to pin, if anywhere.
+    cpu: Option<usize>,
+    /// The backend it was *planned* for: a shard planned for the ring that cannot have
+    /// one serves on epoll and says so, rather than ending and leaving its port with
+    /// one listener fewer.
+    backend: Io,
+    /// Provided buffers for its ring, from the process's ring plan.
+    buffers: u16,
+    codec: Codec,
+}
+
+/// One shard: a pinned thread, its own single-threaded reactor, its own listener, and
+/// every connection it accepts served to completion on it.
+fn run_shard(
+    id: usize,
+    listener: std::net::TcpListener,
+    report: std::sync::mpsc::Sender<Report>,
+    spec: ShardSpec,
+) -> bool {
+    let ShardSpec {
+        protocol,
+        cpu,
+        backend,
+        buffers,
+        codec,
+    } = spec;
+    let did_pin = match cpu {
+        #[cfg(target_os = "linux")]
+        Some(cpu) => {
+            let ok = pin_to_cpu(cpu);
+            if !ok {
+                eprintln!("dbnoop: shard {id} could not pin to cpu {cpu}; continuing unpinned");
+            }
+            ok
+        }
+        #[cfg(not(target_os = "linux"))]
+        Some(_) => false,
+        None => false,
+    };
+    let _ = report.send(Report::Pinned {
+        protocol,
+        pinned: did_pin,
+    });
+
+    // io_uring needs no runtime at all: the codec is sans-io, so a shard is a loop that
+    // submits reads, runs the codec, and submits writes.
+    // epoll keeps tokio because that is what tokio is for.
+    #[cfg(target_os = "linux")]
+    if backend == Io::Uring {
+        match crate::uring::try_run(listener, codec.clone(), 4096, buffers, Some(report.clone())) {
+            Ok(crate::uring::Attempt::Served) => return true,
+            Ok(crate::uring::Attempt::NoRing(listener)) => {
+                // The listener comes back, and this shard serves it on epoll.
+                return serve_epoll(id, listener, report, protocol, codec);
+            }
+            Err(e) => {
+                eprintln!("dbnoop: shard {id} io_uring loop ended: {e}");
+
+                return false;
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = backend;
+
+    serve_epoll(id, listener, report, protocol, codec)
+}
+
+/// Serve one shard's listener on epoll, through a single-threaded tokio runtime.
+fn serve_epoll(
+    id: usize,
+    listener: std::net::TcpListener,
+    report: std::sync::mpsc::Sender<Report>,
+    protocol: Protocol,
+    codec: Codec,
+) -> bool {
+    // Said before the loop, and the loop never returns in normal use: a shard is
+    // serving when it says so, and the banner counts it from here.
+    let _ = report.send(Report::Serving {
+        protocol,
+        backend: Io::Epoll,
+    });
+
+    // current_thread, not multi_thread: a shard IS one thread.
+    // There is no work stealing because there is nothing to steal from -- which is the
+    // entire point.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("shard runtime");
+
+    rt.block_on(async move {
+        let listener = TcpListener::from_std(listener).expect("listener into tokio");
+
+        loop {
+            match listener.accept().await {
+                Ok((socket, _)) => {
+                    // Nagle off: these replies are tens of bytes and a benchmark
+                    // measures their latency.
+                    let _ = socket.set_nodelay(true);
+
+                    let codec = codec.clone();
+                    // spawn, not spawn_blocking: stays on THIS runtime, hence this
+                    // thread, hence this core.
+                    tokio::spawn(async move {
+                        serve(socket, codec).await;
+                    });
+                }
+                Err(e) => {
+                    // A transient fd shortage must not stop the shard.
+                    let err = e.raw_os_error().unwrap_or(0);
+
+                    if matches!(
+                        err,
+                        libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOBUFS
+                    ) {
+                        eprintln!(
+                            "dbnoop: shard {id} accept failed: {e}; \
+                             not accepting for {}ms (open connections continue)",
+                            config::ACCEPT_BACKOFF.as_millis()
+                        );
+                        tokio::time::sleep(config::ACCEPT_BACKOFF).await;
+
+                        continue;
+                    }
+
+                    eprintln!("dbnoop: shard {id} accept failed: {e}");
+                    return false;
+                }
+            }
+        }
+    })
+}
+
+/// Whether a read error is the client going away, which is how a run ends.
+///
+/// A reset or a broken pipe at the end of a measurement is not a fault, and a log
+/// full of them hides the errors that are.
+fn a_connection_ending(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// Join one shard and say how it ended: a panic is not a shard that stopped, and
+/// the process exits nonzero because of it.
+fn join_shard(name: String, handle: std::thread::JoinHandle<bool>) -> ShardEnd {
+    match handle.join() {
+        Ok(true) => ShardEnd::Served,
+        Ok(false) => ShardEnd::Stopped,
+        Err(_) => {
+            eprintln!("dbnoop: shard {name} panicked");
+
+            ShardEnd::Panicked
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ShardEnd {
+    Served,
+    /// Ended without serving: its listener failed, or it never started.
+    Stopped,
+    Panicked,
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::a_connection_ending;
+
+    /// **A client going away is not an error to log**: a run ends with resets, and a
+    /// log full of them hides the ones that matter.
+    #[test]
+    fn a_connection_ending_is_not_news() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(a_connection_ending(&std::io::Error::from(kind)), "{kind:?}");
+        }
+        for kind in [
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            assert!(
+                !a_connection_ending(&std::io::Error::from(kind)),
+                "{kind:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::{join_shard, ShardEnd};
+
+    /// **A panicked shard is not a shard that stopped.** Folding the panic into
+    /// `false` let a process with live shards exit 0 and say nothing.
+    #[test]
+    fn a_panicked_shard_is_reported_and_counted() {
+        let panicked = std::thread::spawn(|| -> bool { panic!("a shard panicked") });
+
+        assert_eq!(
+            join_shard("shard 7".to_string(), panicked),
+            ShardEnd::Panicked
+        );
+        assert_eq!(
+            join_shard("shard 8".to_string(), std::thread::spawn(|| true)),
+            ShardEnd::Served
+        );
+        assert_eq!(
+            join_shard("shard 9".to_string(), std::thread::spawn(|| false)),
+            ShardEnd::Stopped
+        );
+    }
+}
+
+/// What the banner says about one protocol: the shards that reported themselves
+/// serving, the ones on the ring, and the ones that pinned.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+struct Banner {
+    serving: usize,
+    ring: usize,
+    pinned: usize,
+}
+
+impl Banner {
+    fn of(protocol: Protocol, reports: &[Report]) -> Self {
+        let mut banner = Banner::default();
+
+        for report in reports {
+            match report {
+                Report::Pinned {
+                    protocol: p,
+                    pinned: true,
+                } if *p == protocol => banner.pinned += 1,
+                Report::Serving {
+                    protocol: p,
+                    backend,
+                } if *p == protocol => {
+                    banner.serving += 1;
+                    if *backend == Io::Uring {
+                        banner.ring += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        banner
+    }
+}
+
+/// The TPCC counters, on stderr every `interval` and once when the server stops.
+fn spawn_stats(interval: std::time::Duration) {
+    std::thread::Builder::new()
+        .name("dbnoop-stats".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(interval);
+            eprintln!("{}", crate::tpcc::line());
+        })
+        .expect("spawn the stats thread");
+}
+
+/// Serve until the process is stopped.
+/// What both binary names run: `dbnoop` is the name, and `pgnoop` is the same program
+/// under the name the scripts written for the PostgreSQL-only server already use.
+pub fn run() {
+    let config = Config::load();
+    crate::tpcc::set_warehouses(config.warehouses);
+    crate::tpcc::set_profile(config.tpcc_profile);
+    if config.stats_every > 0 {
+        spawn_stats(std::time::Duration::from_secs(config.stats_every));
+    }
+
+    // Before any shard exists: the ring is either usable in this process or it is not,
+    // and the answer does not change per shard.
+    #[cfg(target_os = "linux")]
+    let io = resolve_io(config.io);
+    #[cfg(not(target_os = "linux"))]
+    let io = config.io;
+
+    let shards = if config.workers == 0 {
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    } else {
+        config.workers
+    };
+
+    // One worker set per listener.
+    let mut sockets = vec![(Protocol::Postgres, config.port)];
+    if let Some(port) = config.mysql_port {
+        sockets.push((Protocol::Mysql, port));
+    }
+    let allowed = allowed_cpus();
+    let total = shards * sockets.len();
+    let cpus: Vec<Option<usize>> = if total <= allowed.len() {
+        (0..total).map(|id| cpu_for_shard(&allowed, id)).collect()
+    } else {
+        vec![None; total]
+    };
+
+    // How much ring this process may have, decided before any shard runs.
+    let plan = config::ring_plan(
+        total,
+        config::memlock_bytes(),
+        config::pbuf_override().unwrap_or(config::MAX_BUFFERS),
+    );
+    let uring_budget = if io == Io::Uring {
+        plan.uring_shards
+    } else {
+        0
+    };
+
+    // Resolve, then bind every shard's listener, before any shard runs: a name's
+    // addresses are tried in order until one takes all of them, and a failure is a
+    // startup error rather than a thread that quietly exits.
+    let (report_tx, report_rx) = std::sync::mpsc::channel();
+    let mut threads = Vec::with_capacity(total);
+    let mut banners = Vec::with_capacity(sockets.len());
+    let mut next_cpu = 0usize;
+    // The ring budget is split between the protocols rather than spent on the one that
+    // happens to be spawned first: half a server on the ring and half on epoll is worse
+    // than every shard on the same backend.
+    let protocols = sockets.len();
+    let mut ring_shares = (0..protocols)
+        .map(|k| uring_budget / protocols + usize::from(k < uring_budget % protocols));
+
+    for (protocol, port) in sockets {
+        let candidates = match resolve_bind_addrs(&config.host, port) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("dbnoop: cannot bind {}:{port}: {e}", config.host);
+                std::process::exit(2);
+            }
+        };
+        let (addr, listeners) = match bind_shards(&candidates, shards, 1024) {
+            Ok(bound) => bound,
+            Err(e) => {
+                eprintln!("dbnoop: cannot bind {}:{port}: {e}", config.host);
+                std::process::exit(2);
+            }
+        };
+        banners.push((protocol, addr));
+
+        // This protocol's share of the ring budget, and no more.
+        let mut rings_left = ring_shares.next().unwrap_or(0);
+
+        for (id, listener) in listeners.into_iter().enumerate() {
+            // One codec per listener, cloned into its shards: the PostgreSQL catalog is
+            // shared by them all, and the MySQL codec holds nothing to share.
+            let codec = Codec::new(protocol);
+            let cpu = cpus[next_cpu];
+            next_cpu += 1;
+            let report = report_tx.clone();
+            let backend = if rings_left > 0 {
+                rings_left -= 1;
+
+                Io::Uring
+            } else {
+                Io::Epoll
+            };
+            let spec = ShardSpec {
+                protocol,
+                cpu,
+                backend,
+                buffers: plan.buffers,
+                codec,
+            };
+            threads.push(
+                std::thread::Builder::new()
+                    .name(format!("dbnoop-{}-{id}", protocol.name()))
+                    .spawn(move || run_shard(id, listener, report, spec))
+                    .expect("spawn shard"),
+            );
+        }
+    }
+    drop(report_tx);
+
+    // Every shard reports before it serves, so the banner states what is true: how many
+    // shards are serving, on which backend, and how many are pinned.
+    let mut reports: Vec<Report> = Vec::with_capacity(total * 2);
+    for _ in 0..total * 2 {
+        match report_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(report) => reports.push(report),
+            Err(_) => break,
+        }
+    }
+
+    for (protocol, addr) in &banners {
+        let counts = Banner::of(*protocol, &reports);
+
+        eprintln!(
+            "dbnoop {} listening on {addr} ({shards} shards, SO_REUSEPORT, \
+             serving {}/{shards} (io_uring {}, epoll {}), pinned={}/{shards})",
+            protocol.name(),
+            counts.serving,
+            counts.ring,
+            counts.serving - counts.ring,
+            counts.pinned,
+        );
+    }
+
+    let serving = reports
+        .iter()
+        .filter(|r| matches!(r, Report::Serving { .. }))
+        .count();
+    if serving < total {
+        eprintln!(
+            "dbnoop: **{} of {total} shards are not serving**; the rest are. A shard \
+             that cannot start leaves its port with fewer listeners, and with none at \
+             all if every shard of a protocol failed.",
+            total - serving
+        );
+    }
+
+    // What the ring actually granted, and how it was paid for.
+    // Reported here as well as at startup because this is the line a run's log keeps,
+    // and a measurement is only reproducible if it says which ring produced it.
+    // What the ring actually granted, and how it was paid for.
+    #[cfg(target_os = "linux")]
+    {
+        let ring: usize = banners
+            .iter()
+            .map(|(protocol, _)| Banner::of(*protocol, &reports).ring)
+            .sum();
+        if ring > 0 {
+            eprintln!(
+                "dbnoop: io_uring {}; {ring} shard(s) on the ring with {} buffer(s) each, \
+                 the rest on epoll",
+                crate::uring::report(),
+                plan.buffers,
+            );
+        }
+    }
+
+    // A server whose every shard failed must not exit 0.
+    // Discarding the join results means a fully dead process reports success to
+    // whatever supervises it.
+    let ends: Vec<ShardEnd> = threads
+        .into_iter()
+        .map(|t| {
+            // The name the thread was spawned with, which is the shard's own.
+            let name = t.thread().name().unwrap_or("a shard").to_string();
+            join_shard(name, t)
+        })
+        .collect();
+    let served = ends.iter().filter(|e| **e == ShardEnd::Served).count();
+    let panicked = ends.iter().filter(|e| **e == ShardEnd::Panicked).count();
+
+    // **A process whose shards are all dead, or any of whose shards panicked, must
+    // not report success** to whatever supervises it.
+    if served == 0 || panicked > 0 {
+        eprintln!("dbnoop: {served} shard(s) served, {panicked} panicked; exiting nonzero");
+        std::process::exit(1);
+    }
+
+    // The last word on what was counted, whichever way the shards ended.
+    eprintln!("{}", crate::tpcc::line());
+}
+
+#[cfg(test)]
+mod banner_tests {
+    use super::{Banner, Io, Protocol, Report};
+
+    /// **The banner counts each protocol's shards by what they reported**, not by
+    /// what was planned: a shard on epoll is not a shard on the ring.
+    #[test]
+    fn the_banner_counts_by_report() {
+        let reports = vec![
+            Report::Pinned {
+                protocol: Protocol::Postgres,
+                pinned: true,
+            },
+            Report::Serving {
+                protocol: Protocol::Postgres,
+                backend: Io::Uring,
+            },
+            Report::Pinned {
+                protocol: Protocol::Postgres,
+                pinned: false,
+            },
+            Report::Serving {
+                protocol: Protocol::Postgres,
+                backend: Io::Epoll,
+            },
+            Report::Pinned {
+                protocol: Protocol::Mysql,
+                pinned: true,
+            },
+            Report::Serving {
+                protocol: Protocol::Mysql,
+                backend: Io::Epoll,
+            },
+        ];
+
+        let pg = Banner::of(Protocol::Postgres, &reports);
+        assert_eq!(
+            pg,
+            Banner {
+                serving: 2,
+                ring: 1,
+                pinned: 1
+            }
+        );
+
+        let my = Banner::of(Protocol::Mysql, &reports);
+        assert_eq!(
+            my,
+            Banner {
+                serving: 1,
+                ring: 0,
+                pinned: 1
+            }
+        );
+
+        // A shard that never reported is counted by nothing.
+        assert_eq!(Banner::of(Protocol::Mysql, &reports[..4]).serving, 0);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// The reason this function exists: a container that denies the ring must still get
+    /// a server.
+    #[test]
+    fn a_denied_ring_falls_back_to_epoll() {
+        let eperm = std::io::Error::from_raw_os_error(libc::EPERM);
+
+        assert_eq!(io_to_serve(Io::Uring, Err(eperm)), Io::Epoll);
+    }
+
+    /// Any ring failure falls back, not only the one that was reported.
+    /// A kernel without io_uring answers `ENOSYS`, and an older one answers `EINVAL` on
+    /// the flags this server sets; both mean "no ring here".
+    #[test]
+    fn other_ring_failures_fall_back_too() {
+        for errno in [libc::ENOSYS, libc::EINVAL, libc::EACCES] {
+            let e = std::io::Error::from_raw_os_error(errno);
+
+            assert_eq!(io_to_serve(Io::Uring, Err(e)), Io::Epoll, "errno {errno}");
+        }
+    }
+
+    /// A working ring is kept, which is the path this box takes -- and the one the
+    /// measurements in the README were taken on.
+    #[test]
+    fn a_working_ring_is_kept() {
+        assert_eq!(io_to_serve(Io::Uring, Ok(())), Io::Uring);
+    }
+
+    /// Asking for epoll is never overridden by what the probe found.
+    /// The operator may want epoll precisely because it is the fallback they are about
+    /// to measure against the ring.
+    #[test]
+    fn an_explicit_epoll_is_never_replaced_by_the_ring() {
+        assert_eq!(io_to_serve(Io::Epoll, Ok(())), Io::Epoll);
+        assert_eq!(
+            io_to_serve(
+                Io::Epoll,
+                Err(std::io::Error::from_raw_os_error(libc::EPERM))
+            ),
+            Io::Epoll
+        );
+    }
+
+    /// The probe's verdict on this box, recorded so the fallback path is not mistaken
+    /// for dead code: on a host with io_uring it is `Ok`, and the CI container that
+    /// denies it is the case the tests above pin down.
+    #[test]
+    fn probe_reports_what_this_box_can_do() {
+        match crate::uring::probe() {
+            Ok(()) => assert_eq!(resolve_io(Io::Uring), Io::Uring),
+            Err(e) => {
+                eprintln!("this box cannot create a ring: {e}");
+
+                assert_eq!(resolve_io(Io::Uring), Io::Epoll);
+            }
+        }
+    }
+
+    /// Shards are pinned to the CPUs the process may use, not to their own ids.
+    #[test]
+    fn shards_are_mapped_onto_the_affinity_mask() {
+        let all = allowed_cpus();
+        assert!(!all.is_empty(), "the process runs somewhere");
+
+        // Restrict THIS thread to the last allowed CPU, which is not CPU 0 on any box
+        // with more than one, and read the mask back.
+        let last = *all.last().unwrap();
+        assert!(pin_to_cpu(last), "pinning to an allowed CPU succeeds");
+
+        let allowed = allowed_cpus();
+        assert_eq!(allowed, vec![last], "the mask is what was set");
+
+        // Shard 0 maps onto the first ALLOWED CPU, whatever its number.
+        assert_eq!(cpu_for_shard(&allowed, 0), Some(last));
+        // And with more shards than CPUs nothing is pinned, since two shards on one CPU
+        // is worse than two shards the scheduler may move.
+        assert_eq!(cpu_for_shard(&allowed, 1), None);
+        assert!(pin_to_cpu(cpu_for_shard(&allowed, 0).unwrap()));
+    }
+
+    /// A hostname is a bind address.
+    #[test]
+    fn a_hostname_resolves() {
+        let addrs = match resolve_bind_addrs("localhost", 5432) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("skipping: this host does not resolve `localhost`: {e}");
+
+                return;
+            }
+        };
+
+        assert!(!addrs.is_empty());
+        for addr in &addrs {
+            assert_eq!(addr.port(), 5432);
+            assert!(
+                addr.ip().is_loopback(),
+                "localhost must resolve to loopback addresses, got {addr}"
+            );
+        }
+    }
+
+    /// Every resolved address is a candidate, not just the first.
+    #[test]
+    fn bind_tries_each_address_until_one_binds() {
+        // Occupy a port with an ordinary listener (no SO_REUSEPORT), so a shard
+        // listener on it fails the way a foreign process makes it fail.
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied = taken.local_addr().unwrap();
+        let free: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let (bound, listeners) = bind_shards(&[occupied, free], 3, 16).expect("the second binds");
+
+        assert_ne!(
+            bound.port(),
+            occupied.port(),
+            "the occupied address was skipped"
+        );
+        assert_ne!(
+            bound.port(),
+            0,
+            "the kernel's pick is reported, not the wildcard"
+        );
+        assert_eq!(listeners.len(), 3);
+        for l in &listeners {
+            assert_eq!(
+                l.local_addr().unwrap(),
+                bound,
+                "every shard is on the same address"
+            );
+        }
+    }
+
+    /// When no candidate binds, the error is the last one's, and it is an error the
+    /// caller reports rather than a panic.
+    #[test]
+    fn bind_reports_the_failure_when_nothing_binds() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied = taken.local_addr().unwrap();
+
+        let err = bind_shards(&[occupied, occupied], 2, 16).expect_err("nothing binds");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
+    }
+
+    /// A literal is still a literal, and IPv6 in brackets still works -- this is the
+    /// address form the release builds are tested with.
+    #[test]
+    fn a_literal_resolves_to_itself() {
+        assert_eq!(
+            resolve_bind_addrs("127.0.0.1", 15432).unwrap(),
+            vec!["127.0.0.1:15432".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(
+            resolve_bind_addrs("0.0.0.0", 5432).unwrap(),
+            vec!["0.0.0.0:5432".parse::<SocketAddr>().unwrap()]
+        );
+        assert_eq!(
+            resolve_bind_addrs("::1", 5432).unwrap(),
+            vec!["[::1]:5432".parse::<SocketAddr>().unwrap()]
+        );
+    }
+
+    /// A name that does not resolve is an ERROR, not a panic: the caller prints it and
+    /// exits 2.
+    /// This is the half of the old behaviour that was worse than the missing feature.
+    #[test]
+    fn a_name_that_does_not_resolve_is_an_error() {
+        let err = match resolve_bind_addrs("no-such-host.invalid", 5432) {
+            Ok(a) => panic!("an invalid host resolved to {a:?}"),
+            Err(e) => e,
+        };
+
+        // Reported, not unwound.
+        // The message comes from the resolver, so what is asserted is that there IS one
+        // and that it is not a panic.
+        assert!(
+            !err.to_string().is_empty(),
+            "the error must say something: {err}"
+        );
+    }
+}
