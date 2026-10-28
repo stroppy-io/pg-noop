@@ -93,6 +93,8 @@ enum Shape {
     Status(Option<String>),
     /// `SELECT @...`: one row of plausible values, one column per variable.
     Vars(Vec<String>),
+    /// A failure the client asked for, answered with the error it names.
+    Failure(tpcc::Failure),
     /// A SELECT whose list is literals and variables: one row of exactly those
     /// values, which is a row the server states rather than invents. The rule is
     /// `crate::sql::constant_select`, the same one PostgreSQL uses.
@@ -140,6 +142,7 @@ impl Answer {
                 .collect(),
             Shape::District => vec![("sum(d_next_o_id)", Kind::LongLong)],
             Shape::Status(_) => vec![("Variable_name", Kind::Text), ("Value", Kind::Text)],
+            Shape::Failure(_) => Vec::new(),
             Shape::Constant(items) => items
                 .iter()
                 .map(|c| (c.name.as_str(), constant_kind(c.kind)))
@@ -541,6 +544,19 @@ impl Conn {
 
         match &answer.shape {
             Shape::Ok => result::ok(out, &mut self.seq, 0, 0, status),
+            Shape::Failure(failure) => {
+                // MySQL's numbers and states for the same three failures its
+                // clients inject: a signal carries its own state, a NULL into a
+                // NOT NULL column is 1048, and a CALL of something unknown is
+                // 1305.
+                let (code, state, message) = match failure {
+                    tpcc::Failure::Signal(code) => (1644, code.as_str(), "injected failure"),
+                    tpcc::Failure::Null => (1048, "23000", "column cannot be null"),
+                    tpcc::Failure::Raise => (1644, "P0001", "raised"),
+                    tpcc::Failure::UnknownProcedure => (1305, "42000", "PROCEDURE does not exist"),
+                };
+                self.error(out, code, state, message);
+            }
             Shape::Empty(columns) => {
                 let columns = text_columns(columns.iter().map(String::as_str));
                 result::header(out, &mut self.seq, &columns, status, deprecate);
@@ -728,7 +744,12 @@ fn classify(sql: &str) -> Answer {
     // would otherwise get -- a district sum is a SELECT, a status query is a
     // SHOW, and an OUT-parameter read is a select of variables.
     let mut kind = None;
-    let shape = if let Some(filter) = tpcc::show_status(trimmed) {
+    let shape = if let Some(failure) = tpcc::failure(trimmed) {
+        // **The rollback path a client injects**: an error, so its own error
+        // handling runs and its rollback is counted -- an OK here turns the
+        // rollback into a commit.
+        Shape::Failure(failure)
+    } else if let Some(filter) = tpcc::show_status(trimmed) {
         Shape::Status(filter)
     } else if tpcc::is_district_sum(trimmed) {
         Shape::District
