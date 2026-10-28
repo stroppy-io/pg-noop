@@ -272,6 +272,13 @@ pub fn statement_kind(sql: &str) -> Option<Kind> {
 
             None
         }
+        // **A PostgreSQL TPC-C client calls a procedure as a function**, in a
+        // SELECT: `select neword(...)`, `select * from neword(...)`. A call is
+        // the name followed by `(`, which is what separates it from a column or
+        // a table that happens to be called `payment`.
+        Some(word) if word.eq_ignore_ascii_case("SELECT") || word.eq_ignore_ascii_case("WITH") => {
+            called_procedure(sql)
+        }
         Some(word) if word.eq_ignore_ascii_case("INSERT") => {
             let names_new_order = words.any(|w| {
                 w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
@@ -283,6 +290,37 @@ pub fn statement_kind(sql: &str) -> Option<Kind> {
         }
         _ => None,
     }
+}
+
+/// The TPC-C procedure a statement CALLS, as `name(` outside quotes and
+/// comments.
+fn called_procedure(sql: &str) -> Option<Kind> {
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => i = sql::skip_quoted(bytes, i),
+            b'-' | b'#' | b'/' => match sql::skip_comment(bytes, i) {
+                Some(next) => i = next,
+                None => i += 1,
+            },
+            c if sql::is_word_byte(c) => {
+                let end = sql::word_end(bytes, i)?;
+                let word = &sql[i..end];
+                let after = sql::skip_space(bytes, end);
+                if after < bytes.len() && bytes[after] == b'(' {
+                    if let Some(kind) = Kind::from_procedure(word) {
+                        return Some(kind);
+                    }
+                }
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+
+    None
 }
 
 /// **`SHOW GLOBAL STATUS`, and the filter a client gives it.**
@@ -434,8 +472,40 @@ mod tests {
         }
 
         assert_eq!(statement_kind("call unknown_proc(1)"), None);
-        assert_eq!(statement_kind("select neword(1)"), None);
         assert_eq!(statement_kind("insert into warehouse values (1)"), None);
+    }
+
+    /// **A PostgreSQL TPC-C client calls its procedures as functions**, in a
+    /// SELECT: `select neword(...)`, `select * from neword(...)`, and the same
+    /// statements prepared. Counting only `CALL` meant a PG run's NOPM read zero
+    /// -- the district sum never grew -- while the run itself worked.
+    #[test]
+    fn a_called_function_is_the_same_transaction() {
+        for (sql, kind) in [
+            ("select neword(1, 2, 3, 4)", Kind::NewOrder),
+            ("SELECT neword(1, 2, 3, 4)", Kind::NewOrder),
+            ("select * from neword(1, 2, 3, 4)", Kind::NewOrder),
+            ("select neword (1, 2, 3, 4)", Kind::NewOrder),
+            ("select payment(1, 2, 3, 4)", Kind::Payment),
+            ("select * from delivery(1)", Kind::Delivery),
+            ("select * from ostat(1, 2)", Kind::OrderStatus),
+            ("select * from slev(1, 2, 3)", Kind::StockLevel),
+            ("select tpcc.neword(1, 2, 3, 4)", Kind::NewOrder),
+            // Prepared, the statement keeps its text: the count happens when it
+            // runs, not when it is parsed.
+            ("select * from neword($1, $2, $3, $4)", Kind::NewOrder),
+        ] {
+            assert_eq!(statement_kind(sql), Some(kind), "{sql}");
+        }
+
+        // A name that is not called is not a transaction: a column called
+        // `payment`, or a table someone named after the procedure.
+        assert_eq!(statement_kind("select payment from orders"), None);
+        assert_eq!(
+            statement_kind("select * from orders where payment = 1"),
+            None
+        );
+        assert_eq!(statement_kind("select count(*) from new_order"), None);
     }
 
     /// **A plain-SQL NewOrder is an INSERT into the new_order table**, which is

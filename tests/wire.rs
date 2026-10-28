@@ -956,3 +956,78 @@ fn a_routine_body_leaves_no_transaction_behind() {
     client.query("commit");
     assert_eq!(counter(&mut client, "Com_commit"), 2);
 }
+
+/// **A PostgreSQL TPC-C client's function call counts**, so its NOPM is not zero.
+///
+/// HammerDB's PG TPROC-C calls `neword(...)` as a function inside a SELECT --
+/// plain and prepared -- rather than as a `CALL`. Counting only `CALL` left the
+/// district sum standing still while the run worked, which is the one failure
+/// mode a no-op server must not have.
+#[test]
+fn a_postgres_function_call_is_a_tpcc_transaction() {
+    let server = server();
+    let mut pg = PgClient::connect(server.postgres);
+
+    let answer = pg.query("select sum(d_next_o_id) from district");
+    let before = String::from_utf8_lossy(&answer[1].1).to_string();
+    assert!(before.ends_with("300100"), "{before:?}");
+
+    for sql in [
+        "select neword(1, 2, 3, 4)",
+        "SELECT * FROM neword(1, 2, 3, 4)",
+    ] {
+        let answer = pg.query(sql);
+        assert!(
+            answer.iter().any(|(tag, _)| *tag == b'C'),
+            "{sql} was not answered"
+        );
+    }
+
+    // Prepared, executed twice: two transactions, counted where they run.
+    let parse = |pg: &mut PgClient, sql: &str| {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"s1\0");
+        body.extend_from_slice(sql.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&0i16.to_be_bytes());
+        let mut framed = vec![b'P'];
+        framed.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        framed.extend_from_slice(&body);
+        pg.stream.write_all(&framed).expect("parse");
+        let mut sync = vec![b'S'];
+        sync.extend_from_slice(&4i32.to_be_bytes());
+        pg.stream.write_all(&sync).expect("sync");
+        pg.until_ready();
+    };
+    parse(&mut pg, "select * from payment($1, $2, $3)");
+    for _ in 0..2 {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"\0"); // portal
+        body.extend_from_slice(b"s1\0"); // statement
+        body.extend_from_slice(&0i16.to_be_bytes()); // format codes
+        body.extend_from_slice(&0i16.to_be_bytes()); // parameters
+        body.extend_from_slice(&0i16.to_be_bytes()); // result formats
+        let mut framed = vec![b'B'];
+        framed.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        framed.extend_from_slice(&body);
+        let mut exec = vec![b'E'];
+        exec.extend_from_slice(&9i32.to_be_bytes());
+        exec.extend_from_slice(b"\0");
+        exec.extend_from_slice(&0i32.to_be_bytes());
+        let mut sync = vec![b'S'];
+        sync.extend_from_slice(&4i32.to_be_bytes());
+        framed.extend_from_slice(&exec);
+        framed.extend_from_slice(&sync);
+        pg.stream.write_all(&framed).expect("bind and execute");
+        pg.until_ready();
+    }
+
+    // One district sum read after three NewOrders -- the first two statements --
+    // and two Payments, which move no district.
+    let answer = pg.query("select sum(d_next_o_id) from district");
+    let after = String::from_utf8_lossy(&answer[1].1).to_string();
+    assert!(
+        after.ends_with("300102"),
+        "the NewOrders moved it: {after:?}"
+    );
+}
