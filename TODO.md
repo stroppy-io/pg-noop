@@ -11,7 +11,7 @@ clients.
 ## B — the hot path
 
 **B1. Classify once, at Parse.** `wire.rs:1444` rescans the SQL on every Execute
-(`tpcc::is_district_sum`, `tpcc::statement_kind`) and `row_description`
+(`tpcc::number_query`, `tpcc::statement_kind`) and `row_description`
 (`wire.rs:1896`) twice more; `mysql/mod.rs:694` builds a `Shape` with
 `Vec<String>` column names per query. Store a `u8` class on the plan (MySQL: at
 prepare), intern simple-query SQL per shard by hash, and on a miss scan only the

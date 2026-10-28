@@ -62,8 +62,7 @@ pub enum Kind {
     Text,
     /// `MYSQL_TYPE_LONGLONG`, for the one number this server really produces: the TPC-C
     /// district sum in `crate::tpcc`.
-    #[allow(dead_code)]
-    LongLong,
+        LongLong,
 }
 
 impl Kind {
@@ -145,7 +144,6 @@ pub fn header(
 /// One row: every value length-encoded, and `None` as the NULL marker.
 /// Only the TPC-C answers (`crate::tpcc`) have a row to send: every other result set
 /// this server produces is empty.
-#[allow(dead_code)]
 pub fn row(out: &mut Vec<u8>, seq: &mut u8, values: &[Option<&str>]) {
     let at = packet::begin(out, seq);
     for value in values {
@@ -158,7 +156,6 @@ pub fn row(out: &mut Vec<u8>, seq: &mut u8, values: &[Option<&str>]) {
 }
 
 /// One value of a binary-protocol row.
-#[allow(dead_code)] // the text values are only reached once a rule answers text
 pub enum Value<'a> {
     /// A `MYSQL_TYPE_LONGLONG`: eight bytes, little-endian.
     LongLong(i64),
