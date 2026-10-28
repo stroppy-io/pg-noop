@@ -207,7 +207,10 @@ the difference as NOPM, and reads `show global status` for `Com_commit` and
 zero, and the run measures nothing — the one thing this server exists to avoid.
 
 So there is a small, explicit rule set, listed in full in `src/tpcc.rs`. It is
-not SQL: each rule is the shape of a statement, matched on its own words.
+not SQL: each rule is the shape of a statement, matched on its own words. What is
+decided here — and why — is in [`DESIGN.md`](DESIGN.md), with the review that
+argued for it in
+[`docs/review/2026-10-28-design-panel.md`](docs/review/2026-10-28-design-panel.md).
 
 | Rule | Answer |
 |---|---|
