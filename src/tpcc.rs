@@ -568,8 +568,6 @@ mod tests {
 
     /// The district sum is recognised as HammerDB spells it, with the whitespace and
     /// case a client varies and the schema prefix it may add.
-    #[test]
-
     /// A CALL is counted by the procedure it names, in either case and under a schema
     /// prefix.
     #[test]
