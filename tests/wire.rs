@@ -109,6 +109,9 @@ fn banner(mut child: Child) -> Server {
 }
 
 // Capability bits, by their names in `include/mysql_com.h`.
+/// What the MySQL handshake calls itself, which `select @@version` must answer.
+const SERVER_VERSION: &str = "8.0.0-db-noop";
+
 const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
 const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
 const CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
@@ -1130,4 +1133,61 @@ fn the_banner_says_which_backend_each_shard_got() {
         let (ring, epoll) = (count("io_uring "), count("epoll "));
         assert_eq!(ring + epoll, 1, "{line}");
     }
+}
+
+/// **One answer shape on both protocols.** A row is something the server can
+/// state only for a constant select list; everything that names data answers
+/// none. PostgreSQL used to answer a row of `1`s for a table it had not seen
+/// DDL for, while MySQL answered none -- so the same plain-SQL client found
+/// every item on one protocol and nothing on the other, and its own code paths
+/// (and therefore its cost) differed by protocol.
+///
+/// The row counts here are the whole point, so they are asserted directly and on
+/// both ports.
+#[test]
+fn a_select_answers_the_same_shape_on_both_protocols() {
+    let server = server();
+
+    let mut mysql = Client::connect(server.mysql);
+    let answer = mysql.query("select w_id, w_name from warehouse");
+    assert_eq!(
+        answer.len(),
+        4,
+        "a MySQL select on a table: count, two definitions, terminator: {answer:?}"
+    );
+    let answer = mysql.query("select 1");
+    assert_eq!(answer[2].body, b"\x01\x31", "a MySQL literal: one row, 1");
+
+    let mut pg = PgClient::connect(server.postgres);
+    let answer = pg.query("select w_id, w_name from warehouse");
+    assert_eq!(
+        answer.len(),
+        2,
+        "RowDescription, CommandComplete: {answer:?}"
+    );
+    assert_eq!(answer[0].0, b'T');
+    assert_eq!(answer[1].0, b'C');
+    assert_eq!(
+        &answer[1].1, b"SELECT 0\0",
+        "a PostgreSQL select on a table answers no rows"
+    );
+
+    let answer = pg.query("select 1");
+    assert_eq!(answer.len(), 3, "RowDescription, one row, CommandComplete");
+    assert_eq!(&answer[1].1[6..], b"1", "a PostgreSQL literal: one row, 1");
+
+    // `@var` and `@@var` are values, on both protocols.
+    let answer = pg.query("select @x");
+    assert_eq!(answer.len(), 3, "{answer:?}");
+    assert_eq!(&answer[1].1[6..], b"1");
+    let answer = mysql.query("select @@version");
+    assert_eq!(answer[2].body[1..], *SERVER_VERSION.as_bytes());
+
+    // And a DML tag says what a no-op did: nothing.
+    let answer = pg.query("insert into t values (1)");
+    assert_eq!(&answer[0].1, b"INSERT 0 0\0");
+    let answer = pg.query("update t set a = 1");
+    assert_eq!(&answer[0].1, b"UPDATE 0\0");
+    let answer = pg.query("delete from t");
+    assert_eq!(&answer[0].1, b"DELETE 0\0");
 }

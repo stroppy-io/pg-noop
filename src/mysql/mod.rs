@@ -31,7 +31,7 @@ use result::{Column, Kind};
 use crate::sql;
 use crate::tpcc;
 
-pub use handshake::greeting;
+pub use handshake::{greeting, SERVER_VERSION};
 
 // Server status flags, by their names in `include/mysql_com.h`. A client reads
 // them: `IN_TRANS` is how a pool knows a transaction is open, and
@@ -93,18 +93,18 @@ enum Shape {
     Status(Option<String>),
     /// `SELECT @...`: one row of plausible values, one column per variable.
     Vars(Vec<String>),
-    /// A SELECT whose list is literals and system variables: one row of exactly
-    /// those values, which is a row the server states rather than invents.
-    Constant(Vec<Constant>),
+    /// A SELECT whose list is literals and variables: one row of exactly those
+    /// values, which is a row the server states rather than invents. The rule is
+    /// `crate::sql::constant_select`, the same one PostgreSQL uses.
+    Constant(Vec<sql::Constant>),
 }
 
-/// One item of a constant select list: its column name, the value it answers,
-/// and the type a client decodes that value by.
-#[derive(Clone, PartialEq, Eq, Debug)]
-struct Constant {
-    name: String,
-    value: String,
-    kind: Kind,
+/// The MySQL column type a constant's value is sent as.
+fn constant_kind(kind: sql::ConstantKind) -> Kind {
+    match kind {
+        sql::ConstantKind::Integer => Kind::LongLong,
+        sql::ConstantKind::Text => Kind::Text,
+    }
 }
 
 /// What a statement does to the session, decided from its text and applied when
@@ -140,7 +140,10 @@ impl Answer {
                 .collect(),
             Shape::District => vec![("sum(d_next_o_id)", Kind::LongLong)],
             Shape::Status(_) => vec![("Variable_name", Kind::Text), ("Value", Kind::Text)],
-            Shape::Constant(items) => items.iter().map(|c| (c.name.as_str(), c.kind)).collect(),
+            Shape::Constant(items) => items
+                .iter()
+                .map(|c| (c.name.as_str(), constant_kind(c.kind)))
+                .collect(),
         }
     }
 }
@@ -591,14 +594,14 @@ impl Conn {
                     .iter()
                     .map(|c| Column {
                         name: &c.name,
-                        kind: c.kind,
+                        kind: constant_kind(c.kind),
                     })
                     .collect();
                 result::header(out, &mut self.seq, &columns, status, deprecate);
                 if binary {
                     let values: Vec<result::Value<'_>> = items
                         .iter()
-                        .map(|c| match c.kind {
+                        .map(|c| match constant_kind(c.kind) {
                             Kind::LongLong => {
                                 result::Value::LongLong(c.value.parse::<i64>().unwrap_or_default())
                             }
@@ -722,7 +725,7 @@ fn classify(sql: &str) -> Answer {
         Shape::District
     } else if let Some(names) = tpcc::select_vars(trimmed) {
         Shape::Vars(names)
-    } else if let Some(items) = constant_select(trimmed) {
+    } else if let Some(items) = sql::constant_select(trimmed) {
         Shape::Constant(items)
     } else if head.eq_ignore_ascii_case("SELECT") {
         Shape::Empty(select_columns(trimmed))
@@ -757,120 +760,6 @@ fn text_columns<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<Column<'a>>
             kind: Kind::Text,
         })
         .collect()
-}
-
-/// **A select list of literals and system variables**, which is a row the server
-/// can state rather than invent.
-///
-/// `select 1` answered an empty result set, so `mariadb -e 'select 1'` printed
-/// nothing at all -- which reads as a broken server, and is the same statement
-/// PostgreSQL answers with a row. A list that names a table, a column or a
-/// function is not this rule and keeps its empty result set.
-fn constant_select(sql: &str) -> Option<Vec<Constant>> {
-    // A select over rows is not a row of constants.
-    if sql::find_keyword(sql, sql::first_word(sql).len(), "FROM").is_some() {
-        return None;
-    }
-    let list = sql::select_list(sql)?;
-
-    let mut items = Vec::new();
-    for item in sql::split_top_level(list) {
-        let item = item.trim();
-        let constant = constant_item(item)?;
-        items.push(constant);
-    }
-    if items.is_empty() {
-        return None;
-    }
-
-    Some(items)
-}
-
-/// One item of a select list, when it is a literal or a system variable.
-fn constant_item(item: &str) -> Option<Constant> {
-    // A quoted string: its own text, without the quotes.
-    if let Some(inner) = item.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
-        if inner.len() + 2 != item.len() {
-            return None;
-        }
-
-        return Some(Constant {
-            name: item.to_string(),
-            value: inner.replace("''", "'"),
-            kind: Kind::Text,
-        });
-    }
-
-    // `@@name`, `@@session.name`, `@@global.name`.
-    if let Some(name) = item.strip_prefix("@@") {
-        let name = name
-            .strip_prefix("session.")
-            .or_else(|| name.strip_prefix("global."))
-            .or_else(|| name.strip_prefix("local."))
-            .unwrap_or(name);
-        let (value, kind) = system_variable(name.trim_matches('`'))?;
-
-        return Some(Constant {
-            name: item.to_string(),
-            value,
-            kind,
-        });
-    }
-
-    // An integer literal.
-    if let Ok(n) = item.parse::<i64>() {
-        return Some(Constant {
-            name: item.to_string(),
-            value: n.to_string(),
-            kind: Kind::LongLong,
-        });
-    }
-
-    None
-}
-
-/// The value of a MySQL system variable a client reads at connect.
-///
-/// Every one of these is a fact about a MariaDB the caller believes it is
-/// talking to, and a driver that reads one at connect needs a value it can
-/// parse: an empty result set is a driver that cannot start. Names beyond the
-/// table answer `1` -- a plausible number -- because a variable this server has
-/// never heard of is still one a client is entitled to an answer for.
-fn system_variable(name: &str) -> Option<(String, Kind)> {
-    let text = |value: &str| Some((value.to_string(), Kind::Text));
-    let number = |value: &str| Some((value.to_string(), Kind::LongLong));
-
-    match name.to_ascii_lowercase().as_str() {
-        "version" => text(handshake::SERVER_VERSION),
-        "version_comment" => text("db-noop: a no-op server for measuring clients"),
-        "max_allowed_packet" => number("16777216"),
-        "autocommit" => number("1"),
-        "auto_increment_increment" => number("1"),
-        "auto_increment_offset" => number("1"),
-        "tx_isolation" | "transaction_isolation" => text("REPEATABLE-READ"),
-        "tx_read_only" | "transaction_read_only" | "read_only" => number("0"),
-        "sql_mode" => text(""),
-        "character_set_client"
-        | "character_set_connection"
-        | "character_set_results"
-        | "character_set_database"
-        | "character_set_server" => text("utf8mb4"),
-        "collation_connection" | "collation_server" | "collation_database" => {
-            text("utf8mb4_general_ci")
-        }
-        "time_zone" => text("SYSTEM"),
-        "system_time_zone" => text("UTC"),
-        "lower_case_table_names" => number("0"),
-        "net_write_timeout" | "net_read_timeout" | "wait_timeout" | "interactive_timeout" => {
-            number("28800")
-        }
-        "init_connect" => text(""),
-        "license" => text("MIT OR Apache-2.0"),
-        "have_query_cache" => text("NO"),
-        // A variable this server has never heard of is still one a client is
-        // entitled to answer: a number, which parses as anything.
-        _ => number("1"),
-    }
 }
 
 /// `START TRANSACTION`, with any of its modifiers.
