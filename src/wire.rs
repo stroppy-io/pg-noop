@@ -304,6 +304,9 @@ pub struct Conn {
     copy_binary: BinaryState,
     /// Where a text or CSV COPY stream is within its current line.
     copy_lines: LineState,
+    /// What this connection has done in its open transaction, counted when it
+    /// commits and dropped if it rolls back.
+    pending: crate::tpcc::Pending,
     /// The state `ReadyForQuery` reports, which is not a constant.
     ///
     /// pgxpool reads it: a connection that reports idle while a transaction is
@@ -328,6 +331,7 @@ impl Conn {
             portals: HashMap::new(),
             copy_binary: BinaryState::default(),
             copy_lines: LineState::default(),
+            pending: crate::tpcc::Pending::default(),
             tx_status: TxStatus::Idle,
         }
     }
@@ -410,13 +414,50 @@ impl Conn {
     /// nothing; `COMMIT` and `ROLLBACK` close it, failed or not. A statement
     /// inside a failed transaction never reaches here: it is refused first,
     /// with 25P02, which is what a client reading `E` expects.
-    fn note_transaction(&mut self, kind: &PlanKind) {
+    fn note_transaction(&mut self, kind: &PlanKind, failed: bool) {
         match kind {
             PlanKind::Begin if self.tx_status == TxStatus::Idle => {
                 self.tx_status = TxStatus::InTransaction
             }
-            PlanKind::Commit | PlanKind::Rollback => self.tx_status = TxStatus::Idle,
+            PlanKind::Commit if failed => {
+                // Committing a failed transaction rolls it back, and the tag
+                // says so: its statements never happened, and the counter says
+                // the same thing the tag does.
+                self.tx_status = TxStatus::Idle;
+                self.pending.discard();
+                crate::tpcc::note_rollback();
+            }
+            PlanKind::Commit => {
+                self.tx_status = TxStatus::Idle;
+                self.pending.commit();
+            }
+            PlanKind::Rollback => {
+                self.tx_status = TxStatus::Idle;
+                self.pending.discard();
+                crate::tpcc::note_rollback();
+            }
             _ => {}
+        }
+    }
+
+    /// Note what a statement does to the counters.
+    ///
+    /// A TPC-C transaction is counted when it COMMITS: the statement's kind is
+    /// noted here, and folded into the counters by `note_transaction` at COMMIT
+    /// or, outside a transaction, by the autocommit fold below. A statement that
+    /// is rolled back is counted by nothing.
+    fn note_statement(&mut self, sql: &str) {
+        let Some(kind) = crate::tpcc::statement_kind(sql) else {
+            return;
+        };
+        self.pending.note(kind);
+
+        // **Autocommit: a counted statement outside a transaction is one
+        // transaction of its own**, and commits when it is answered -- the same
+        // rule MySQL follows, so a client that never says BEGIN still moves the
+        // commit counter a TPM check reads.
+        if self.tx_status == TxStatus::Idle {
+            self.pending.commit();
         }
     }
 
@@ -970,7 +1011,8 @@ impl Conn {
                 // the answer is written so that the byte and the statement
                 // cannot disagree.
                 let failed = self.failed();
-                self.note_transaction(&plan.kind);
+                self.note_transaction(&plan.kind, failed);
+                self.note_statement(&plan.sql);
 
                 answer(
                     &plan,
@@ -1281,7 +1323,8 @@ impl Conn {
                 // The extended protocol's Execute is where a statement actually
                 // runs, so it is where the transaction state changes. `SYNC` is
                 // what asks for the byte, later.
-                self.note_transaction(&p.kind);
+                self.note_transaction(&p.kind, failed);
+                self.note_statement(&p.sql);
 
                 if let Some(format) = streams_rows {
                     self.copy_binary = BinaryState::default();
@@ -1482,13 +1525,6 @@ fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Ru
         return status_answer(out, run, filter.as_deref());
     }
 
-    // A statement that IS a TPC-C transaction is counted here, where it runs,
-    // and never at Parse: a portal executed a thousand times is a thousand
-    // transactions, and one that is prepared and never run is none.
-    if let Some(kind) = crate::tpcc::statement_kind(&plan.sql) {
-        crate::tpcc::note(kind);
-    }
-
     match &plan.kind {
         // **A constant select answers one row, and nothing else does.** The
         // values are the statement's own: no data is involved, so the row is
@@ -1531,20 +1567,11 @@ fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Ru
         PlanKind::Update => complete_raw(out, "UPDATE 0"),
         PlanKind::Delete => complete_raw(out, "DELETE 0"),
         PlanKind::Begin => complete_raw(out, "BEGIN"),
-        PlanKind::Commit if run.failed => {
-            // Committing a failed transaction rolls it back, and the tag says
-            // so; the counter says the same thing the tag does.
-            crate::tpcc::note_rollback();
-            complete_raw(out, "ROLLBACK")
-        }
-        PlanKind::Commit => {
-            crate::tpcc::note_commit();
-            complete_raw(out, "COMMIT")
-        }
-        PlanKind::Rollback => {
-            crate::tpcc::note_rollback();
-            complete_raw(out, "ROLLBACK")
-        }
+        // The counters are moved by the connection, at the moment the
+        // transaction ends; the tag is what the client reads.
+        PlanKind::Commit if run.failed => complete_raw(out, "ROLLBACK"),
+        PlanKind::Commit => complete_raw(out, "COMMIT"),
+        PlanKind::Rollback => complete_raw(out, "ROLLBACK"),
         PlanKind::Ddl => {
             catalog.apply(&plan.sql);
             complete_raw(out, ddl_tag(&plan.sql));

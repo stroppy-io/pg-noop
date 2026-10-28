@@ -719,6 +719,21 @@ fn counter(client: &mut Client, name: &str) -> u64 {
     rows[0][1].parse().expect("a number")
 }
 
+/// A PostgreSQL DataRow's values: an i16 count, then an i32 length and that many
+/// bytes for each.
+fn pg_values(body: &[u8]) -> Vec<String> {
+    let count = i16::from_be_bytes([body[0], body[1]]) as usize;
+    let mut at = 2;
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = i32::from_be_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]) as usize;
+        values.push(String::from_utf8_lossy(&body[at + 4..at + 4 + len]).to_string());
+        at += 4 + len;
+    }
+
+    values
+}
+
 /// A row packet's values.
 fn row(packet: &Packet) -> Vec<String> {
     let mut values = Vec::new();
@@ -1190,4 +1205,85 @@ fn a_select_answers_the_same_shape_on_both_protocols() {
     assert_eq!(&answer[0].1, b"UPDATE 0\0");
     let answer = pg.query("delete from t");
     assert_eq!(&answer[0].1, b"DELETE 0\0");
+}
+
+/// **A transaction is counted when it commits; a rollback counts nothing.**
+///
+/// A NewOrder used to be counted when its statement ran, so a rolled-back
+/// NewOrder raised the district sum anyway and NOPM was inflated by every failed
+/// transaction. On PostgreSQL a counted statement outside `BEGIN` was not counted
+/// as a commit at all, so HammerDB's PostgreSQL TPM -- `xact_commit +
+/// xact_rollback` -- read zero on a run that worked.
+#[test]
+fn a_transaction_is_counted_at_commit_on_both_protocols() {
+    let server = server();
+
+    // MySQL: inside a transaction, nothing moves until the COMMIT.
+    let mut mysql = Client::connect(server.mysql);
+    let sum = |client: &mut Client| -> u64 {
+        let answer = client.query("select sum(d_next_o_id) from district");
+        row(&answer[2])[0].parse().expect("a number")
+    };
+    let before = sum(&mut mysql);
+
+    mysql.query("begin");
+    mysql.query("call NEWORD(1, 2, 3, 4)");
+    assert_eq!(
+        sum(&mut mysql),
+        before,
+        "an uncommitted NewOrder is not counted"
+    );
+    mysql.query("rollback");
+    assert_eq!(sum(&mut mysql), before, "and a rolled-back one never is");
+
+    mysql.query("begin");
+    mysql.query("call NEWORD(1, 2, 3, 4)");
+    mysql.query("commit");
+    assert_eq!(sum(&mut mysql), before + 1, "a committed one is");
+
+    // Autocommit: the statement is its own transaction, and commits.
+    mysql.query("call NEWORD(1, 2, 3, 4)");
+    assert_eq!(sum(&mut mysql), before + 2);
+
+    // PostgreSQL: the same rules.
+    let mut pg = PgClient::connect(server.postgres);
+    let sum = |pg: &mut PgClient| -> u64 {
+        let answer = pg.query("select sum(d_next_o_id) from district");
+        pg_values(&answer[1].1)[0].parse().expect("a number")
+    };
+    let before = sum(&mut pg);
+
+    pg.query("begin");
+    pg.query("insert into new_order values (1, 1, 3001)");
+    assert_eq!(
+        sum(&mut pg),
+        before,
+        "an uncommitted NewOrder is not counted"
+    );
+    pg.query("rollback");
+    assert_eq!(sum(&mut pg), before);
+
+    pg.query("begin");
+    pg.query("insert into new_order values (1, 1, 3001)");
+    pg.query("commit");
+    assert_eq!(sum(&mut pg), before + 1, "a committed one is");
+
+    // **Autocommit on PostgreSQL counts a commit too**, which is what a TPM
+    // read off `xact_commit` needs.
+    let commits = |pg: &mut PgClient| -> u64 {
+        let answer = pg.query("show global status like 'Com_commit'");
+        pg_values(&answer[1].1)[1].parse().expect("a number")
+    };
+    let before_commits = commits(&mut pg);
+    pg.query("insert into new_order values (1, 1, 3001)");
+    assert_eq!(
+        sum(&mut pg),
+        before + 2,
+        "an autocommit NewOrder is counted"
+    );
+    assert_eq!(
+        commits(&mut pg),
+        before_commits + 1,
+        "and it is a commit of its own"
+    );
 }
