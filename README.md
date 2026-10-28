@@ -211,12 +211,26 @@ not SQL: each rule is the shape of a statement, matched on its own words.
 
 | Rule | Answer |
 |---|---|
-| `CALL NEWORD(...)` — also `PAYMENT`, `DELIVERY`, `OSTAT`/`order_status`, `SLEV`/`stock_level`, any case, optional schema prefix | OK packet; the transaction is counted |
-| A SELECT that CALLS one of them as a function — `select neword(…)`, `SELECT * FROM neword(…)`, PostgreSQL's form of the same, plain or prepared | The ordinary SELECT answer; the transaction is counted |
-| `INSERT` that names `new_order` (or `tpcc_new_order`) | OK packet; counted as a NewOrder |
-| `select sum(d_next_o_id) from district` (any case and spacing, optional schema prefix, `district` or `tpcc_district`, nothing after the table) | One row: `3001 × districts + NewOrders seen` |
-| `show global status` [`like '<pattern>'`] | A result set of `Com_commit` and `Com_rollback` (MySQL's `%`/`_` matching) |
+| `CALL NEWORD(...)` — also `PAYMENT`, `DELIVERY`, `OSTAT`/`order_status`, `SLEV`/`stock_level`, any case, optional schema prefix | OK packet; the transaction is counted at COMMIT |
+| A SELECT that CALLS one of them as a function — `select neword(…)`, `SELECT * FROM neword(…)`, PostgreSQL's form of the same, plain or prepared | The ordinary SELECT answer; counted at COMMIT |
+| `INSERT` that names `new_order` (or `tpcc_new_order`) | OK packet; counted at COMMIT |
+| `SIGNAL SQLSTATE '<code>'`, a NULL written by an INSERT or UPDATE, a `RAISE`, a `CALL` of a procedure with no rule | The client's own error: the rollback path a benchmark injects |
 | `select @a, @b` (variables only) | One row, one column per variable, every value `1` |
+
+With **`--profile tpcc`** (off by default) the server also states the numbers a
+TPC-C client reads its throughput from, all derived from `--warehouses`:
+
+| Profile answer | Value |
+|---|---|
+| `select sum(d_next_o_id) from district` (any case and spacing, optional schema prefix, `district` or `tpcc_district`) | One row: `3001 × districts + committed NewOrders` |
+| `select max(w_id) from warehouse`, `max(d_id) from district`, `count(*)` from `orders`/`new_order`/`warehouse`/`district` | One row: the schema's own population, plus the orders this process has committed |
+| PostgreSQL `select sum(xact_commit+xact_rollback) from pg_stat_database` | One row: the commits and rollbacks this process has counted |
+| `show global status` [`like '<pattern>'`] | `Com_commit` and `Com_rollback` (MySQL's `%`/`_` matching) |
+
+Without the profile those statements answer what every other select of a table
+answers — its columns and no rows — because a server that states numbers it has
+no data for is manufacturing a measurement. **The counters always run**: a
+transaction is counted when it commits, and a rollback counts nothing.
 | A select list of literals and `@@variables` (`select 1`, `select @@version`) | One row of exactly those values |
 
 **A row where a row can be stated.** `select 1` answers one row (`1`), because a
@@ -432,6 +446,25 @@ loop, reports p50/p90/p99/p99.9/max. It speaks both protocols: `--proto postgres
 packet per query and counts the packets that end an answer. Conventional load
 tools saturate first — four instances reached 825,238 q/s with db-noop at 4% of
 one core, at which point the figure describes the client.
+
+## Which clients this is for
+
+A no-op server has to be able to say which clients it can measure, and to say
+when it cannot. **An unsupported client gets no number, not a low one**: a figure
+from a client whose own logic is being decided by the server's made-up answers is
+a measurement of nothing.
+
+| Client | How it runs | Notes |
+|---|---|---|
+| HammerDB, PostgreSQL TPROC-C | Function mode: `select neword(…)`, with SQL `PREPARE … AS` at login | Supported with `--profile tpcc` |
+| HammerDB, MySQL TPROC-C | Stored procedures: `call neword(…)` | Supported with `--profile tpcc` |
+| stroppy-rust, both protocols | `--no-verify`; conformant and hammer drivers | Supported with `--profile tpcc` |
+| stroppy-go | — | **Not supported**: it validates the rows it reads, and there are none |
+| HammerDB, MySQL client-side SQL arm | — | **Not supported**: it needs point lookups (an item's price, a stock level), and a server with no data cannot answer one |
+
+**Every db-noop figure is published next to a real-server run.** The number says
+how much of a client's cost the database was not: alone it says nothing about how
+fast the client is against a database, and it is not a TPC-C result.
 
 ## What has not been verified here
 
