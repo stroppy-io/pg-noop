@@ -244,6 +244,13 @@ impl Pending {
         self.open = false;
     }
 
+    /// The session starts over: no open transaction, nothing noted, and **no
+    /// rollback counted** -- a reset is not a transaction that failed.
+    pub fn reset(&mut self) {
+        self.counts = [0; 5];
+        self.open = false;
+    }
+
     /// Whether a transaction is open.
     pub fn in_transaction(&self) -> bool {
         self.open
@@ -860,6 +867,25 @@ mod tests {
         assert!(line().contains("[synthetic NOPM]"));
         set_profile(false);
         assert!(!line().contains("[synthetic NOPM]"));
+    }
+
+    /// **A reset drops what was noted without counting a rollback.** MySQL's
+    /// COM_RESET_CONNECTION and COM_CHANGE_USER end a session's work, not a
+    /// transaction that failed.
+    #[test]
+    fn a_reset_counts_nothing() {
+        let before = com_rollback();
+        let mut pending = Pending::default();
+        pending.begin();
+        pending.statement(Kind::NewOrder);
+        pending.reset();
+
+        assert!(!pending.in_transaction());
+        assert_eq!(com_rollback(), before, "a reset is not a rollback");
+
+        let orders = new_orders();
+        pending.commit();
+        assert_eq!(new_orders(), orders, "the noted NewOrder is gone");
     }
 
     /// A transaction is counted at COMMIT, and a rollback counts nothing.

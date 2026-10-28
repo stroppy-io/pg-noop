@@ -1326,3 +1326,26 @@ fn the_synthetic_answers_need_the_profile() {
     let answer = mysql.query("show global status like 'Com_commit'");
     assert_eq!(row(&answer[3])[0], "Com_commit");
 }
+
+/// **A reset connection is not a rollback.** MySQL's COM_RESET_CONNECTION ends the
+/// session's work; counting it as a rollback inflated Com_rollback by one per reused
+/// pooled connection. This test owns a server, so the counters are exact.
+#[test]
+fn a_reset_connection_counts_no_rollback() {
+    let server = server();
+    let mut client = Client::connect(server.mysql);
+
+    client.query("begin");
+    client.query("call NEWORD(1, 2, 3, 4)");
+    let before = counter(&mut client, "Com_rollback");
+
+    client.command(COM_RESET_CONNECTION, &[]);
+    let answer = client.read();
+    assert_eq!(answer.body[0], 0x00, "an OK packet");
+
+    assert_eq!(
+        counter(&mut client, "Com_rollback"),
+        before,
+        "a reset is not a rollback"
+    );
+}
