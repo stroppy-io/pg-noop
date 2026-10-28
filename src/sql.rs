@@ -465,75 +465,6 @@ fn skip_dollar(bytes: &[u8], i: usize) -> usize {
     bytes.len()
 }
 
-/// Tokens of a statement: words, quoted strings and parenthesised groups.
-///
-/// A COPY's options and a column list are read through this: a group is one
-/// token, so a comma inside it is not a separator.
-#[allow(clippy::should_implement_trait)] // a cursor over SQL, not an Iterator
-pub struct Tokens<'a> {
-    rest: &'a str,
-}
-
-#[allow(clippy::should_implement_trait)] // a cursor over SQL, not an Iterator
-impl<'a> Tokens<'a> {
-    pub fn new(sql: &'a str) -> Self {
-        Tokens { rest: sql }
-    }
-
-    pub fn next_is(&mut self, word: &str) -> bool {
-        matches!(self.next(), Some(w) if w.eq_ignore_ascii_case(word))
-    }
-
-    pub fn next(&mut self) -> Option<&'a str> {
-        loop {
-            self.rest = self
-                .rest
-                .trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ';');
-            if self.rest.is_empty() {
-                return None;
-            }
-            match skip_comment(self.rest.as_bytes(), 0) {
-                Some(next) if next > 0 => {
-                    self.rest = &self.rest[next..];
-
-                    continue;
-                }
-                _ => break,
-            }
-        }
-
-        let bytes = self.rest.as_bytes();
-        let word = match bytes[0] {
-            b'\'' | b'"' | b'`' | b'$' => {
-                let end = skip_literal(bytes, 0).max(1).min(bytes.len());
-
-                &self.rest[..end]
-            }
-            b'(' => {
-                let end = matching_paren(bytes, 0).unwrap_or(bytes.len());
-
-                &self.rest[..end]
-            }
-            _ => {
-                let end = (0..bytes.len())
-                    .find(|&i| {
-                        bytes[i].is_ascii_whitespace()
-                            || bytes[i] == b'('
-                            || bytes[i] == b';'
-                            || skip_comment(bytes, i).is_some()
-                    })
-                    .unwrap_or(bytes.len())
-                    .max(1);
-
-                &self.rest[..end]
-            }
-        };
-        self.rest = &self.rest[word.len()..];
-
-        Some(word)
-    }
-}
-
 /// The offset after the `)` matching the `(` at `open`, if there is one.
 pub fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0usize;
@@ -807,7 +738,7 @@ mod tests {
         assert_eq!(items[0].kind, ConstantKind::Integer);
         assert_eq!(items[1].value, "abc");
         assert_eq!(items[1].kind, ConstantKind::Text);
-        assert_eq!(items[2].value, crate::mysql::SERVER_VERSION);
+        assert_eq!(items[2].value, SERVER_VERSION);
 
         // A trailing clause is a clause, not part of the list, and neither is a
         // trailing comment: a padded query is still the literal it pads.
