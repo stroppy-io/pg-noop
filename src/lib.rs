@@ -231,19 +231,7 @@ async fn serve(mut socket: TcpStream, codec: Codec) {
         };
 
         out.clear();
-
-        // The common case is a whole batch in one read with nothing left over, so the
-        // copy into `pending` is avoided when there is nothing pending.
-        if pending.is_empty() {
-            let used = codec.advance(&mut conn, &chunk[..n], &mut out);
-            if used < n {
-                pending.extend_from_slice(&chunk[used..n]);
-            }
-        } else {
-            pending.extend_from_slice(&chunk[..n]);
-            let used = codec.advance(&mut conn, &pending, &mut out);
-            pending.drain(..used);
-        }
+        protocol::feed(&codec, &mut conn, &mut pending, &chunk[..n], &mut out);
 
         if !out.is_empty() && socket.write_all(&out).await.is_err() {
             return;

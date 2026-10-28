@@ -1289,16 +1289,13 @@ fn passes(
                         // and `n` is the byte count the kernel wrote there.
                         let bytes = unsafe { std::slice::from_raw_parts(src, n) };
 
-                        if slot.pending.is_empty() {
-                            let used = codec.advance(&mut slot.session, bytes, out);
-                            if used < n {
-                                slot.pending.extend_from_slice(&bytes[used..n]);
-                            }
-                        } else {
-                            slot.pending.extend_from_slice(bytes);
-                            let used = codec.advance(&mut slot.session, &slot.pending, out);
-                            slot.pending.drain(..used);
-                        }
+                        crate::protocol::feed(
+                            &codec,
+                            &mut slot.session,
+                            &mut slot.pending,
+                            bytes,
+                            out,
+                        );
 
                         // Only now: the codec has read what the buffer held.
                         if let (Some(bid), Some(b)) = (release, bufs.as_mut()) {
