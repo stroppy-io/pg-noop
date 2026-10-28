@@ -234,6 +234,13 @@ empty set: `@@version` (`8.0.0-db-noop`), `@@max_allowed_packet` (`16777216`),
 (`REPEATABLE-READ`), `@@character_set_*` (`utf8mb4`), the timeouts (`28800`), and
 `1` for anything this server has not heard of.
 
+**The counters are the server's**, not a connection's and not a protocol's: a
+NewOrder on the MySQL port moves the district sum the PostgreSQL port reads, and
+a client that wants its own throughput reads the sum either side of its own
+window — which is what HammerDB and stroppy do — rather than expecting a fixed
+figure. Two clients measuring at once on one server therefore see each other's
+transactions, exactly as they would on one database.
+
 `districts` is ten per warehouse, and `--warehouses` says how many there are (ten
 by default, which is HammerDB's own default schema). A statement outside a
 transaction counts as its own commit on the MySQL side, where a client's

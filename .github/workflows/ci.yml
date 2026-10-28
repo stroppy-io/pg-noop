@@ -79,39 +79,64 @@ jobs:
       - name: MySQL — select 1, NOPM, transaction, status
         run: |
           set -euo pipefail
+          # **The district sum is a DELTA, not a figure.** The counters are the
+          # server's, shared by both protocols and every connection: a NewOrder on
+          # one port moves the sum the other port reads, and the CI steps run one
+          # after another. What a TPC-C client reports is the difference across
+          # its own window, so that is what is checked here.
+          nopm() { $MYSQL_CLIENT -h 127.0.0.1 -P 13306 -u root -N -e "select sum(d_next_o_id) from district"; }
+
           out=$($MYSQL_CLIENT -h 127.0.0.1 -P 13306 -u root -e "select 1")
           echo "$out"
           echo "$out" | grep -Eq '(^|[^0-9])1([^0-9]|$)'
 
-          out=$($MYSQL_CLIENT -h 127.0.0.1 -P 13306 -u root -e "select sum(d_next_o_id) from district")
-          echo "$out"
-          echo "$out" | grep -q 300100
+          before=$(nopm)
+          echo "district sum before: $before"
 
-          # One transaction: the CALL is the transaction, and the COMMIT is the
-          # commit the TPM check counts.
+          # One NewOrder: a CALL (its own transaction), then the COMMIT a TPM
+          # check counts.
           $MYSQL_CLIENT -h 127.0.0.1 -P 13306 -u root -e "call NEWORD(1,2,3,4); commit"
+
+          after=$(nopm)
+          echo "district sum after: $after"
+          [ "$after" -eq "$((before + 1))" ] || {
+            echo "one NewOrder must move the district sum by one: $before -> $after"
+            exit 1
+          }
+
           out=$($MYSQL_CLIENT -h 127.0.0.1 -P 13306 -u root -e "show global status like 'Com_commit'")
           echo "$out"
           echo "$out" | grep -Eq 'Com_commit[[:space:]]+[1-9]'
 
-          # A transaction's status flags are the client's to read.
+          # A transaction's status flags are the client's to read, and the CALL
+          # inside it does not commit on its own.
           $MYSQL_CLIENT -h 127.0.0.1 -P 13306 -u root -e "begin; select 1; commit"
-
-          # And the TPC-C reads move: one more NewOrder, one more district.
-          out=$($MYSQL_CLIENT -h 127.0.0.1 -P 13306 -u root -e "select sum(d_next_o_id) from district")
-          echo "$out"
-          echo "$out" | grep -q 300101
 
       - name: PostgreSQL — select 1, NOPM, transaction
         run: |
           set -euo pipefail
+          # The same delta rule as the MySQL step: the counter is the server's and
+          # the step before this one has already counted a NewOrder.
+          nopm() { $PG_CLIENT -h 127.0.0.1 -p 15432 -U any -d any -Atc "select sum(d_next_o_id) from district"; }
+
           out=$($PG_CLIENT -h 127.0.0.1 -p 15432 -U any -d any -Atc "select 1")
           echo "$out"
           echo "$out" | grep -Eq '^1$'
 
-          out=$($PG_CLIENT -h 127.0.0.1 -p 15432 -U any -d any -Atc "select sum(d_next_o_id) from district")
-          echo "$out"
-          echo "$out" | grep -q 300100
+          before=$(nopm)
+          echo "district sum before: $before"
+
+          # A plain-SQL NewOrder on the PostgreSQL side: the INSERT into
+          # new_order is the one table only that transaction writes.
+          $PG_CLIENT -h 127.0.0.1 -p 15432 -U any -d any -c \
+            "insert into new_order values (1, 1, 3001)" >/dev/null
+
+          after=$(nopm)
+          echo "district sum after: $after"
+          [ "$after" -eq "$((before + 1))" ] || {
+            echo "one NewOrder must move the district sum by one: $before -> $after"
+            exit 1
+          }
 
           $PG_CLIENT -h 127.0.0.1 -p 15432 -U any -d any -c "begin; select 1; commit" >/dev/null
           out=$($PG_CLIENT -h 127.0.0.1 -p 15432 -U any -d any -Atc "show global status like 'Com_commit'")
