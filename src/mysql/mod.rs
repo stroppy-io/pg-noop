@@ -571,23 +571,19 @@ impl Conn {
         out.extend_from_slice(&0u16.to_le_bytes()); // warnings
         packet::end(out, at);
 
-        for _ in 0..params {
-            // A parameter has no name and no type until it is bound.
-            result::definition(
-                out,
-                &mut self.seq,
-                &Column {
-                    name: "?",
-                    kind: Kind::Text,
-                },
-            );
-        }
-        if !deprecate && params > 0 {
-            result::eof(out, &mut self.seq, status);
-        }
-        if !columns.is_empty() {
-            result::header(out, &mut self.seq, &columns, status, deprecate);
-        }
+        // **Definitions, not a result set.** The counts are in the header above;
+        // what follows is one definition per parameter and one per column, with
+        // an EOF after each list unless the client deprecated EOF. A column
+        // count here would be a packet no driver is waiting for.
+        let parameters: Vec<Column<'_>> = (0..params)
+            .map(|_| Column {
+                // A parameter has no name and no type until it is bound.
+                name: "?",
+                kind: Kind::Text,
+            })
+            .collect();
+        result::definitions(out, &mut self.seq, &parameters, status, deprecate);
+        result::definitions(out, &mut self.seq, &columns, status, deprecate);
 
         self.stmts.insert(id, Prepared { answer });
     }

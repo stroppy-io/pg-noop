@@ -449,9 +449,17 @@ fn a_prepared_statement_is_prepared_and_executed() {
     assert_eq!(params, 2);
     assert_eq!(r.u8(), Some(0x00), "reserved");
     assert_eq!(r.u16(), Some(0), "warnings");
-    // Two parameter definitions, then the column count and two definitions; no
-    // EOF anywhere because EOF was deprecated.
-    assert_eq!(packets.len(), 6, "{packets:?}");
+
+    // **The counts are in that header and nowhere else.** A prepare response is
+    // the OK packet, one definition per parameter, then one per column -- with
+    // no column-count packet in front of the columns, which is what a client
+    // would read as the start of the rows. EOF is deprecated here, so there is
+    // none between them either.
+    assert_eq!(packets.len(), 1 + 2 + 2, "{packets:?}");
+    assert!(
+        packets[1..].iter().all(|p| p[0] == 3),
+        "every packet after the header is a column definition: {packets:?}"
+    );
 
     let mut body = Vec::new();
     body.extend_from_slice(&id.to_le_bytes());
@@ -467,6 +475,23 @@ fn a_prepared_statement_is_prepared_and_executed() {
     // Executing it again is answered again; a prepared statement is not consumed.
     let packets = round_trip(&mut c, &command(cmd::STMT_EXECUTE, &body));
     assert_eq!(result_set(&packets).0, 2);
+}
+
+/// **The same response when EOF is not deprecated**: a definition per
+/// parameter, an EOF, a definition per column, an EOF -- and still no column
+/// count anywhere.
+#[test]
+fn a_prepare_response_without_deprecated_eof_has_two_eofs() {
+    let mut c = connected(CAPS & !CLIENT_DEPRECATE_EOF);
+    let packets = round_trip(&mut c, &command(cmd::STMT_PREPARE, b"select ? , ?"));
+
+    assert_eq!(packets.len(), 1 + 2 + 1 + 2 + 1, "{packets:?}");
+    assert_eq!(packets[3][0], 0xfe, "an EOF after the parameters");
+    assert_eq!(packets[6][0], 0xfe, "an EOF after the columns");
+    assert!(
+        packets[1..3].iter().all(|p| p[0] == 3) && packets[4..6].iter().all(|p| p[0] == 3),
+        "definitions on either side of the first EOF: {packets:?}"
+    );
 }
 
 /// **A statement that answers with an OK packet is prepared with no columns**,
