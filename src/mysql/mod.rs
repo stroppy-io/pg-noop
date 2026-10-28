@@ -359,7 +359,7 @@ impl Conn {
             // A connection that changes user or is reset starts over: no open
             // transaction, no prepared statements.
             cmd::CHANGE_USER | cmd::RESET_CONNECTION => {
-                self.pending.rollback();
+                self.pending.reset();
                 self.stmts.clear();
                 let status = self.status(false);
                 result::ok(out, &mut self.seq, 0, 0, status);
