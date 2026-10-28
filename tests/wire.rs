@@ -1349,3 +1349,50 @@ fn a_reset_connection_counts_no_rollback() {
         "a reset is not a rollback"
     );
 }
+
+/// **The NULL rule is the profile's, on both protocols.** Without `--profile tpcc` a
+/// NULL is data: a benchmark writing one into a nullable column is answered as the
+/// no-op it is, whether the NULL arrives as a literal or as a bound value.
+#[test]
+fn a_null_is_data_without_the_profile_on_both_ports() {
+    let plain = server_with_env(&[], &["--profile", "none"]);
+
+    let mut mysql = Client::connect(plain.mysql);
+    let answer = mysql.query("insert into t values (1, NULL, 3)");
+    assert_eq!(answer[0].body[0], 0x00, "a MySQL literal NULL: {answer:?}");
+
+    mysql.command(COM_STMT_PREPARE, b"insert into t values (?)");
+    let prepare = mysql.read();
+    let id = u32::from_le_bytes([
+        prepare.body[1],
+        prepare.body[2],
+        prepare.body[3],
+        prepare.body[4],
+    ]);
+    // The parameter's definition follows the header; an INSERT has no columns.
+    let definition = mysql.read();
+    assert_eq!(definition.body[0], 3, "the parameter's definition");
+    let mut body = Vec::new();
+    body.extend_from_slice(&id.to_le_bytes());
+    body.push(0x00);
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.push(0b0000_0001);
+    body.push(0x00);
+    mysql.command(COM_STMT_EXECUTE, &body);
+    let answer = mysql.read();
+    assert_eq!(answer.body[0], 0x00, "a MySQL bound NULL: {answer:?}");
+
+    let mut pg = PgClient::connect(plain.postgres);
+    let answer = pg.query("insert into t values (1, NULL, 3)");
+    assert!(
+        String::from_utf8_lossy(&answer[0].1).contains("INSERT 0 0"),
+        "a PostgreSQL literal NULL: {answer:?}"
+    );
+
+    // And the profile turns it back into an error.
+    let profiled = server();
+    let mut pg = PgClient::connect(profiled.postgres);
+    let answer = pg.query("insert into t values (1, NULL, 3)");
+    assert_eq!(answer[0].0, b'E', "with the profile: {answer:?}");
+    assert!(String::from_utf8_lossy(&answer[0].1).contains("23502"));
+}

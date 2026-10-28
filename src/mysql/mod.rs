@@ -674,7 +674,8 @@ impl Conn {
             }
             None => (false, false),
         };
-        if writes && null {
+        // The NULL rule is the profile's, as on the PostgreSQL side.
+        if tpcc::profile() && writes && null {
             self.error(out, 1048, "23000", "column cannot be null");
 
             return;

@@ -399,8 +399,10 @@ pub fn failure(sql: &str, dialect: Dialect) -> Option<Failure> {
         return Some(Failure::Raise);
     }
 
-    // A NULL in the statement's values.
-    if writes_null(trimmed, dialect) {
+    // A NULL in the statement's values, and only under the profile: without it a NULL
+    // is data, and a benchmark writing one into a nullable column is not injecting a
+    // failure.
+    if profile() && writes_null(trimmed, dialect) {
         return Some(Failure::Null);
     }
 
@@ -728,6 +730,7 @@ mod tests {
     /// The failures a client asks for are recognised, and nothing else is.
     #[test]
     fn an_injected_failure_is_recognised() {
+        let _state = state_guard(true, 10);
         assert_eq!(
             failure("SIGNAL SQLSTATE '45000'", Dialect::Postgres),
             Some(Failure::Signal("45000".to_string()))

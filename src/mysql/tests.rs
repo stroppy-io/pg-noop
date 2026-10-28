@@ -892,10 +892,42 @@ fn the_tpcc_rules_answer_with_numbers() {
     assert_eq!(row_value(&packets[3]), "1", "the first variable");
 }
 
+/// **With the profile off a NULL is data**, whether it arrives as a literal or in a
+/// prepared statement's bitmap.
+#[test]
+fn a_null_is_data_without_the_profile() {
+    let _state = tpcc::state_guard(false, 10);
+    let mut c = connected(CAPS);
+
+    let packets = round_trip(&mut c, &query("insert into t values (1, NULL, 3)"));
+    assert_eq!(packets.len(), 1);
+    assert_eq!(ok_status(&packets[0]), AUTOCOMMIT, "the literal");
+
+    let packets = round_trip(
+        &mut c,
+        &command(cmd::STMT_PREPARE, b"insert into t values (?)"),
+    );
+    let mut r = Reader::new(&packets[0]);
+    r.u8().expect("header");
+    let id = r.u32().expect("statement id");
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&id.to_le_bytes());
+    body.push(0x00);
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.push(0b0000_0001); // the parameter is NULL
+    body.push(0x00);
+    let packets = round_trip(&mut c, &command(cmd::STMT_EXECUTE, &body));
+
+    assert_eq!(packets.len(), 1);
+    assert_eq!(ok_status(&packets[0]), AUTOCOMMIT, "the bound NULL");
+}
+
 /// **A NULL in a prepared statement's bitmap fails a write**, the way a NULL literal
 /// does: the client sends it as a value, not as text.
 #[test]
 fn a_bound_null_fails_a_prepared_insert() {
+    let _state = tpcc::state_guard(true, 10);
     let mut c = connected(CAPS);
     let packets = round_trip(
         &mut c,
