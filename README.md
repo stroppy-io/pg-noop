@@ -419,10 +419,21 @@ one core, at which point the figure describes the client.
 
 ## What has not been verified here
 
-* **No real MySQL client library was driven against this server.** The sandbox
-  this branch was written in has no network and no MySQL client crate in its
-  registry, so the integration test drives the server with a client written
-  against the protocol itself (`tests/wire.rs`). That checks the framing, the
+* **No real MySQL client library was driven against this server** *in the
+  sandbox this branch was written in*: it has no network and no MySQL client
+  crate in its registry, so the integration test drives the server with a client
+  written against the protocol itself (`tests/wire.rs`). The CI job `Real
+  clients` does the other half — the official `mariadb` and `psql` binaries
+  against the release build — and it is the job to read first if a driver
+  refuses the greeting:
+
+  ```sh
+  act -j clients -P ubuntu-24.04=catthehacker/ubuntu:act-24.04 --bind \
+      --container-options "--security-opt seccomp=unconfined"
+  ```
+
+  The seccomp flag is what lets the job use io_uring; without it the server says
+  so and serves with epoll, which the job still passes. That checks the framing, the
   sequencing, the status flags and the result-set shapes a driver reads, but not
   a driver's own opinions — `mysql_async`'s handshake parsing, or MariaDB's
   connector, are untested. If one of them refuses the greeting, the first thing
