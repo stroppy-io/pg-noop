@@ -888,7 +888,7 @@ fn run_until(listener: TcpListener, codec: Codec, tuning: Tuning) -> io::Result<
         ..Shard::default()
     };
 
-    let outcome = passes(listener, codec, tuning, &mut shard);
+    let outcome = shard.serve(listener, codec, tuning);
 
     match finish(outcome, &mut shard.slots)? {
         Passed::NoRing(listener) => Ok(Attempt::NoRing(listener)),
@@ -991,470 +991,470 @@ fn ring_for_shard(setup: &Setup, tuning_entries: u32, refuse: bool) -> io::Resul
 }
 
 /// One shard's event loop, until the listener fails or a test asks it to stop.
-fn passes(
-    listener: TcpListener,
-    codec: Codec,
-    tuning: Tuning,
-    shard: &mut Shard,
-) -> io::Result<Passed> {
-    let plan = plan();
-    let setup = Setup {
-        cqsize: plan.setup.cqsize && CQSIZE.load(Ordering::Relaxed),
-        ..plan.setup
-    };
-    let mut ioring = match ring_for_shard(&setup, tuning.entries, ring_refused(&tuning)) {
-        Ok(r) => r,
-        // A shard that cannot have a ring must not die.
-        // Memory for rings is charged to the user, so a process with more shards than
-        // its budget allows has shards that cannot have one.
-        Err(e) => {
-            report_no_ring(&e);
+impl Shard {
+    /// One shard's event loop, until the listener fails or a test asks it to stop.
+    fn serve(&mut self, listener: TcpListener, codec: Codec, tuning: Tuning) -> io::Result<Passed> {
+        let plan = plan();
+        let setup = Setup {
+            cqsize: plan.setup.cqsize && CQSIZE.load(Ordering::Relaxed),
+            ..plan.setup
+        };
+        let mut ioring = match ring_for_shard(&setup, tuning.entries, ring_refused(&tuning)) {
+            Ok(r) => r,
+            // A self that cannot have a ring must not die.
+            // Memory for rings is charged to the user, so a process with more shards than
+            // its budget allows has shards that cannot have one.
+            Err(e) => {
+                report_no_ring(&e);
 
-            return Ok(Passed::NoRing(listener));
-        }
-    };
+                return Ok(Passed::NoRing(listener));
+            }
+        };
 
-    let (mut submit, sq, cq) = ioring.split();
+        let (mut submit, sq, cq) = ioring.split();
 
-    // Registration before the loop, on the very `Submitter` that will enter: the
-    // registered index is remembered by the `Submitter`, so registering on any other
-    // one would register nothing at all.
-    if plan.ring_fd {
-        if let Err(e) = submit.register_ring_fd() {
-            eprintln!(
-                "dbnoop: ring fd registration failed ({}); enters keep passing the raw fd",
-                errno_name(e.raw_os_error().unwrap_or(0))
-            );
-        }
-    }
-
-    shard.bufs = match plan.pbuf {
-        Some(_granted_incremental) => register_buffers(
-            &submit,
-            tuning.pbuf_count,
-            #[cfg(test)]
-            tuning.stats.clone(),
-        ),
-        None => None,
-    };
-
-    // Reported after the registration, not after the ring.
-    if let Some(report) = &tuning.report {
-        let _ = report.send(crate::protocol::Report::Serving {
-            protocol: codec.protocol(),
-            backend: Io::Uring,
-        });
-    }
-
-    #[cfg(test)]
-    if let Some(s) = &tuning.stats {
-        s.provided.store(shard.bufs.is_some(), Ordering::Relaxed);
-    }
-    #[cfg(test)]
-    if let Some(up) = &tuning.up {
-        up.store(true, Ordering::SeqCst);
-    }
-
-    let mut ring = Ring {
-        submit,
-        sq,
-        cq,
-        pass: Pass {
-            done: Vec::with_capacity(1024),
-            next: 0,
-        },
-        #[cfg(test)]
-        stats: tuning.stats.clone(),
-    };
-
-    let listen_fd = listener.as_raw_fd();
-
-    // Accept: one multishot request, re-armed only when the kernel says it is no longer
-    // holding it (`F_MORE` clear), and not at all while paused.
-    let mut accept_armed = false;
-    let mut accept_paused_until: Option<Instant> = None;
-
-    // The connections in startup, as a list rather than a scan.
-    let mut startup: Vec<usize> = Vec::new();
-    let mut earliest_startup: Option<Instant> = None;
-
-    // Slow connections, and the ring itself, come back to in a moment.
-
-    // Multishot receive is discovered from the kernel's answer, not from a version
-    // number: a kernel that does not know `IORING_RECV_MULTISHOT` answers the first
-    // receive with EINVAL, and every receive after that is a one-shot into a provided
-    let mut multishot = shard.bufs.is_some();
-    let mut scratch: Vec<usize> = Vec::new();
-
-    arm_accept(&mut ring, listen_fd, &mut accept_armed)?;
-
-    loop {
-        // A test asks the shard to stop so that its ring goes back to the process;
-        // nothing in the server sets this.
-        #[cfg(test)]
-        if let Some(stop) = &tuning.stop {
-            if stop.load(Ordering::Relaxed) {
-                return Ok(Passed::Served);
+        // Registration before the loop, on the very `Submitter` that will enter: the
+        // registered index is remembered by the `Submitter`, so registering on any other
+        // one would register nothing at all.
+        if plan.ring_fd {
+            if let Err(e) = submit.register_ring_fd() {
+                eprintln!(
+                    "dbnoop: ring fd registration failed ({}); enters keep passing the raw fd",
+                    errno_name(e.raw_os_error().unwrap_or(0))
+                );
             }
         }
 
-        // Wait for a completion, or for the earliest deadline.
-        // Two obligations of this shard are invisible to a completion: a paused accept,
-        // and a connection that has not completed startup.
-        #[cfg(test)]
-        let tick = tuning
-            .stop
-            .as_ref()
-            .map(|_| Instant::now() + Duration::from_millis(20));
-        #[cfg(not(test))]
-        let tick: Option<Instant> = None;
-
-        let deadline = match (accept_paused_until, earliest_startup, tick) {
-            (None, None, None) => None,
-            (a, b, c) => Some(a.into_iter().chain(b).chain(c).min().expect("one is Some")),
+        self.bufs = match plan.pbuf {
+            Some(_granted_incremental) => register_buffers(
+                &submit,
+                tuning.pbuf_count,
+                #[cfg(test)]
+                tuning.stats.clone(),
+            ),
+            None => None,
         };
 
-        ring.wait(deadline)?;
+        // Reported after the registration, not after the ring.
+        if let Some(report) = &tuning.report {
+            let _ = report.send(crate::protocol::Report::Serving {
+                protocol: codec.protocol(),
+                backend: Io::Uring,
+            });
+        }
 
-        // A deadline's arrival is read from the clock, never from the wait.
-        let expired = deadline.is_some_and(|at| Instant::now() >= at);
+        #[cfg(test)]
+        if let Some(s) = &tuning.stats {
+            s.provided.store(self.bufs.is_some(), Ordering::Relaxed);
+        }
+        #[cfg(test)]
+        if let Some(up) = &tuning.up {
+            up.store(true, Ordering::SeqCst);
+        }
 
-        ring.drain();
+        let mut ring = Ring {
+            submit,
+            sq,
+            cq,
+            pass: Pass {
+                done: Vec::with_capacity(1024),
+                next: 0,
+            },
+            #[cfg(test)]
+            stats: tuning.stats.clone(),
+        };
 
-        // By hand, not by iterator: a submission made while the pass is working can
-        // make the kernel answer at once (EBUSY, drained into the pass), and those
-        // completions belong to this pass.
-        let mut expiry_done = !expired;
+        let listen_fd = listener.as_raw_fd();
+
+        // Accept: one multishot request, re-armed only when the kernel says it is no longer
+        // holding it (`F_MORE` clear), and not at all while paused.
+        let mut accept_armed = false;
+        let mut accept_paused_until: Option<Instant> = None;
+
+        // The connections in startup, as a list rather than a scan.
+        let mut startup: Vec<usize> = Vec::new();
+        let mut earliest_startup: Option<Instant> = None;
+
+        // Slow connections, and the ring itself, come back to in a moment.
+
+        // Multishot receive is discovered from the kernel's answer, not from a version
+        // number: a kernel that does not know `IORING_RECV_MULTISHOT` answers the first
+        // receive with EINVAL, and every receive after that is a one-shot into a provided
+        let mut multishot = self.bufs.is_some();
+        let mut scratch: Vec<usize> = Vec::new();
+
+        arm_accept(&mut ring, listen_fd, &mut accept_armed)?;
+
         loop {
-            while let Some(Done { data, res, flags }) = ring.pass.next() {
-                let (idx, op) = untag(data);
+            // A test asks the self to stop so that its ring goes back to the process;
+            // nothing in the server sets this.
+            #[cfg(test)]
+            if let Some(stop) = &tuning.stop {
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(Passed::Served);
+                }
+            }
 
-                match op {
-                    OP_ACCEPT => {
-                        accept_armed = cqueue::more(flags);
+            // Wait for a completion, or for the earliest deadline.
+            // Two obligations of this self are invisible to a completion: a paused accept,
+            // and a connection that has not completed startup.
+            #[cfg(test)]
+            let tick = tuning
+                .stop
+                .as_ref()
+                .map(|_| Instant::now() + Duration::from_millis(20));
+            #[cfg(not(test))]
+            let tick: Option<Instant> = None;
 
-                        if res >= 0 {
-                            let fd = res as RawFd;
-                            // Nagle off: replies are tens of bytes and latency is what
-                            // a benchmark reads.
-                            set_nodelay(fd);
+            let deadline = match (accept_paused_until, earliest_startup, tick) {
+                (None, None, None) => None,
+                (a, b, c) => Some(a.into_iter().chain(b).chain(c).min().expect("one is Some")),
+            };
 
-                            let admitted = tuning.startup_timeout.map(|t| Instant::now() + t);
-                            let recycled = shard.spare.pop().unwrap_or_default();
-                            let idx = match shard.free.pop() {
-                                Some(i) => {
-                                    shard.slots[i] = Some(Slot::new(
-                                        fd,
-                                        admitted,
-                                        recycled,
-                                        &codec,
-                                        tuning.water,
-                                    ));
-                                    i
+            ring.wait(deadline)?;
+
+            // A deadline's arrival is read from the clock, never from the wait.
+            let expired = deadline.is_some_and(|at| Instant::now() >= at);
+
+            ring.drain();
+
+            // By hand, not by iterator: a submission made while the pass is working can
+            // make the kernel answer at once (EBUSY, drained into the pass), and those
+            // completions belong to this pass.
+            let mut expiry_done = !expired;
+            loop {
+                while let Some(Done { data, res, flags }) = ring.pass.next() {
+                    let (idx, op) = untag(data);
+
+                    match op {
+                        OP_ACCEPT => {
+                            accept_armed = cqueue::more(flags);
+
+                            if res >= 0 {
+                                let fd = res as RawFd;
+                                // Nagle off: replies are tens of bytes and latency is what
+                                // a benchmark reads.
+                                set_nodelay(fd);
+
+                                let admitted = tuning.startup_timeout.map(|t| Instant::now() + t);
+                                let recycled = self.spare.pop().unwrap_or_default();
+                                let idx = match self.free.pop() {
+                                    Some(i) => {
+                                        self.slots[i] = Some(Slot::new(
+                                            fd,
+                                            admitted,
+                                            recycled,
+                                            &codec,
+                                            tuning.water,
+                                        ));
+                                        i
+                                    }
+                                    None => {
+                                        self.slots.push(Some(Slot::new(
+                                            fd,
+                                            admitted,
+                                            recycled,
+                                            &codec,
+                                            tuning.water,
+                                        )));
+                                        self.slots.len() - 1
+                                    }
+                                };
+                                // MySQL speaks first.
+                                if let Some(prelude) = codec.prelude() {
+                                    if let Some(slot) = self.slots[idx].as_mut() {
+                                        slot.send.extend_from_slice(prelude);
+                                    }
+                                    submit_send(&mut ring, &mut self.slots, idx)?;
                                 }
-                                None => {
-                                    shard.slots.push(Some(Slot::new(
-                                        fd,
-                                        admitted,
-                                        recycled,
-                                        &codec,
-                                        tuning.water,
-                                    )));
-                                    shard.slots.len() - 1
+                                // Only a connection with a deadline belongs in the list the
+                                // expiry pass walks; without one it is an entry the pass
+                                // would drop for nothing.
+                                if let Some(at) = admitted {
+                                    startup.push(idx);
+                                    earliest_startup =
+                                        Some(earliest_startup.map_or(at, |e| e.min(at)));
                                 }
-                            };
-                            // MySQL speaks first.
-                            if let Some(prelude) = codec.prelude() {
-                                if let Some(slot) = shard.slots[idx].as_mut() {
-                                    slot.send.extend_from_slice(prelude);
-                                }
-                                submit_send(&mut ring, &mut shard.slots, idx)?;
-                            }
-                            // Only a connection with a deadline belongs in the list the
-                            // expiry pass walks; without one it is an entry the pass
-                            // would drop for nothing.
-                            if let Some(at) = admitted {
-                                startup.push(idx);
-                                earliest_startup = Some(earliest_startup.map_or(at, |e| e.min(at)));
-                            }
-                            arm_recv(
-                                &mut ring,
-                                &mut shard.slots,
-                                shard.bufs.as_ref(),
-                                idx,
-                                multishot,
-                            )?;
-                        } else {
-                            let err = -res;
-                            if accept_should_pause(err) {
-                                // Back off the ACCEPT, not the shard.
-                                accept_paused_until = Some(Instant::now() + ACCEPT_BACKOFF);
-                                eprintln!(
-                                    "dbnoop: accept failed with errno {err}; \
+                                arm_recv(
+                                    &mut ring,
+                                    &mut self.slots,
+                                    self.bufs.as_ref(),
+                                    idx,
+                                    multishot,
+                                )?;
+                            } else {
+                                let err = -res;
+                                if accept_should_pause(err) {
+                                    // Back off the ACCEPT, not the self.
+                                    accept_paused_until = Some(Instant::now() + ACCEPT_BACKOFF);
+                                    eprintln!(
+                                        "dbnoop: accept failed with errno {err}; \
                                  not re-arming accept for {}ms (other work continues)",
-                                    ACCEPT_BACKOFF.as_millis()
-                                );
-                            } else if err == libc::EBADF || err == libc::EINVAL {
-                                return Err(io::Error::from_raw_os_error(err));
+                                        ACCEPT_BACKOFF.as_millis()
+                                    );
+                                } else if err == libc::EBADF || err == libc::EINVAL {
+                                    return Err(io::Error::from_raw_os_error(err));
+                                }
+                            }
+
+                            // Only re-arm when the kernel is not still holding the request
+                            // and the pause has expired.
+                            let paused = accept_paused_until.is_some_and(|t| Instant::now() < t);
+                            if !accept_armed && !paused {
+                                accept_paused_until = None;
+                                arm_accept(&mut ring, listen_fd, &mut accept_armed)?;
                             }
                         }
 
-                        // Only re-arm when the kernel is not still holding the request
-                        // and the pause has expired.
-                        let paused = accept_paused_until.is_some_and(|t| Instant::now() < t);
-                        if !accept_armed && !paused {
-                            accept_paused_until = None;
+                        OP_RECV => {
+                            let more = cqueue::more(flags);
+                            let bid = cqueue::buffer_select(flags);
+
+                            // The buffer is the shard's, not the connection's.
+                            let Some(slot) = self.slots.get_mut(idx).and_then(|s| s.as_mut())
+                            else {
+                                if let (Some(bid), Some(b)) = (bid, self.bufs.as_mut()) {
+                                    b.put(bid);
+                                }
+                                continue;
+                            };
+                            slot.recv_armed = more;
+                            #[cfg(test)]
+                            if res > 0 {
+                                if let Some(s) = &tuning.stats {
+                                    s.reads.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            if res > 0 {
+                                // The connection is reading again, whatever it had to do
+                                // last time.
+                                slot.private = false;
+                            }
+
+                            // Where the bytes are, and which buffer must go back.
+                            let mut release: Option<u16> = None;
+                            let mut src: *const u8 = std::ptr::null();
+                            let mut n = 0usize;
+
+                            if let (Some(bid), Some(b)) = (bid, self.bufs.as_mut()) {
+                                // A one-shot descriptor is the whole of one read: the bytes
+                                // start at the buffer and the buffer goes back as soon as
+                                // the codec has seen them.
+                                b.take(bid);
+                                src = b.ptr(bid);
+                                n = res.max(0) as usize;
+                                release = Some(bid);
+                            } else if bid.is_none() && res > 0 {
+                                // No provided-buffer ring, or none left to give: the
+                                // receive went into this connection's own buffer.
+                                src = slot.recv.as_ptr();
+                                n = res as usize;
+                            }
+
+                            if res <= 0 {
+                                // An error can still carry a buffer.
+                                if let (Some(bid), Some(b)) = (release, self.bufs.as_mut()) {
+                                    b.put(bid);
+                                }
+
+                                let next = match res {
+                                    // ENOBUFS: every buffer in the ring was taken when the
+                                    // data arrived.
+                                    r if r == -libc::ENOBUFS => {
+                                        #[cfg(test)]
+                                        if let Some(s) = &tuning.stats {
+                                            s.enobufs.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        slot.private = true;
+                                        Next::Arm
+                                    }
+                                    // Cancelled: by a park of ours, whose own completion is
+                                    // what resumes the read side, or by a slot on its way
+                                    // out.
+                                    r if r == -libc::ECANCELED => {
+                                        after_cancel(slot.parked, slot.closing)
+                                    }
+                                    // A kernel that does not know multishot receive (or a
+                                    // provided buffer selected by the kernel) says so here,
+                                    // once.
+                                    r if (r == -libc::EINVAL || r == -libc::EOPNOTSUPP)
+                                        && multishot =>
+                                    {
+                                        multishot = false;
+                                        slot.private = true;
+                                        eprintln!(
+                                            "dbnoop: multishot receive unavailable ({}); \
+                                     one receive per read instead",
+                                            errno_name(-r)
+                                        );
+                                        Next::Arm
+                                    }
+                                    // Zero is the peer closing; any other error is the
+                                    // connection ending.
+                                    // Both close it.
+                                    _ => Next::Close,
+                                };
+
+                                ring.apply(idx, next, self, multishot)?;
+                                continue;
+                            }
+
+                            // The reply goes into `send` unless the kernel is still reading
+                            // `send`, in which case it goes into `staged`: a multishot
+                            // receive delivers while a send is outstanding.
+                            if slot.send.capacity() == 0 {
+                                slot.send.reserve(8 * 1024);
+                            }
+                            let out = if slot.sending {
+                                &mut slot.staged
+                            } else {
+                                &mut slot.send
+                            };
+
+                            // SAFETY: `src` points into a provided buffer this thread just
+                            // took out of the ring, or into the slot's own receive buffer,
+                            // and `n` is the byte count the kernel wrote there.
+                            let bytes = unsafe { std::slice::from_raw_parts(src, n) };
+
+                            crate::protocol::feed(
+                                &codec,
+                                &mut slot.session,
+                                &mut slot.pending,
+                                bytes,
+                                out,
+                            );
+
+                            // Only now: the codec has read what the buffer held.
+                            if let (Some(bid), Some(b)) = (release, self.bufs.as_mut()) {
+                                b.put(bid);
+                            }
+
+                            // Startup completed: this connection is no longer the one the
+                            // startup deadline is about.
+                            if !slot.session.awaiting_startup() {
+                                slot.startup_deadline = None;
+                            }
+
+                            #[cfg(test)]
+                            if let Some(s) = &tuning.stats {
+                                s.staged_high.fetch_max(slot.queued(), Ordering::Relaxed);
+                            }
+
+                            let next = next_for(slot);
+                            ring.apply(idx, next, self, multishot)?;
+                        }
+
+                        OP_SEND => {
+                            let next = {
+                                let Some(slot) = self.slots.get_mut(idx).and_then(|s| s.as_mut())
+                                else {
+                                    continue;
+                                };
+                                slot.sending = false;
+
+                                if res <= 0 {
+                                    Next::Close
+                                } else {
+                                    slot.sent += res as usize;
+
+                                    if slot.sent < slot.send.len() {
+                                        // A short write is normal under pressure; finish
+                                        // it.
+                                        Next::Send
+                                    } else {
+                                        slot.send.clear();
+                                        slot.sent = 0;
+
+                                        next_for(slot)
+                                    }
+                                }
+                            };
+                            ring.apply(idx, next, self, multishot)?;
+                        }
+
+                        OP_CANCEL => {
+                            let next = {
+                                let Some(slot) = self.slots.get_mut(idx).and_then(|s| s.as_mut())
+                                else {
+                                    continue;
+                                };
+                                after_cancel_request(slot, res)
+                            };
+                            ring.apply(idx, next, self, multishot)?;
+                        }
+
+                        _ => {
+                            // Nothing else is ever submitted with a tag of its own.
+                        }
+                    }
+                }
+
+                // The deadlines, once per pass, after the completions it began with.
+                // Only reached when at least one was pending; with none, `expired` is false
+                // and this pass is over.
+                if expiry_done {
+                    break;
+                }
+                expiry_done = true;
+
+                // A paused accept whose backoff has passed resumes here.
+                // Checked against the clock rather than assumed: the wait can also have
+                // been bounded by another deadline and returned early.
+                if let Some(t) = accept_paused_until {
+                    if Instant::now() >= t {
+                        accept_paused_until = None;
+                        if !accept_armed {
                             arm_accept(&mut ring, listen_fd, &mut accept_armed)?;
                         }
                     }
-
-                    OP_RECV => {
-                        let more = cqueue::more(flags);
-                        let bid = cqueue::buffer_select(flags);
-
-                        // The buffer is the shard's, not the connection's.
-                        let Some(slot) = shard.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
-                            if let (Some(bid), Some(b)) = (bid, shard.bufs.as_mut()) {
-                                b.put(bid);
-                            }
-                            continue;
-                        };
-                        slot.recv_armed = more;
-                        #[cfg(test)]
-                        if res > 0 {
-                            if let Some(s) = &tuning.stats {
-                                s.reads.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        if res > 0 {
-                            // The connection is reading again, whatever it had to do
-                            // last time.
-                            slot.private = false;
-                        }
-
-                        // Where the bytes are, and which buffer must go back.
-                        let mut release: Option<u16> = None;
-                        let mut src: *const u8 = std::ptr::null();
-                        let mut n = 0usize;
-
-                        if let (Some(bid), Some(b)) = (bid, shard.bufs.as_mut()) {
-                            // A one-shot descriptor is the whole of one read: the bytes
-                            // start at the buffer and the buffer goes back as soon as
-                            // the codec has seen them.
-                            b.take(bid);
-                            src = b.ptr(bid);
-                            n = res.max(0) as usize;
-                            release = Some(bid);
-                        } else if bid.is_none() && res > 0 {
-                            // No provided-buffer ring, or none left to give: the
-                            // receive went into this connection's own buffer.
-                            src = slot.recv.as_ptr();
-                            n = res as usize;
-                        }
-
-                        if res <= 0 {
-                            // An error can still carry a buffer.
-                            if let (Some(bid), Some(b)) = (release, shard.bufs.as_mut()) {
-                                b.put(bid);
-                            }
-
-                            let next = match res {
-                                // ENOBUFS: every buffer in the ring was taken when the
-                                // data arrived.
-                                r if r == -libc::ENOBUFS => {
-                                    #[cfg(test)]
-                                    if let Some(s) = &tuning.stats {
-                                        s.enobufs.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                    slot.private = true;
-                                    Next::Arm
-                                }
-                                // Cancelled: by a park of ours, whose own completion is
-                                // what resumes the read side, or by a slot on its way
-                                // out.
-                                r if r == -libc::ECANCELED => {
-                                    after_cancel(slot.parked, slot.closing)
-                                }
-                                // A kernel that does not know multishot receive (or a
-                                // provided buffer selected by the kernel) says so here,
-                                // once.
-                                r if (r == -libc::EINVAL || r == -libc::EOPNOTSUPP)
-                                    && multishot =>
-                                {
-                                    multishot = false;
-                                    slot.private = true;
-                                    eprintln!(
-                                        "dbnoop: multishot receive unavailable ({}); \
-                                     one receive per read instead",
-                                        errno_name(-r)
-                                    );
-                                    Next::Arm
-                                }
-                                // Zero is the peer closing; any other error is the
-                                // connection ending.
-                                // Both close it.
-                                _ => Next::Close,
-                            };
-
-                            ring.apply(idx, next, shard, multishot)?;
-                            continue;
-                        }
-
-                        // The reply goes into `send` unless the kernel is still reading
-                        // `send`, in which case it goes into `staged`: a multishot
-                        // receive delivers while a send is outstanding.
-                        if slot.send.capacity() == 0 {
-                            slot.send.reserve(8 * 1024);
-                        }
-                        let out = if slot.sending {
-                            &mut slot.staged
-                        } else {
-                            &mut slot.send
-                        };
-
-                        // SAFETY: `src` points into a provided buffer this thread just
-                        // took out of the ring, or into the slot's own receive buffer,
-                        // and `n` is the byte count the kernel wrote there.
-                        let bytes = unsafe { std::slice::from_raw_parts(src, n) };
-
-                        crate::protocol::feed(
-                            &codec,
-                            &mut slot.session,
-                            &mut slot.pending,
-                            bytes,
-                            out,
-                        );
-
-                        // Only now: the codec has read what the buffer held.
-                        if let (Some(bid), Some(b)) = (release, shard.bufs.as_mut()) {
-                            b.put(bid);
-                        }
-
-                        // Startup completed: this connection is no longer the one the
-                        // startup deadline is about.
-                        if !slot.session.awaiting_startup() {
-                            slot.startup_deadline = None;
-                        }
-
-                        #[cfg(test)]
-                        if let Some(s) = &tuning.stats {
-                            s.staged_high.fetch_max(slot.queued(), Ordering::Relaxed);
-                        }
-
-                        let next = next_for(slot);
-                        ring.apply(idx, next, shard, multishot)?;
-                    }
-
-                    OP_SEND => {
-                        let next = {
-                            let Some(slot) = shard.slots.get_mut(idx).and_then(|s| s.as_mut())
-                            else {
-                                continue;
-                            };
-                            slot.sending = false;
-
-                            if res <= 0 {
-                                Next::Close
-                            } else {
-                                slot.sent += res as usize;
-
-                                if slot.sent < slot.send.len() {
-                                    // A short write is normal under pressure; finish
-                                    // it.
-                                    Next::Send
-                                } else {
-                                    slot.send.clear();
-                                    slot.sent = 0;
-
-                                    next_for(slot)
-                                }
-                            }
-                        };
-                        ring.apply(idx, next, shard, multishot)?;
-                    }
-
-                    OP_CANCEL => {
-                        let next = {
-                            let Some(slot) = shard.slots.get_mut(idx).and_then(|s| s.as_mut())
-                            else {
-                                continue;
-                            };
-                            after_cancel_request(slot, res)
-                        };
-                        ring.apply(idx, next, shard, multishot)?;
-                    }
-
-                    _ => {
-                        // Nothing else is ever submitted with a tag of its own.
-                    }
-                }
-            }
-
-            // The deadlines, once per pass, after the completions it began with.
-            // Only reached when at least one was pending; with none, `expired` is false
-            // and this pass is over.
-            if expiry_done {
-                break;
-            }
-            expiry_done = true;
-
-            // A paused accept whose backoff has passed resumes here.
-            // Checked against the clock rather than assumed: the wait can also have
-            // been bounded by another deadline and returned early.
-            if let Some(t) = accept_paused_until {
-                if Instant::now() >= t {
-                    accept_paused_until = None;
-                    if !accept_armed {
-                        arm_accept(&mut ring, listen_fd, &mut accept_armed)?;
-                    }
-                }
-            }
-
-            // Connections still in startup whose deadline has passed, walked as the
-            // list of connections that are in startup rather than as every slot on the
-            // shard.
-            let now = Instant::now();
-            let mut next: Option<Instant> = None;
-            scratch.clear();
-            for idx in startup.drain(..) {
-                let deadline = shard
-                    .slots
-                    .get_mut(idx)
-                    .and_then(|s| s.as_mut())
-                    .and_then(|slot| slot.startup_deadline);
-                let Some(at) = deadline else {
-                    // The slot is gone, or its connection finished startup: either way
-                    // this entry has no deadline to speak for.
-                    continue;
-                };
-                if at > now {
-                    next = Some(next.map_or(at, |n| n.min(at)));
-                    scratch.push(idx);
-                    continue;
                 }
 
-                if let Some(slot) = shard.slots.get_mut(idx).and_then(|s| s.as_mut()) {
-                    if slot.session.awaiting_startup() {
-                        eprintln!(
-                            "dbnoop: connection did not complete startup within {}ms; closing",
-                            tuning.startup_timeout.map_or(0, |t| t.as_millis())
-                        );
+                // Connections still in startup whose deadline has passed, walked as the
+                // list of connections that are in startup rather than as every slot on the
+                // self.
+                let now = Instant::now();
+                let mut next: Option<Instant> = None;
+                scratch.clear();
+                for idx in startup.drain(..) {
+                    let deadline = self
+                        .slots
+                        .get_mut(idx)
+                        .and_then(|s| s.as_mut())
+                        .and_then(|slot| slot.startup_deadline);
+                    let Some(at) = deadline else {
+                        // The slot is gone, or its connection finished startup: either way
+                        // this entry has no deadline to speak for.
+                        continue;
+                    };
+                    if at > now {
+                        next = Some(next.map_or(at, |n| n.min(at)));
+                        scratch.push(idx);
+                        continue;
                     }
-                    slot.startup_deadline = None;
-                }
 
-                // `shutdown`, not `close`: a receive in flight may not be freed, and
-                // shutting down makes it return 0 so the ordinary path reaps it.
-                ring.apply(idx, Next::Close, shard, multishot)?;
+                    if let Some(slot) = self.slots.get_mut(idx).and_then(|s| s.as_mut()) {
+                        if slot.session.awaiting_startup() {
+                            eprintln!(
+                                "dbnoop: connection did not complete startup within {}ms; closing",
+                                tuning.startup_timeout.map_or(0, |t| t.as_millis())
+                            );
+                        }
+                        slot.startup_deadline = None;
+                    }
+
+                    // `shutdown`, not `close`: a receive in flight may not be freed, and
+                    // shutting down makes it return 0 so the ordinary path reaps it.
+                    ring.apply(idx, Next::Close, self, multishot)?;
+                }
+                std::mem::swap(&mut startup, &mut scratch);
+                earliest_startup = next;
             }
-            std::mem::swap(&mut startup, &mut scratch);
-            earliest_startup = next;
+
+            // Every completion this pass was given has been processed -- including the ones
+            // that arrived while it was working.
+            // Only now may they be dropped.
+            ring.finish();
         }
-
-        // Every completion this pass was given has been processed -- including the ones
-        // that arrived while it was working.
-        // Only now may they be dropped.
-        ring.finish();
     }
 }
 
@@ -1530,7 +1530,7 @@ fn wait_for_work(submit: &io_uring::Submitter<'_>, deadline: Option<Instant>) ->
     }
 }
 
-/// What a failed ring operation means for the shard.
+/// What a failed ring operation means for the self.
 #[derive(Debug, PartialEq, Eq)]
 enum Retry {
     /// The kernel was interrupted before it could do anything.
@@ -1808,7 +1808,7 @@ fn reap(
 }
 
 /// The shard's provided-buffer ring: one registered array of descriptors and one block
-/// of buffers, shared by every connection on the shard.
+/// of buffers, shared by every connection on the self.
 struct BufRing {
     /// The descriptor ring, page aligned as the interface requires, and the buffers it
     /// describes.
@@ -2718,7 +2718,7 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// A buffer ring the kernel refuses is not a dead shard.
+    /// A buffer ring the kernel refuses is not a dead self.
     #[test]
     fn a_refused_buffer_ring_falls_back_to_per_connection_buffers() {
         let ring = build(&Setup::default(), 64).expect("a plain ring builds");
@@ -3414,7 +3414,7 @@ mod tests {
         );
 
         // Another connection is served normally while the first is parked: the park is
-        // per-connection, not per-shard.
+        // per-connection, not per-self.
         let mut polite = TcpStream::connect(addr).expect("connect");
         polite.set_nodelay(true).expect("nodelay");
         polite
