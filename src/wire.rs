@@ -1082,9 +1082,9 @@ impl Conn {
                 // columns here.
                 if bind.result_formats > 1 {
                     let columns = match plan.kind {
-                        PlanKind::SelectMeta { .. } | PlanKind::SelectStub { .. } => {
-                            resolve_columns(plan, catalog).len()
-                        }
+                        PlanKind::SelectMeta { .. }
+                        | PlanKind::SelectStub { .. }
+                        | PlanKind::Constant(_) => resolve_columns(plan, catalog).len(),
                         _ => 0,
                     };
                     if bind.result_formats != columns {
@@ -1465,33 +1465,21 @@ fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Ru
     }
 
     match &plan.kind {
-        PlanKind::SelectMeta { .. } | PlanKind::SelectStub { .. } => {
-            let cols = resolve_columns(plan, catalog);
+        // **A constant select answers one row, and nothing else does.** The
+        // values are the statement's own: no data is involved, so the row is
+        // true-shaped on both protocols.
+        PlanKind::Constant(items) => {
             if run.describe {
-                row_description_of(&cols, run.formats, out);
+                row_description(plan, catalog, run.formats, out);
             }
 
-            // A portal already read to its end has nothing more: PostgreSQL
-            // answers `SELECT 0` with no row, and so does this.
             if run.consumed {
                 complete(out, "SELECT", Some(0));
 
                 return true;
             }
 
-            // A metadata select answers empty; a stub select answers one row.
-            if matches!(plan.kind, PlanKind::SelectMeta { .. }) && cols.resolved() {
-                complete(out, "SELECT", Some(0));
-
-                return true;
-            }
-
-            data_row(out, &cols, run.formats);
-
-            // The one row is also the last one, but with a limit of one the
-            // server cannot know that until it looks for the next -- which is
-            // why PostgreSQL answers PortalSuspended here, and the next
-            // Execute finds the end.
+            constant_row(items, out, run.formats);
             if run.max_rows == 1 {
                 portal_suspended(out);
             } else {
@@ -1500,9 +1488,23 @@ fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Ru
 
             return true;
         }
-        PlanKind::Insert => complete_raw(out, "INSERT 0 1"),
-        PlanKind::Update => complete_raw(out, "UPDATE 1"),
-        PlanKind::Delete => complete_raw(out, "DELETE 1"),
+        // **A select that names data answers no rows.** The columns are real --
+        // the catalog's when it knows the table, stubs when it does not -- but a
+        // row would have to be invented, and an invented row is what made the
+        // same client find every item on PostgreSQL and none on MySQL.
+        PlanKind::SelectMeta { .. } | PlanKind::SelectStub { .. } => {
+            if run.describe {
+                row_description(plan, catalog, run.formats, out);
+            }
+            complete(out, "SELECT", Some(0));
+
+            return true;
+        }
+        // **Nothing was written, so nothing is reported written** -- the tags the
+        // README documents.
+        PlanKind::Insert => complete_raw(out, "INSERT 0 0"),
+        PlanKind::Update => complete_raw(out, "UPDATE 0"),
+        PlanKind::Delete => complete_raw(out, "DELETE 0"),
         PlanKind::Begin => complete_raw(out, "BEGIN"),
         PlanKind::Commit if run.failed => {
             // Committing a failed transaction rolls it back, and the tag says
@@ -1659,6 +1661,27 @@ fn district_answer(out: &mut Vec<u8>, run: Run<'_>) -> bool {
     true
 }
 
+/// One DataRow of the values a constant select stated, in the format the portal
+/// asked for.
+fn constant_row(items: &[crate::sql::Constant], out: &mut Vec<u8>, formats: &Formats) {
+    msg(out, b'D', |b| {
+        b.extend_from_slice(&(items.len() as i16).to_be_bytes());
+        for (i, item) in items.iter().enumerate() {
+            match (item.kind, formats.get(i) == 1) {
+                (crate::sql::ConstantKind::Integer, true) => {
+                    let n: i64 = item.value.parse().unwrap_or_default();
+                    b.extend_from_slice(&8i32.to_be_bytes());
+                    b.extend_from_slice(&n.to_be_bytes());
+                }
+                _ => {
+                    b.extend_from_slice(&(item.value.len() as i32).to_be_bytes());
+                    b.extend_from_slice(item.value.as_bytes());
+                }
+            }
+        }
+    });
+}
+
 /// How one execution of a plan is to be answered.
 struct Run<'a> {
     /// Whether to send RowDescription first: the simple protocol does, and
@@ -1790,57 +1813,6 @@ fn error_with_severity(out: &mut Vec<u8>, severity: &str, code: &str, message: &
     });
 }
 
-/// One DataRow, every value a `1`, encoded per column in the format the
-/// portal asked for.
-///
-/// Text is the one byte `1` whatever the type. Binary is the type's own wire
-/// form -- eight bytes for an int8, four for an int4, one for a bool -- which
-/// is what a driver that read the RowDescription will decode. The row used to
-/// be text regardless of what Bind asked: pgx, which asks for binary int8 by
-/// default, then failed with `invalid length for int8: 1`.
-fn data_row(out: &mut Vec<u8>, cols: &Columns, formats: &Formats) {
-    msg(out, b'D', |b| {
-        b.extend_from_slice(&(cols.len() as i16).to_be_bytes());
-        for i in 0..cols.len() {
-            if formats.get(i) == 1 {
-                binary_one(b, cols.oid(i));
-            } else {
-                b.extend_from_slice(&1i32.to_be_bytes());
-                b.push(b'1');
-            }
-        }
-    });
-}
-
-/// The value 1 in the binary send format of the type `oid`, with its length.
-fn binary_one(b: &mut Vec<u8>, oid: u32) {
-    fn field(b: &mut Vec<u8>, bytes: &[u8]) {
-        b.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
-        b.extend_from_slice(bytes);
-    }
-
-    match oid {
-        // bool
-        16 => field(b, &[1]),
-        // int2, int4, int8
-        21 => field(b, &1i16.to_be_bytes()),
-        23 => field(b, &1i32.to_be_bytes()),
-        20 => field(b, &1i64.to_be_bytes()),
-        // float4, float8
-        700 => field(b, &1f32.to_be_bytes()),
-        701 => field(b, &1f64.to_be_bytes()),
-        // numeric: one base-10000 digit, weight 0, positive, scale 0, digit 1.
-        1700 => field(b, &[0, 1, 0, 0, 0, 0, 0, 0, 0, 1]),
-        // date: days since 2000-01-01. timestamp, timestamptz: microseconds
-        // since then. Zero is a valid value of each; "1" would not be.
-        1082 => field(b, &0i32.to_be_bytes()),
-        1114 | 1184 => field(b, &0i64.to_be_bytes()),
-        // text, varchar, bpchar, bytea, json and anything else whose binary
-        // form is its bytes.
-        _ => field(b, b"1"),
-    }
-}
-
 /// The columns a SELECT answers with: the catalog's, when it knows the table,
 /// or `n` stubs. Resolved once per answer and used for both the
 /// RowDescription and the DataRow, so the two cannot disagree.
@@ -1849,6 +1821,8 @@ enum Columns {
     /// allocated Strings.
     Stub(usize),
     Known(Vec<(String, u32)>),
+    /// A constant select's items: the statement's own text and value types.
+    Constant(Vec<crate::sql::Constant>),
 }
 
 impl Columns {
@@ -1856,17 +1830,15 @@ impl Columns {
         match self {
             Columns::Stub(n) => *n,
             Columns::Known(cols) => cols.len(),
+            Columns::Constant(items) => items.len(),
         }
-    }
-
-    fn resolved(&self) -> bool {
-        matches!(self, Columns::Known(_))
     }
 
     fn name(&self, i: usize) -> &str {
         match self {
             Columns::Stub(_) => STUB_COL,
             Columns::Known(cols) => &cols[i].0,
+            Columns::Constant(items) => &items[i].name,
         }
     }
 
@@ -1874,6 +1846,10 @@ impl Columns {
         match self {
             Columns::Stub(_) => 20,
             Columns::Known(cols) => cols[i].1,
+            Columns::Constant(items) => match items[i].kind {
+                crate::sql::ConstantKind::Integer => 20,
+                crate::sql::ConstantKind::Text => 25,
+            },
         }
     }
 }
@@ -1885,6 +1861,7 @@ fn resolve_columns(plan: &PreparedPlan, catalog: &CatalogView) -> Columns {
             None => Columns::Stub(columns.len().max(1)),
         },
         PlanKind::SelectStub { columns } => Columns::Stub(*columns),
+        PlanKind::Constant(items) => Columns::Constant(items.clone()),
         _ => Columns::Stub(0),
     }
 }
@@ -1908,6 +1885,12 @@ fn row_description(
     }
     if crate::tpcc::show_status(&plan.sql).is_some() {
         status_description(formats, out);
+
+        return true;
+    }
+
+    if let PlanKind::Constant(items) = &plan.kind {
+        row_description_of(&Columns::Constant(items.clone()), formats, out);
 
         return true;
     }
@@ -3819,11 +3802,13 @@ mod tests {
             .iter()
             .all(|f| f.as_ref().unwrap().len() == 8));
 
+        // **The values are the statement's**, not a stub: `select 1, 2` answers
+        // 1 and 2, each in the format its column was asked for.
         let out = query_with_formats(&mut c, &v, "select 1, 2", &[0, 1]);
         assert_eq!(row_description_formats(&out), vec![0, 1]);
         let fields = data_row_fields(&out);
         assert_eq!(fields[0], Some(b"1".to_vec()));
-        assert_eq!(fields[1], Some(1i64.to_be_bytes().to_vec()));
+        assert_eq!(fields[1], Some(2i64.to_be_bytes().to_vec()));
     }
 
     /// A select from a table the catalog knows describes the client's own
@@ -3849,33 +3834,6 @@ mod tests {
         );
         let text = String::from_utf8_lossy(&out);
         assert!(text.contains("SELECT 0"), "{text}");
-    }
-
-    /// The binary form of `1` per type the catalog can announce. Only int8
-    /// reaches a DataRow today (stub columns are int8, and a known table
-    /// answers no rows), but the RowDescription can promise any of these and
-    /// the encoder has to keep that promise if a row is ever sent.
-    #[test]
-    fn binary_one_is_each_types_own_wire_form() {
-        let one = |oid: u32| {
-            let mut b = Vec::new();
-            binary_one(&mut b, oid);
-            let len = i32::from_be_bytes(b[..4].try_into().unwrap()) as usize;
-            assert_eq!(b.len(), 4 + len, "oid {oid}: length prefix matches");
-            b[4..].to_vec()
-        };
-
-        assert_eq!(one(16), vec![1], "bool");
-        assert_eq!(one(21), 1i16.to_be_bytes(), "int2");
-        assert_eq!(one(23), 1i32.to_be_bytes(), "int4");
-        assert_eq!(one(20), 1i64.to_be_bytes(), "int8");
-        assert_eq!(one(700), 1f32.to_be_bytes(), "float4");
-        assert_eq!(one(701), 1f64.to_be_bytes(), "float8");
-        assert_eq!(one(1700), vec![0, 1, 0, 0, 0, 0, 0, 0, 0, 1], "numeric 1");
-        assert_eq!(one(1082), 0i32.to_be_bytes(), "date: 2000-01-01");
-        assert_eq!(one(1114), 0i64.to_be_bytes(), "timestamp");
-        assert_eq!(one(25), b"1", "text");
-        assert_eq!(one(1043), b"1", "varchar");
     }
 
     /// Describe of a STATEMENT has no portal and so no formats: PostgreSQL

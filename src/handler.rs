@@ -3,15 +3,15 @@ use std::fmt::Debug;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use async_trait::async_trait;
+use futures::stream;
 use futures::Sink;
-use futures::{future, stream};
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
-    CopyResponse, DataRowEncoder, DescribePortalResponse, DescribeResponse,
-    DescribeStatementResponse, FieldFormat, FieldInfo, QueryResponse, Response, Tag,
+    CopyResponse, DescribePortalResponse, DescribeResponse, DescribeStatementResponse, FieldFormat,
+    FieldInfo, QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, Type};
@@ -1427,13 +1427,28 @@ fn table_lookup_keys(table_name: &[String]) -> Vec<String> {
 /// Builds a single DataRow with `n` columns, each containing int64(1).
 /// Mirrors the stroppy noop driver's one-row stub: using 1 rather than 0
 /// prevents workload guards like `if (nameCount === 0) throw` from tripping.
-fn stub_row(fields: &Arc<Vec<FieldInfo>>) -> QueryResponse {
-    let mut encoder = DataRowEncoder::new(Arc::clone(fields));
-    for _ in 0..fields.len() {
-        encoder.encode_field(&1i64).unwrap();
-    }
-    let row = encoder.take_row();
-    QueryResponse::new(Arc::clone(fields), stream::once(future::ready(Ok(row))))
+/// The fields of a constant select list: one per item, typed the way the value
+/// is sent.
+fn constant_fields(items: &[crate::sql::Constant]) -> Arc<Vec<FieldInfo>> {
+    Arc::new(
+        items
+            .iter()
+            .map(|item| {
+                let oid = match item.kind {
+                    crate::sql::ConstantKind::Integer => 20, // int8
+                    crate::sql::ConstantKind::Text => 25,    // text
+                };
+
+                FieldInfo::new(
+                    item.name.clone(),
+                    None,
+                    None,
+                    Type::from_oid(oid).unwrap_or(Type::INT8),
+                    FieldFormat::Text,
+                )
+            })
+            .collect(),
+    )
 }
 
 fn empty_query(fields: &Arc<Vec<FieldInfo>>) -> QueryResponse {
@@ -1494,10 +1509,15 @@ pub enum PlanKind {
         table: Vec<String>,
         columns: Vec<SelectColumn>,
     },
-    /// A SELECT that names no table: hand back n stub columns.
+    /// A SELECT that names no table and no literal: `n` stub columns and no
+    /// rows, which is what a SELECT on a table the server has never seen also
+    /// answers. One row shape for both protocols: a row is something the server
+    /// can only state for a constant select list (see `PlanKind::Constant`).
     SelectStub {
         columns: usize,
     },
+    /// A select list of literals and variables: one row of exactly those values.
+    Constant(Vec<crate::sql::Constant>),
     Insert,
     Update,
     Delete,
@@ -1549,11 +1569,22 @@ impl PreparedPlan {
             || head.eq_ignore_ascii_case("TABLE")
             || head.eq_ignore_ascii_case("VALUES")
         {
-            match parse_metadata_select(sql) {
-                Some((table, columns)) => PlanKind::SelectMeta { table, columns },
-                None => PlanKind::SelectStub {
-                    columns: count_select_columns(sql),
-                },
+            // **A literal answers a row; anything naming data answers none.**
+            // `select 1` and `select @@version` are values the server can state
+            // without knowing anything, and both protocols answer them the same
+            // way. A table, a column or a function is a row the server does not
+            // have, whether or not DDL has been seen for the table: the same
+            // plain-SQL client must not find every item on one protocol and none
+            // on the other.
+            if let Some(items) = crate::sql::constant_select(sql) {
+                PlanKind::Constant(items)
+            } else {
+                match parse_metadata_select(sql) {
+                    Some((table, columns)) => PlanKind::SelectMeta { table, columns },
+                    None => PlanKind::SelectStub {
+                        columns: count_select_columns(sql),
+                    },
+                }
             }
         } else if head.eq_ignore_ascii_case("INSERT") {
             PlanKind::Insert
@@ -1597,6 +1628,7 @@ impl PreparedPlan {
                     .unwrap_or_else(|| stub_fields(columns.len().max(1))),
             ),
             PlanKind::SelectStub { columns } => Some(stub_fields(*columns)),
+            PlanKind::Constant(items) => Some(constant_fields(items)),
             _ => None,
         }
     }
@@ -1644,21 +1676,21 @@ impl QueryParser for PlanParser {
 fn respond_to_plan(handler: &NoopHandler, plan: &PreparedPlan) -> Response {
     match &plan.kind {
         PlanKind::SelectMeta { table, columns } => {
-            match handler.fields_for_parsed_select(table, columns) {
-                Some(fields) => Response::Query(empty_query(&fields)),
-                None => {
-                    let fields = stub_fields(columns.len().max(1));
-                    Response::Query(stub_row(&fields))
-                }
-            }
+            // A table the catalog has not seen gets stub fields and no rows: a
+            // row is not something this server can state for a table.
+            let fields = handler
+                .fields_for_parsed_select(table, columns)
+                .unwrap_or_else(|| stub_fields(columns.len().max(1)));
+
+            Response::Query(empty_query(&fields))
         }
-        PlanKind::SelectStub { columns } => {
-            let fields = stub_fields(*columns);
-            Response::Query(stub_row(&fields))
-        }
-        PlanKind::Insert => Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(1)),
-        PlanKind::Update => Response::Execution(Tag::new("UPDATE").with_rows(1)),
-        PlanKind::Delete => Response::Execution(Tag::new("DELETE").with_rows(1)),
+        PlanKind::SelectStub { columns } => Response::Query(empty_query(&stub_fields(*columns))),
+        PlanKind::Constant(items) => Response::Query(empty_query(&constant_fields(items))),
+        // **Nothing was written, so nothing is reported written.** The tags say
+        // what the README says: a no-op changes no rows.
+        PlanKind::Insert => Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(0)),
+        PlanKind::Update => Response::Execution(Tag::new("UPDATE").with_rows(0)),
+        PlanKind::Delete => Response::Execution(Tag::new("DELETE").with_rows(0)),
         PlanKind::Begin => Response::TransactionStart(Tag::new("BEGIN")),
         PlanKind::Commit => Response::TransactionEnd(Tag::new("COMMIT")),
         PlanKind::Rollback => Response::TransactionEnd(Tag::new("ROLLBACK")),
@@ -1703,16 +1735,16 @@ fn classify_simple(handler: &NoopHandler, sql: &str) -> Vec<Response> {
         } else {
             let n = count_select_columns(sql);
             let fields = stub_fields(n);
-            vec![Response::Query(stub_row(&fields))]
+            vec![Response::Query(empty_query(&fields))]
         }
     } else if head.eq_ignore_ascii_case("INSERT") {
         vec![Response::Execution(
-            Tag::new("INSERT").with_oid(0).with_rows(1),
+            Tag::new("INSERT").with_oid(0).with_rows(0),
         )]
     } else if head.eq_ignore_ascii_case("UPDATE") {
-        vec![Response::Execution(Tag::new("UPDATE").with_rows(1))]
+        vec![Response::Execution(Tag::new("UPDATE").with_rows(0))]
     } else if head.eq_ignore_ascii_case("DELETE") {
-        vec![Response::Execution(Tag::new("DELETE").with_rows(1))]
+        vec![Response::Execution(Tag::new("DELETE").with_rows(0))]
     } else if head.eq_ignore_ascii_case("BEGIN") {
         vec![Response::TransactionStart(Tag::new("BEGIN"))]
     } else if head.eq_ignore_ascii_case("COMMIT") {
@@ -1769,14 +1801,14 @@ fn classify_extended(handler: &NoopHandler, sql: &str) -> Response {
         } else {
             let n = count_select_columns(sql);
             let fields = stub_fields(n);
-            Response::Query(stub_row(&fields))
+            Response::Query(empty_query(&fields))
         }
     } else if head.eq_ignore_ascii_case("INSERT") {
-        Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(1))
+        Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(0))
     } else if head.eq_ignore_ascii_case("UPDATE") {
-        Response::Execution(Tag::new("UPDATE").with_rows(1))
+        Response::Execution(Tag::new("UPDATE").with_rows(0))
     } else if head.eq_ignore_ascii_case("DELETE") {
-        Response::Execution(Tag::new("DELETE").with_rows(1))
+        Response::Execution(Tag::new("DELETE").with_rows(0))
     } else if head.eq_ignore_ascii_case("BEGIN") {
         Response::TransactionStart(Tag::new("BEGIN"))
     } else if head.eq_ignore_ascii_case("COMMIT") {

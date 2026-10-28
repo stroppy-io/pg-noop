@@ -740,7 +740,10 @@ fn a_command_split_across_packets_is_one_command() {
     // The answer follows the command's LAST packet, which is the second one.
     let packets = packets_from(&out, 2);
     let (columns, rows, status) = result_set(&packets);
-    assert_eq!((columns, rows, status), (1, 0, AUTOCOMMIT));
+    // `select 1` inside a comment is still the literal: one row, and the one
+    // piece it was split across did not become two statements.
+    assert_eq!((columns, rows, status), (1, 1, AUTOCOMMIT));
+    assert_eq!(row_value(&packets[2]), "1");
 }
 
 /// A packet that is still incomplete is not consumed: the caller keeps it and

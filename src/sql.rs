@@ -270,6 +270,167 @@ pub fn select_list(sql: &str) -> Option<&str> {
     Some(list)
 }
 
+/// One item of a constant select list: the text a client wrote, the value the
+/// server answers, and what kind of value it is.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Constant {
+    pub name: String,
+    pub value: String,
+    pub kind: ConstantKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConstantKind {
+    /// A number, sent in the type a client reads numbers with.
+    Integer,
+    /// A string, or a system variable's value.
+    Text,
+}
+
+/// **A select list of literals and variables**, which is a row the server can
+/// state without knowing anything about the data.
+///
+/// `select 1` answers one row on both protocols -- PostgreSQL has always said
+/// one and MySQL said none, and a `mariadb -e 'select 1'` that printed nothing
+/// reads as a broken server. Anything else a SELECT can name -- a table, a
+/// column, a function -- is a row the server does not have, and answers none.
+///
+/// `None` when the statement is not such a select: it does not start with
+/// `SELECT`, it names a table, or an item is not a literal or a variable.
+pub fn constant_select(sql: &str) -> Option<Vec<Constant>> {
+    // A select over rows is not a row of constants.
+    if find_keyword(sql, first_word(sql).len(), "FROM").is_some() {
+        return None;
+    }
+    let list = select_list(sql)?;
+
+    let mut items = Vec::new();
+    for item in split_top_level(list) {
+        items.push(constant_item(trim_leading(item))?);
+    }
+    if items.is_empty() {
+        return None;
+    }
+
+    Some(items)
+}
+
+/// One item of a select list, when it is a literal or a variable.
+fn constant_item(item: &str) -> Option<Constant> {
+    // A trailing comment is not part of the value: `select 1 /* padding */` is
+    // still the literal 1, which is what a padded query is for.
+    let item = strip_trailing_comment(item).trim_end();
+    if item.is_empty() {
+        return None;
+    }
+
+    // A quoted string: its own text, without the quotes.
+    if let Some(inner) = item.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        if inner.len() + 2 != item.len() {
+            return None;
+        }
+
+        return Some(Constant {
+            name: item.to_string(),
+            value: inner.replace("''", "'"),
+            kind: ConstantKind::Text,
+        });
+    }
+
+    // `@@name`, `@@session.name`, `@name`: a variable, by the value a client
+    // reads it as.
+    for prefix in ["@@", "@"] {
+        if let Some(name) = item.strip_prefix(prefix) {
+            if prefix == "@" && name.starts_with('@') {
+                continue;
+            }
+            let name = name
+                .strip_prefix("session.")
+                .or_else(|| name.strip_prefix("global."))
+                .or_else(|| name.strip_prefix("local."))
+                .unwrap_or(name);
+            let (value, kind) = variable(name.trim_matches('`'))?;
+
+            return Some(Constant {
+                name: item.to_string(),
+                value,
+                kind,
+            });
+        }
+    }
+
+    // An integer literal.
+    if let Ok(n) = item.parse::<i64>() {
+        return Some(Constant {
+            name: item.to_string(),
+            value: n.to_string(),
+            kind: ConstantKind::Integer,
+        });
+    }
+
+    None
+}
+
+/// A statement item with any trailing comment removed.
+fn strip_trailing_comment(item: &str) -> &str {
+    let bytes = item.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => i = skip_quoted(bytes, i),
+            b'-' | b'#' | b'/' => match skip_comment(bytes, i) {
+                Some(_) => return &item[..i],
+                None => i += 1,
+            },
+            _ => i += 1,
+        }
+    }
+
+    item
+}
+
+/// The value of a variable a client reads at connect.
+///
+/// Every one of these is a fact about a MariaDB the caller believes it is
+/// talking to, and a driver that reads one at connect needs a value it can
+/// parse: an empty result set is a driver that cannot start. Names beyond the
+/// table answer `1` -- a plausible number -- because a variable this server has
+/// never heard of is still one a client is entitled to an answer for.
+fn variable(name: &str) -> Option<(String, ConstantKind)> {
+    let text = |value: &str| Some((value.to_string(), ConstantKind::Text));
+    let number = |value: &str| Some((value.to_string(), ConstantKind::Integer));
+
+    match name.to_ascii_lowercase().as_str() {
+        "version" => text(crate::mysql::SERVER_VERSION),
+        "version_comment" => text("db-noop: a no-op server for measuring clients"),
+        "max_allowed_packet" => number("16777216"),
+        "autocommit" => number("1"),
+        "auto_increment_increment" => number("1"),
+        "auto_increment_offset" => number("1"),
+        "tx_isolation" | "transaction_isolation" => text("REPEATABLE-READ"),
+        "tx_read_only" | "transaction_read_only" | "read_only" => number("0"),
+        "sql_mode" => text(""),
+        "character_set_client"
+        | "character_set_connection"
+        | "character_set_results"
+        | "character_set_database"
+        | "character_set_server" => text("utf8mb4"),
+        "collation_connection" | "collation_server" | "collation_database" => {
+            text("utf8mb4_general_ci")
+        }
+        "time_zone" => text("SYSTEM"),
+        "system_time_zone" => text("UTC"),
+        "lower_case_table_names" => number("0"),
+        "net_write_timeout" | "net_read_timeout" | "wait_timeout" | "interactive_timeout" => {
+            number("28800")
+        }
+        "init_connect" => text(""),
+        "license" => text("MIT OR Apache-2.0"),
+        "have_query_cache" => text("NO"),
+        _ => number("1"),
+    }
+}
+
 /// Skip a quoted run, `i` at its opening quote. A doubled quote inside is an
 /// escaped one, which is how SQL spells a quote in a literal.
 pub fn skip_quoted(bytes: &[u8], i: usize) -> usize {
@@ -492,6 +653,36 @@ mod tests {
             Some("Com%")
         );
         assert_eq!(quoted_argument("show global status", "LIKE"), None);
+    }
+
+    /// **A constant select is literals and variables, and nothing else.** Both
+    /// protocols answer one row for it and no rows for anything that names data.
+    #[test]
+    fn a_constant_select_is_literals_and_variables() {
+        let items = constant_select("select 1, 'abc', @@version").expect("a constant select");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].value, "1");
+        assert_eq!(items[0].kind, ConstantKind::Integer);
+        assert_eq!(items[1].value, "abc");
+        assert_eq!(items[1].kind, ConstantKind::Text);
+        assert_eq!(items[2].value, crate::mysql::SERVER_VERSION);
+
+        // A trailing clause is a clause, not part of the list, and neither is a
+        // trailing comment: a padded query is still the literal it pads.
+        let items = constant_select("select 1 limit 1").expect("still constant");
+        assert_eq!(items.len(), 1);
+        let items = constant_select("select 1 /* padding */").expect("still constant");
+        assert_eq!(items[0].value, "1");
+
+        for sql in [
+            "select a from t",
+            "select 1 from t",
+            "select now()",
+            "select a",
+            "insert into t values (1)",
+        ] {
+            assert_eq!(constant_select(sql), None, "{sql}");
+        }
     }
 
     /// The words of a statement skip literals, identifiers and comments, so a
