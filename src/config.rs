@@ -165,7 +165,27 @@ pub fn ring_plan(shards: usize, budget: Option<usize>, max_buffers: u16) -> Ring
 
 /// `DBNOOP_PBUF` (`PGNOOP_PBUF` is the old name), when the operator set it.
 pub fn pbuf_override() -> Option<u16> {
-    env("PBUF").and_then(|v| v.trim().parse::<u16>().ok())
+    match parse_env::<u16>("PBUF", env("PBUF")) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("dbnoop: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Read a config file: absent is the defaults, malformed is an error that names it.
+///
+/// A file the operator wrote and got wrong is not the same as no file: silently
+/// ignoring it runs a server on defaults while the operator believes otherwise.
+fn read_config(path: &std::path::Path) -> Result<FileConfig, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FileConfig::default()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+
+    serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The config file to read when `--config` does not name one.
@@ -321,10 +341,13 @@ impl Config {
             Some(path) => path,
             None => env("CONFIG").map(PathBuf::from).unwrap_or_else(config_path),
         };
-        let file: FileConfig = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let file: FileConfig = match read_config(&path) {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("dbnoop: {e}");
+                std::process::exit(2);
+            }
+        };
 
         let default_workers = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -362,6 +385,12 @@ impl Config {
                 std::process::exit(2);
             }
         };
+
+        // `DBNOOP_FAIL_RING` is read by the loop, so a bad one is caught here.
+        if let Err(e) = parse_env::<i64>("FAIL_RING", env("FAIL_RING")) {
+            eprintln!("dbnoop: {e}");
+            std::process::exit(2);
+        }
 
         // Only a profile this server has is accepted, and the answer says which ones
         // those are: a typo must not silently measure the wrong thing.
@@ -503,6 +532,35 @@ mod tests {
         }
         #[cfg(not(target_os = "linux"))]
         assert_eq!(memlock_bytes(), None);
+    }
+
+    /// **A config file that does not parse is a startup error naming it**, and
+    /// an absent one is the defaults.
+    #[test]
+    fn a_malformed_config_file_names_itself() {
+        let dir = std::env::temp_dir().join(format!("dbnoop-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+
+        let absent = dir.join("absent.json");
+        assert!(
+            read_config(&absent)
+                .map(|f| f.port.is_none())
+                .unwrap_or(false),
+            "absent is the defaults"
+        );
+
+        let bad = dir.join("bad.json");
+        std::fs::write(&bad, "{\"port\": }").expect("write");
+        match read_config(&bad) {
+            Err(e) => assert!(e.contains("bad.json"), "{e}"),
+            Ok(_) => panic!("a malformed file must be an error"),
+        }
+
+        let wrong = dir.join("wrong.json");
+        std::fs::write(&wrong, "[1, 2, 3]").expect("write");
+        assert!(read_config(&wrong).is_err(), "an array is not a config");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A value that does not parse is an error, not "disabled".
