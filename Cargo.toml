@@ -1,16 +1,26 @@
 [package]
-name = "pg-noop"
-version = "0.2.0"
+name = "db-noop"
+version = "0.3.0"
 edition = "2021"
-description = "NoOp PostgreSQL blackhole server for benchmarking"
+description = "NoOp PostgreSQL and MySQL/MariaDB server for measuring benchmark clients"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/stroppy-io/pg-noop"
-keywords = ["postgresql", "benchmark", "database", "noop", "blackhole"]
+keywords = ["postgresql", "mysql", "benchmark", "database", "noop"]
 categories = ["database", "command-line-utilities"]
+
+[lib]
+name = "db_noop"
+path = "src/lib.rs"
+
+# The server, under two names: `dbnoop` is its own, and `pgnoop` is the one every
+# script written for the PostgreSQL-only server already uses.
+[[bin]]
+name = "dbnoop"
+path = "src/bin/dbnoop.rs"
 
 [[bin]]
 name = "pgnoop"
-path = "src/main.rs"
+path = "src/bin/pgnoop.rs"
 
 [dependencies]
 pgwire = { version = "0.38", default-features = false, features = ["server-api-ring"] }
