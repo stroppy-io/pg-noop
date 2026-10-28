@@ -14,14 +14,14 @@ rows, whether or not DDL was seen; `INSERT`/`UPDATE`/`DELETE` answer
 
 PostgreSQL used to answer a row of `1`s for an unseen table while MySQL answered
 none, so the same plain-SQL client found every item on one protocol and nothing on
-the other — and its cost depended on which port it was pointed at.
+the other - and its cost depended on which port it was pointed at.
 
 ## Counted at COMMIT, on both protocols
 
 The transaction kind is noted on the connection, folded into the counters at
 COMMIT, and dropped by ROLLBACK; a COMMIT of a failed transaction discards, as its
 tag already says. Autocommit is one transaction per statement, so a client that
-never says `BEGIN` — HammerDB's stored-procedure path does not — still moves the
+never says `BEGIN` - HammerDB's stored-procedure path does not - still moves the
 counters a TPM check reads. Counting when the statement ran inflated NOPM by every
 failed transaction, and counting only explicit COMMITs made PostgreSQL report zero.
 

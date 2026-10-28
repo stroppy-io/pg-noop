@@ -2,7 +2,7 @@
 
 ## 0.3.0
 
-The crate is `db-noop`, the binary is `dbnoop`, and `pgnoop` still runs — the same
+The crate is `db-noop`, the binary is `dbnoop`, and `pgnoop` still runs - the same
 program under the older name.
 
 **MySQL / MariaDB.** A wire-protocol listener on `--mysql-port` (off by default):

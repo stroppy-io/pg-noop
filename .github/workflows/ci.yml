@@ -76,7 +76,7 @@ jobs:
           cat server.log
           exit 1
 
-      - name: MySQL — select 1, NOPM, transaction, status
+      - name: MySQL - select 1, NOPM, transaction, status
         run: |
           set -euo pipefail
           # **The district sum is a DELTA, not a figure.** The counters are the
@@ -112,7 +112,7 @@ jobs:
           # inside it does not commit on its own.
           $MYSQL_CLIENT -h 127.0.0.1 -P 13306 -u root -e "begin; select 1; commit"
 
-      - name: PostgreSQL — select 1, NOPM, transaction
+      - name: PostgreSQL - select 1, NOPM, transaction
         run: |
           set -euo pipefail
           # The same delta rule as the MySQL step: the counter is the server's and

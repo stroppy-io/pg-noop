@@ -8,7 +8,7 @@ this file; the reasoning is in
 **~220–330 ns**. That is the number that decides whether a comparison is about the
 clients.
 
-## B — the hot path
+## B - the hot path
 
 **B1. Classify once, at Parse.** `wire.rs:1444` rescans the SQL on every Execute
 (`tpcc::number_query`, `tpcc::statement_kind`) and `row_description`
@@ -42,7 +42,7 @@ completions through a `Vec`; `uring.rs:780` calls `sq.sync()` per push. Prebuild
 constant replies at Parse, carry the tail as a ring offset, iterate completions in
 place, sync once per pass, and use `min_wait` where the kernel grants it.
 
-## C — logging, injection, reporting
+## C - logging, injection, reporting
 
 **C1. Call-site logging into a per-shard ring.** The loop calls `eprintln!`
 (`uring.rs:1386`, `1489`, `1672`, `lib.rs:265`, `399`, `409`): formatting and a

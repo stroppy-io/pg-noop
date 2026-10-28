@@ -788,7 +788,7 @@ mod copy_columns {
 
     /// The index came from the trimmed string and sliced the untrimmed one.
     /// `upper.find(" FROM ")` counts bytes in `sql.trim().to_ascii_uppercase()`, and
-    /// `&sql[..i]` then cuts the ORIGINAL — short by exactly the leading whitespace.
+    /// `&sql[..i]` then cuts the ORIGINAL - short by exactly the leading whitespace.
     #[test]
     fn leading_whitespace_does_not_shift_the_from_offset() {
         for (sql, want) in [

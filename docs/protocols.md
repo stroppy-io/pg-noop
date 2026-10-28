@@ -21,7 +21,7 @@ What each protocol is answered with. The rules behind it are in
 
 Both **simple query** (psql) and **extended query** (pgx, psycopg3, JDBC) are
 supported, and there is no authentication: every connection is accepted. The
-codec is `wire::Conn` — sans-io, so one read batch produces at most one write.
+codec is `wire::Conn` - sans-io, so one read batch produces at most one write.
 
 ## MySQL / MariaDB
 
