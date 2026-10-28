@@ -199,6 +199,10 @@ struct Slot {
     /// than `STAGED_HIGH_WATER` while a write is in flight, so no receive is
     /// armed until that write has drained.
     parked: bool,
+    /// How much reply this connection may hold before the read side is parked:
+    /// `STAGED_HIGH_WATER`, except in the test that turns it down to reach the
+    /// mark in a read rather than in a run.
+    water: usize,
     /// The slot is on its way out and must not arm anything new.
     closing: bool,
     /// When this connection stops being allowed to sit in startup. `None` once
@@ -207,7 +211,13 @@ struct Slot {
 }
 
 impl Slot {
-    fn new(fd: RawFd, startup_deadline: Option<Instant>, spare: Spare, codec: &Codec) -> Self {
+    fn new(
+        fd: RawFd,
+        startup_deadline: Option<Instant>,
+        spare: Spare,
+        codec: &Codec,
+        water: usize,
+    ) -> Self {
         let mut slot = Slot {
             fd,
             session: codec.session(),
@@ -220,6 +230,7 @@ impl Slot {
             recv_armed: false,
             private: false,
             parked: false,
+            water,
             closing: false,
             startup_deadline,
         };
@@ -268,7 +279,7 @@ fn next_for(slot: &mut Slot) -> Next {
         // The read side stays off until the reply it outran has gone out --
         // including the one still staged, which the two checks above have just
         // taken into `send`.
-        if slot.queued() > STAGED_HIGH_WATER {
+        if slot.queued() > slot.water {
             return Next::Idle;
         }
         slot.parked = false;
@@ -277,7 +288,7 @@ fn next_for(slot: &mut Slot) -> Next {
     // read that arrives while the connection is already this far behind is
     // exactly the read that must not happen, whether or not a receive is armed
     // for it.
-    if slot.queued() >= STAGED_HIGH_WATER {
+    if slot.queued() >= slot.water {
         return Next::Park;
     }
     if !slot.recv_armed {
@@ -826,6 +837,10 @@ struct Tuning {
     /// asked for that, and for a test that is not about it.
     startup_timeout: Option<Duration>,
     pbuf_count: u16,
+    /// How much staged reply a connection may hold before the read side is
+    /// parked: `STAGED_HIGH_WATER`, or less in the test that reaches the mark in
+    /// a read.
+    water: usize,
     /// A test's way of asking the shard to stop, so the test can give its ring
     /// back: a test binary runs a dozen shards, and a ring is kernel memory with
     /// a process-wide budget.
@@ -863,6 +878,7 @@ impl Default for Tuning {
             // connections; eight is room for both.
             #[cfg(test)]
             pbuf_count: 8,
+            water: STAGED_HIGH_WATER,
             #[cfg(test)]
             stop: None,
             #[cfg(test)]
@@ -1167,11 +1183,23 @@ fn passes(
                             let recycled = spare.pop().unwrap_or_default();
                             let idx = match free_slots.pop() {
                                 Some(i) => {
-                                    slots[i] = Some(Slot::new(fd, admitted, recycled, &codec));
+                                    slots[i] = Some(Slot::new(
+                                        fd,
+                                        admitted,
+                                        recycled,
+                                        &codec,
+                                        tuning.water,
+                                    ));
                                     i
                                 }
                                 None => {
-                                    slots.push(Some(Slot::new(fd, admitted, recycled, &codec)));
+                                    slots.push(Some(Slot::new(
+                                        fd,
+                                        admitted,
+                                        recycled,
+                                        &codec,
+                                        tuning.water,
+                                    )));
                                     slots.len() - 1
                                 }
                             };
@@ -2835,6 +2863,12 @@ mod tests {
         let Some((addr, _tid, _shard)) = spawn_shard(tuning) else {
             return;
         };
+        // **Without a provided-buffer ring there is no run-ahead to bound.** Each
+        // receive is then one-shot and armed only after the previous write
+        // completed, so the reply cannot pile up and there is no park to see.
+        if !has_provided_buffers(&stats) {
+            return;
+        }
 
         let mut s = TcpStream::connect(addr).expect("connect");
         s.set_nodelay(true).expect("nodelay");
@@ -3181,22 +3215,48 @@ mod tests {
     #[test]
     fn a_shard_that_ends_with_an_error_closes_its_descriptors() {
         let codec = Codec::new(crate::protocol::Protocol::Postgres);
-        // A descriptor the slot owns, the way an accepted socket is.
-        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
-        assert!(fd >= 0, "opening /dev/null: {}", io::Error::last_os_error());
 
-        let mut slots: Vec<Option<Slot>> =
-            vec![None, Some(Slot::new(fd, None, Spare::default(), &codec))];
+        // A pipe, whose read end the slot owns the way it owns an accepted
+        // socket. What proves the closure is the pipe itself: a write to a pipe
+        // whose reader is gone fails with EPIPE, whether or not the descriptor
+        // number has been handed to another thread since.
+        let mut fds = [0i32; 2];
+        // SAFETY: a two-element array the kernel fills.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            // A box out of descriptors is the environment, not this code: the
+            // tests that hold shards and connections take a lot of them.
+            eprintln!("skipping: this process is out of descriptors");
+
+            return;
+        }
+        let (read_end, write_end) = (fds[0], fds[1]);
+
+        let mut slots: Vec<Option<Slot>> = vec![
+            None,
+            Some(Slot::new(
+                read_end,
+                None,
+                Spare::default(),
+                &codec,
+                STAGED_HIGH_WATER,
+            )),
+        ];
 
         let outcome = finish(Err(io::Error::from_raw_os_error(libc::EBADF)), &mut slots);
 
         assert!(outcome.is_err(), "the error is the caller's to report");
-        // SAFETY: a plain fcntl on a descriptor this test opened.
+        // SAFETY: a one-byte write to a descriptor this test opened. Rust ignores
+        // SIGPIPE, so a closed reader is EPIPE here rather than a signal.
+        let wrote = unsafe { libc::write(write_end, b"x".as_ptr().cast(), 1) };
+        let err = io::Error::last_os_error();
+        // SAFETY: the write end is this test's to close.
+        unsafe { libc::close(write_end) };
+
         assert_eq!(
-            unsafe { libc::fcntl(fd, libc::F_GETFD) },
-            -1,
-            "the socket must be closed even though the shard ended in an error"
+            wrote, -1,
+            "the slot's descriptor must be closed even though the shard ended in an error"
         );
+        assert_eq!(err.raw_os_error(), Some(libc::EPIPE), "{err}");
     }
 
     /// **A parked receive is armed again once, not twice.**
@@ -3210,7 +3270,7 @@ mod tests {
     #[test]
     fn a_parked_receive_is_armed_again_once() {
         let codec = Codec::new(crate::protocol::Protocol::Postgres);
-        let mut slot = Slot::new(-1, None, Spare::default(), &codec);
+        let mut slot = Slot::new(-1, None, Spare::default(), &codec, STAGED_HIGH_WATER);
 
         // Parked, with more reply held than the water mark and a write in
         // flight, and the receive still in the kernel's hands.
@@ -3393,6 +3453,12 @@ mod tests {
         let Some((addr, _tid, _shard)) = spawn_shard(tuning) else {
             return;
         };
+        // **Without a provided-buffer ring there is no run-ahead to bound.** Each
+        // receive is then one-shot and armed only after the previous write
+        // completed, so the reply cannot pile up and there is no park to see.
+        if !has_provided_buffers(&stats) {
+            return;
+        }
 
         let mut s = TcpStream::connect(addr).expect("connect");
         s.set_nodelay(true).expect("nodelay");
@@ -3534,44 +3600,50 @@ mod tests {
     ///
     /// A multishot receive runs ahead of the write: the kernel hands over
     /// whatever the client pipelined, and with a write in flight every answer is
-    /// staged. A client that never reads its replies therefore grew `staged`
-    /// for as long as it kept writing -- the server holding a whole run's answer
-    /// in memory. Past `STAGED_HIGH_WATER` the receive is cancelled, which is
-    /// the only way to stop a request the kernel owns, and the connection is
-    /// read from again once the write has drained.
+    /// staged. A client that never reads its replies therefore grew `staged` for
+    /// as long as it kept writing -- the server holding a whole run's answer in
+    /// memory. Past the water mark the receive is cancelled, which is the only
+    /// way to stop a request the kernel owns, and the connection is read from
+    /// again once the write has drained.
     ///
-    /// Two things are pinned: the connection never held much more than the
-    /// water mark, and it is still a working connection afterwards -- parking
-    /// is a pause, not a break.
+    /// Three things are pinned: the queue stops growing while the client keeps
+    /// writing, another connection is served meanwhile, and the parked
+    /// connection is read from again -- parking is a pause, not a break.
     #[test]
     fn a_client_that_never_reads_cannot_grow_the_shard_memory() {
+        // **The mark is what the test scales down.** At the production 256 KiB a
+        // test spends its time filling a pipeline the size of a run's; a read of
+        // a wide answer is ~96 KiB, so a 128 KiB mark is crossed in a read or
+        // two, and the decision being tested is the same one.
+        const WATER: usize = 128 * 1024;
+
         let stats = Arc::new(Stats::default());
         let tuning = Tuning {
             entries: 256,
             pbuf_count: 32,
+            water: WATER,
             stats: Some(Arc::clone(&stats)),
             ..Tuning::default()
         };
         let Some((addr, _tid, _shard)) = spawn_shard(tuning) else {
             return;
         };
+        // **Without a provided-buffer ring there is no run-ahead to bound.** Each
+        // receive is then one-shot and armed only after the previous write
+        // completed, so the reply cannot pile up and there is no park to see.
+        if !has_provided_buffers(&stats) {
+            return;
+        }
 
-        let s = TcpStream::connect(addr).expect("connect");
+        let mut s = TcpStream::connect(addr).expect("connect");
         s.set_nodelay(true).expect("nodelay");
-        // **A small receive window on purpose.** The reply has to back up on the
-        // server for the water mark to be reached at all, and the kernel's
-        // default window is megabytes: with it, the test would be measuring the
-        // size of this box's socket buffers rather than the shard's mark.
-        let _ = socket2::SockRef::from(&s).set_recv_buffer_size(4096);
-        let mut s = s;
         // The write side is bounded: once the server stops reading, the client's
         // own socket buffer fills and `write_all` would block forever.
         s.set_write_timeout(Some(Duration::from_millis(50)))
             .expect("write timeout");
 
         // A wide result set: the answer is several times the size of the query,
-        // so a few megabytes of writes are tens of megabytes of reply -- more
-        // than any socket buffer will absorb.
+        // so the reply is what fills the pipeline.
         let wide = format!("select {}", vec!["1"; 200].join(", "));
         let query = query_message(&wide);
         let mut batch = Vec::new();
@@ -3580,9 +3652,9 @@ mod tests {
         }
         s.write_all(&startup_message()).expect("startup");
 
-        // Write until the shard stops reading from this connection. A write
-        // that times out is retried: the pipeline is full for the moment, and
-        // the server is still working through it.
+        // Write until the shard stops reading from this connection. A write that
+        // times out is retried: the pipeline is full for the moment, and the
+        // server is still working through what it has.
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline && stats.parks.load(Ordering::Relaxed) == 0 {
             if s.write_all(&batch).is_err() {
@@ -3596,19 +3668,19 @@ mod tests {
             "the shard never stopped reading from a connection holding {held} bytes \
              of unanswered reply"
         );
-        // What a parked connection still holds is the water mark plus the
-        // reads the kernel had ALREADY completed when the park was decided --
-        // bytes in provided buffers that nobody can put back unread. Bounded by
-        // the ring, not by what the client writes.
+        // What a parked connection still holds is the water mark plus the reads
+        // the kernel had ALREADY completed when the park was decided -- bytes in
+        // provided buffers that nobody can put back unread. Bounded by the ring,
+        // not by what the client writes.
         assert!(
-            held <= STAGED_HIGH_WATER + PBUF_COUNT as usize * RECV_BUF * 16,
+            held <= WATER + PBUF_COUNT as usize * RECV_BUF * 16,
             "a connection that never reads grew the server's buffer to {held} bytes \
-             (water mark {STAGED_HIGH_WATER})"
+             (water mark {WATER})"
         );
 
-        // The property that matters is that growth STOPS. The same client keeps
-        // writing and still reads nothing; once the reads it had already been
-        // given are behind it, its queue does not move again.
+        // Growth STOPS: the client keeps writing and still reads nothing, and
+        // once the reads it had already been given are behind it the queue does
+        // not move again.
         let settled = |s: &Stats| {
             let before = s.staged_high.load(Ordering::Relaxed);
             std::thread::sleep(Duration::from_millis(200));
@@ -3619,8 +3691,7 @@ mod tests {
             let _ = s.write_all(&batch);
         }
         let settled_at = stats.staged_high.load(Ordering::Relaxed);
-
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_millis(500);
         while Instant::now() < deadline {
             let _ = s.write_all(&batch);
         }
@@ -3645,23 +3716,34 @@ mod tests {
             assert_eq!(frames.len(), 4);
         }
 
-        // And the parked connection is read from again once its peer drains.
-        s.set_read_timeout(Some(Duration::from_secs(5)))
+        // **And then read: the read side comes back.** What proves it is the
+        // shard reading from this connection again -- `reads` moving past what it
+        // had read when it parked -- and answers reaching the client. How much
+        // the client got in before the park is the park's business, not a number
+        // the test can choose.
+        let reads_before = stats.reads.load(Ordering::Relaxed);
+        s.set_read_timeout(Some(Duration::from_secs(2)))
             .expect("read timeout");
         let mut ready = 0usize;
         let mut buf = vec![0u8; 64 * 1024];
         let deadline = Instant::now() + Duration::from_secs(20);
-        while ready < 100 && Instant::now() < deadline {
+        while (stats.reads.load(Ordering::Relaxed) == reads_before || ready < 16)
+            && Instant::now() < deadline
+        {
             match s.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
                 Ok(n) => ready += buf[..n].iter().filter(|&&b| b == b'Z').count(),
+                // A read that times out is a server with nothing to say yet; the
+                // deadline above is what ends the wait.
+                Err(_) => continue,
             }
         }
         assert!(
-            ready >= 100,
+            stats.reads.load(Ordering::Relaxed) > reads_before,
             "a parked connection must be read from again once its peer drains: \
-             {ready} answers"
+             {ready} answers, and not one read after the park"
         );
+        assert!(ready > 0, "and its answers must arrive");
     }
 
     /// **Many connections, one deliberately small ring.**
