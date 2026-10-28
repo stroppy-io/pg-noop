@@ -1,10 +1,11 @@
-//! Drive the server over a real socket with a MySQL client.
+//! Drive the server over a real socket, in both protocols.
 //!
 //! There is no MySQL client crate in this workspace's registry, and a sandbox
-//! without a network cannot fetch one, so the client here is written against the
-//! same protocol the server speaks -- which has an advantage for this job: a
-//! driver would hide exactly the packets being tested (a terminator, a sequence
-//! number, a status flag).
+//! without a network cannot fetch one, so the MySQL client here is written
+//! against the same protocol the server speaks -- which has an advantage for
+//! this job: a driver would hide exactly the packets being tested (a
+//! terminator, a sequence number, a status flag). The PostgreSQL side uses the
+//! same approach, in a few hundred bytes of framing.
 //!
 //! What it drives is the REAL server: the binary this workspace builds, on a
 //! port the kernel picks, through the same accept, receive and send path
@@ -821,5 +822,42 @@ impl PgClient {
         frames.pop();
 
         frames
+    }
+}
+
+/// **Both binary names serve.** `dbnoop` is the name; `pgnoop` is what the
+/// scripts written for the PostgreSQL-only server call, and an upgrade that
+/// dropped it would break them at their next run.
+#[test]
+fn both_binary_names_serve() {
+    for binary in [env!("CARGO_BIN_EXE_dbnoop"), env!("CARGO_BIN_EXE_pgnoop")] {
+        let child = Command::new(binary)
+            .args([
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "0",
+                "--mysql-port",
+                "0",
+                "--workers",
+                "1",
+            ])
+            .env("DBNOOP_PBUF", "4")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the binary starts");
+        let server = banner(child);
+
+        let mut pg = PgClient::connect(server.postgres);
+        let answer: Vec<(u8, String)> = pg
+            .query("select 1")
+            .into_iter()
+            .map(|(tag, body)| (tag, String::from_utf8_lossy(&body).to_string()))
+            .collect();
+        assert!(
+            answer.iter().any(|(tag, _)| *tag == b'T'),
+            "{binary} did not answer a query: {answer:?}"
+        );
     }
 }
