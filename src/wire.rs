@@ -1541,8 +1541,14 @@ fn status_answer(out: &mut Vec<u8>, run: Run<'_>, filter: Option<&str>) -> bool 
     }
 
     let rows = crate::tpcc::status_rows(filter);
+    // **Execute's row limit is honoured here too**: this is the one answer with more
+    // than one row, so it is the one a limit can truncate.
+    let limit = usize::try_from(run.max_rows).unwrap_or(0);
     let mut written = 0u64;
-    for (name, value) in &rows {
+    for (name, value) in rows
+        .iter()
+        .take(if limit == 0 { rows.len() } else { limit })
+    {
         let value = value.to_string();
         msg(out, b'D', |b| {
             b.extend_from_slice(&2i16.to_be_bytes());
@@ -1554,7 +1560,7 @@ fn status_answer(out: &mut Vec<u8>, run: Run<'_>, filter: Option<&str>) -> bool 
         written += 1;
     }
 
-    if run.max_rows > 0 && written >= run.max_rows as u64 {
+    if limit > 0 && rows.len() > limit {
         portal_suspended(out);
 
         return true;
@@ -2876,6 +2882,19 @@ mod tests {
             "and the Sync after it is still answered, so the stream is in sync"
         );
         assert!(framed < input.len());
+    }
+
+    /// **Execute's row limit truncates a multi-row answer.** `show global status`
+    /// answers two rows; a portal asked for one gets one and `PortalSuspended`.
+    #[test]
+    fn a_row_limit_truncates_a_multi_row_answer() {
+        let _state = crate::tpcc::state_guard(true, 10);
+
+        let (mut c, v) = connected();
+        bind_p1(&mut c, &v, "show global status");
+
+        let out = execute(&mut c, &v, "p1", 1);
+        assert_eq!(tags(&out), vec![b'D', b's', b'Z'], "{out:?}");
     }
 
     /// **A NULL bound into an INSERT is the same failure a NULL literal is.** The
