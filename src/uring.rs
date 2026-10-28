@@ -48,6 +48,7 @@ use std::time::{Duration, Instant};
 
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 
+use crate::config::Io;
 use crate::protocol::{Codec, Session};
 
 /// One provided buffer's size. The same as the per-connection receive buffer
@@ -813,17 +814,72 @@ impl Ring<'_> {
     }
 }
 
-/// Run one shard's loop until the listener fails. Never returns in normal use.
-pub fn run(listener: TcpListener, codec: Codec, entries: u32) -> io::Result<()> {
+/// What one shard's attempt at the ring came to.
+pub enum Attempt {
+    /// The shard served on the ring until it was asked to stop (a test) or its
+    /// listener failed.
+    Served,
+    /// **This shard could not have a ring.** The listener comes back untouched,
+    /// for the caller to serve on epoll: ring memory is charged to the user, so
+    /// a process with more shards than its budget allows has shards that cannot
+    /// have one, and a shard that dies instead of falling back leaves its socket
+    /// in the `SO_REUSEPORT` group routing connections to nobody.
+    NoRing(TcpListener),
+}
+
+/// Serve one shard on the ring, or hand its listener back when no ring can be
+/// had.
+pub fn try_run(
+    listener: TcpListener,
+    codec: Codec,
+    entries: u32,
+    buffers: u16,
+    report: Option<std::sync::mpsc::Sender<crate::protocol::Report>>,
+) -> io::Result<Attempt> {
     run_until(
         listener,
         codec,
         Tuning {
             entries,
+            pbuf_count: buffers.min(Tuning::default().pbuf_count),
             startup_timeout: crate::config::startup_timeout(),
+            report,
             ..Tuning::default()
         },
     )
+}
+
+/// `DBNOOP_FAIL_RING=<n>`: the next `n` shards are refused a ring with the
+/// errno a user out of ring memory gets.
+///
+/// A diagnostic, not a feature: the fallback to epoll has to be provable, and a
+/// box that is out of ring memory cannot be asked to be out of it on demand. It
+/// is a countdown so that every shard after the first `n` behaves normally, and
+/// a test can make some shards fail rather than all of them.
+#[cfg_attr(test, allow(dead_code))] // a test forces the failure through `Tuning`
+fn injected_ring_failure() -> Option<io::Error> {
+    /// How many more shards to refuse.
+    static LEFT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+    static ONCE: OnceLock<Option<i64>> = OnceLock::new();
+
+    // Seeded here, once: the countdown is what the shards share.
+    let left = ONCE.get_or_init(|| {
+        let left = crate::config::env("FAIL_RING").and_then(|v| v.trim().parse::<i64>().ok())?;
+        LEFT.store(left as isize, Ordering::Relaxed);
+
+        Some(left)
+    });
+    let left = (*left)?;
+    if left <= 0 {
+        return None;
+    }
+    // Count down once per shard: the first `left` shards are refused, the rest
+    // behave as they would on a box with room.
+    if LEFT.fetch_sub(1, Ordering::Relaxed) < 1 {
+        return None;
+    }
+
+    Some(io::Error::from_raw_os_error(libc::ENOMEM))
 }
 
 /// What a shard is run with. A struct because two of these are knobs a test
@@ -852,6 +908,16 @@ struct Tuning {
     /// whether it is serving or whether this box refused it a ring.
     #[cfg(test)]
     up: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Refuse this shard a ring, so the fallback to epoll can be proven on a box
+    /// that has ring memory to spare. The binary's knob is the environment's
+    /// (`DBNOOP_FAIL_RING`); a test's is here, because an environment variable
+    /// is shared with every other test in the process.
+    #[cfg(test)]
+    fail_ring: bool,
+    /// Where to say "this shard is serving on the ring", before it serves. The
+    /// process's banner is built from these; a shard that dies instead of
+    /// reporting is a shard the banner does not count.
+    report: Option<std::sync::mpsc::Sender<crate::protocol::Report>>,
 }
 
 impl Default for Tuning {
@@ -885,6 +951,9 @@ impl Default for Tuning {
             stats: None,
             #[cfg(test)]
             up: None,
+            #[cfg(test)]
+            fail_ring: false,
+            report: None,
         }
     }
 }
@@ -946,7 +1015,7 @@ struct Stats {
 /// has gone; declared inside `passes` -- which is where they used to be -- they
 /// were dropped before it, and only a ring with DEFER_TASKRUN kept that from
 /// being visible.
-fn run_until(listener: TcpListener, codec: Codec, tuning: Tuning) -> io::Result<()> {
+fn run_until(listener: TcpListener, codec: Codec, tuning: Tuning) -> io::Result<Attempt> {
     // Slot 0 is reserved for the accept operation so an index is never
     // ambiguous.
     let mut slots: Vec<Option<Slot>> = vec![None];
@@ -964,7 +1033,51 @@ fn run_until(listener: TcpListener, codec: Codec, tuning: Tuning) -> io::Result<
         &mut bufs,
     );
 
-    finish(outcome, &mut slots)
+    match finish(outcome, &mut slots)? {
+        Passed::NoRing(listener) => Ok(Attempt::NoRing(listener)),
+        Passed::Served => Ok(Attempt::Served),
+    }
+}
+
+/// What the event loop did.
+enum Passed {
+    /// The loop ended because a test asked it to; the server's loop never
+    /// returns.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Served,
+    /// No ring could be had, and the listener was never used: it goes back to
+    /// the caller.
+    NoRing(TcpListener),
+}
+
+/// Say it once, and say what it costs: a shard serving on epoll is slower, and a
+/// process that has many of them is a process whose ring budget was exhausted.
+fn report_no_ring(e: &io::Error) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SAID.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    eprintln!(
+        "dbnoop: no io_uring ring for this shard ({}); shards without one serve on epoll. \
+         Ring memory is charged to the user, so fewer shards have a ring than the process \
+         has shards: DBNOOP_PBUF, or more memlock, buys more.",
+        errno_name(e.raw_os_error().unwrap_or(0))
+    );
+}
+
+/// Should this shard be refused a ring?
+fn ring_refused(tuning: &Tuning) -> bool {
+    #[cfg(test)]
+    {
+        tuning.fail_ring
+    }
+    #[cfg(not(test))]
+    {
+        let _ = tuning;
+
+        injected_ring_failure().is_some()
+    }
 }
 
 /// The loop's outcome, with the shard's descriptors closed whatever it was.
@@ -973,28 +1086,27 @@ fn run_until(listener: TcpListener, codec: Codec, tuning: Tuning) -> io::Result<
 /// nothing of its own is in flight, so every descriptor the shard still holds is
 /// its own to close. `?` on the loop skipped that: a shard that died of a ring
 /// error left every connection it had accepted open until the process exited.
-fn finish(outcome: io::Result<()>, slots: &mut [Option<Slot>]) -> io::Result<()> {
+///
+/// `Ok(Some(listener))` is the one outcome that keeps a descriptor open, and it
+/// is the one that must: a shard that could not have a ring hands its listener
+/// back so the caller can serve it on epoll.
+fn finish(outcome: io::Result<Passed>, slots: &mut [Option<Slot>]) -> io::Result<Passed> {
     close_all(slots);
 
     outcome
 }
 
-/// One shard's event loop, until the listener fails or a test asks it to stop.
-fn passes(
-    listener: TcpListener,
-    codec: Codec,
-    tuning: Tuning,
-    slots: &mut Vec<Option<Slot>>,
-    free_slots: &mut Vec<usize>,
-    spare: &mut Vec<Spare>,
-    bufs: &mut Option<BufRing>,
-) -> io::Result<()> {
-    let plan = plan();
-    let setup = Setup {
-        cqsize: plan.setup.cqsize && CQSIZE.load(Ordering::Relaxed),
-        ..plan.setup
-    };
-    let mut ioring = match build(&setup, tuning.entries) {
+/// Build this shard's ring, walking down to a plain one when the kernel refuses
+/// what was probed.
+///
+/// `DBNOOP_FAIL_RING` short-circuits it, so the fallback to epoll can be tested.
+fn ring_for_shard(setup: &Setup, tuning_entries: u32, refuse: bool) -> io::Result<IoUring> {
+    let setup = *setup;
+    if refuse {
+        return Err(io::Error::from_raw_os_error(libc::ENOMEM));
+    }
+
+    let ioring = match build(&setup, tuning_entries) {
         Ok(r) => r,
         // **A ring's memory is not free.** `io_uring_setup` charges it to the
         // process, and a large completion queue is the biggest part of it: on a
@@ -1012,14 +1124,14 @@ fn passes(
                  shards keep the kernel's own completion queue",
                 errno_name(libc::ENOMEM)
             );
-            match build(&smaller, tuning.entries) {
+            match build(&smaller, tuning_entries) {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!(
                         "dbnoop: io_uring refused the probed setup ({}); serving on a plain ring",
                         errno_name(e.raw_os_error().unwrap_or(0))
                     );
-                    build(&Setup::default(), tuning.entries)?
+                    build(&Setup::default(), tuning_entries)?
                 }
             }
         }
@@ -1028,7 +1140,39 @@ fn passes(
                 "dbnoop: io_uring refused the probed setup ({}); serving on a plain ring",
                 errno_name(e.raw_os_error().unwrap_or(0))
             );
-            build(&Setup::default(), tuning.entries)?
+            build(&Setup::default(), tuning_entries)?
+        }
+    };
+
+    Ok(ioring)
+}
+
+/// One shard's event loop, until the listener fails or a test asks it to stop.
+fn passes(
+    listener: TcpListener,
+    codec: Codec,
+    tuning: Tuning,
+    slots: &mut Vec<Option<Slot>>,
+    free_slots: &mut Vec<usize>,
+    spare: &mut Vec<Spare>,
+    bufs: &mut Option<BufRing>,
+) -> io::Result<Passed> {
+    let plan = plan();
+    let setup = Setup {
+        cqsize: plan.setup.cqsize && CQSIZE.load(Ordering::Relaxed),
+        ..plan.setup
+    };
+    let mut ioring = match ring_for_shard(&setup, tuning.entries, ring_refused(&tuning)) {
+        Ok(r) => r,
+        // **A shard that cannot have a ring must not die.** Memory for rings is
+        // charged to the user, so a process with more shards than its budget
+        // allows has shards that cannot have one. A shard that dies instead of
+        // falling back leaves its socket in the `SO_REUSEPORT` group, and the
+        // kernel keeps routing connections to a port nobody accepts on.
+        Err(e) => {
+            report_no_ring(&e);
+
+            return Ok(Passed::NoRing(listener));
         }
     };
 
@@ -1060,6 +1204,15 @@ fn passes(
     // shard a ring and refuse it the buffers, and the two mean different things
     // to a test: the first is a shard, the second is a shard that reads into the
     // connection's own buffer.
+    // **Said here, before serving**: the banner counts shards that are serving,
+    // and the answer is only known once the ring exists.
+    if let Some(report) = &tuning.report {
+        let _ = report.send(crate::protocol::Report::Serving {
+            protocol: codec.protocol(),
+            backend: Io::Uring,
+        });
+    }
+
     #[cfg(test)]
     if let Some(s) = &tuning.stats {
         s.provided.store(bufs.is_some(), Ordering::Relaxed);
@@ -1118,7 +1271,7 @@ fn passes(
         #[cfg(test)]
         if let Some(stop) = &tuning.stop {
             if stop.load(Ordering::Relaxed) {
-                return Ok(());
+                return Ok(Passed::Served);
             }
         }
 
@@ -3257,6 +3410,43 @@ mod tests {
             "the slot's descriptor must be closed even though the shard ended in an error"
         );
         assert_eq!(err.raw_os_error(), Some(libc::EPIPE), "{err}");
+    }
+
+    /// **A shard that cannot have a ring hands its listener back.**
+    ///
+    /// Ring memory is charged to the user, so a process with more shards than its
+    /// budget allows has shards that cannot have one. A shard that *ends* instead
+    /// leaves its socket in the `SO_REUSEPORT` group, and the kernel keeps
+    /// routing connections to a port nobody accepts on -- which is how a
+    /// container with `--workers 0` answered PostgreSQL and refused MySQL. What
+    /// comes back here is the same listener, still open, for the caller to serve
+    /// on epoll.
+    #[test]
+    fn a_shard_without_a_ring_hands_its_listener_back() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener");
+        let addr = listener.local_addr().expect("an address");
+        let tuning = Tuning {
+            fail_ring: true,
+            ..Tuning::default()
+        };
+
+        let outcome = run_until(
+            listener,
+            Codec::new(crate::protocol::Protocol::Postgres),
+            tuning,
+        );
+
+        match outcome {
+            Ok(Attempt::NoRing(listener)) => {
+                assert_eq!(
+                    listener.local_addr().expect("the listener is still open"),
+                    addr,
+                    "the listener that comes back is the one that went in"
+                );
+            }
+            Ok(Attempt::Served) => panic!("a refused ring must not be reported as served"),
+            Err(e) => panic!("a refused ring must hand the listener back, not error: {e}"),
+        }
     }
 
     /// **A parked receive is armed again once, not twice.**

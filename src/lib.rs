@@ -29,7 +29,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use config::{Config, Io};
-use protocol::{Codec, Protocol};
+use protocol::{Codec, Protocol, Report};
 
 /// Pin the calling thread to one CPU, so a shard stays where its data is.
 ///
@@ -303,20 +303,35 @@ async fn serve(mut socket: TcpStream, codec: Codec) {
     }
 }
 
+/// What one shard is asked to serve, and how.
+struct ShardSpec {
+    protocol: Protocol,
+    /// Where to pin, if anywhere.
+    cpu: Option<usize>,
+    /// The backend it was *planned* for: a shard planned for the ring that
+    /// cannot have one serves on epoll and says so, rather than ending and
+    /// leaving its port with one listener fewer.
+    backend: Io,
+    /// Provided buffers for its ring, from the process's ring plan.
+    buffers: u16,
+    codec: Codec,
+}
+
 /// One shard: a pinned thread, its own single-threaded reactor, its own
 /// listener, and every connection it accepts served to completion on it.
-///
-/// `cpu` is where to pin, if anywhere; what happened is reported back on
-/// `pinned` before the shard serves, so the banner can say what is true
-/// rather than what was intended.
 fn run_shard(
     id: usize,
     listener: std::net::TcpListener,
-    cpu: Option<usize>,
-    pinned: std::sync::mpsc::Sender<bool>,
-    io: Io,
-    codec: Codec,
+    report: std::sync::mpsc::Sender<Report>,
+    spec: ShardSpec,
 ) -> bool {
+    let ShardSpec {
+        protocol,
+        cpu,
+        backend,
+        buffers,
+        codec,
+    } = spec;
     let did_pin = match cpu {
         #[cfg(target_os = "linux")]
         Some(cpu) => {
@@ -330,24 +345,52 @@ fn run_shard(
         Some(_) => false,
         None => false,
     };
-    let _ = pinned.send(did_pin);
-    drop(pinned);
-
-    // Unused where the enum has a single variant; the loop below is the same.
-    #[cfg(not(target_os = "linux"))]
-    let _ = io;
+    let _ = report.send(Report::Pinned {
+        protocol,
+        pinned: did_pin,
+    });
 
     // io_uring needs no runtime at all: the codec is sans-io, so a shard is a
     // loop that submits reads, runs the codec, and submits writes. epoll keeps
     // tokio because that is what tokio is for.
     #[cfg(target_os = "linux")]
-    if io == Io::Uring {
-        if let Err(e) = crate::uring::run(listener, codec, 4096) {
-            eprintln!("dbnoop: shard {id} io_uring loop ended: {e}");
-            return false;
+    if backend == Io::Uring {
+        match crate::uring::try_run(listener, codec.clone(), 4096, buffers, Some(report.clone())) {
+            Ok(crate::uring::Attempt::Served) => return true,
+            Ok(crate::uring::Attempt::NoRing(listener)) => {
+                // **The listener comes back, and this shard serves it on epoll.**
+                // Dying here instead leaves the socket in the `SO_REUSEPORT`
+                // group, where the kernel keeps routing connections to a port
+                // nobody accepts on.
+                return serve_epoll(id, listener, report, protocol, codec);
+            }
+            Err(e) => {
+                eprintln!("dbnoop: shard {id} io_uring loop ended: {e}");
+
+                return false;
+            }
         }
-        return true;
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = backend;
+
+    serve_epoll(id, listener, report, protocol, codec)
+}
+
+/// Serve one shard's listener on epoll, through a single-threaded tokio runtime.
+fn serve_epoll(
+    id: usize,
+    listener: std::net::TcpListener,
+    report: std::sync::mpsc::Sender<Report>,
+    protocol: Protocol,
+    codec: Codec,
+) -> bool {
+    // Said before the loop, and the loop never returns in normal use: a shard is
+    // serving when it says so, and the banner counts it from here.
+    let _ = report.send(Report::Serving {
+        protocol,
+        backend: Io::Epoll,
+    });
 
     // current_thread, not multi_thread: a shard IS one thread. There is no work
     // stealing because there is nothing to steal from -- which is the entire
@@ -414,6 +457,23 @@ fn run_shard(
     })
 }
 
+/// How many shards are serving on the ring, from their own reports.
+#[cfg(target_os = "linux")]
+fn ring_serving(reports: &[Report]) -> usize {
+    reports
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                Report::Serving {
+                    backend: Io::Uring,
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
 /// The TPCC counters, on stderr every `interval` and once when the server stops.
 ///
 /// A benchmark that reads its throughput from the server reads it from the
@@ -472,13 +532,40 @@ pub fn run() {
         vec![None; total]
     };
 
+    // **How much ring this process may have, decided before any shard runs.**
+    //
+    // A ring's memory -- its queues, and the pages a provided-buffer ring pins --
+    // is charged to the USER, not to the shard that has it, and `RLIMIT_MEMLOCK`
+    // is 8 MiB on a default Linux host. The default `--workers 0` on a 32-CPU box
+    // is 64 shards, which cannot all have a ring: the shards that cannot used to
+    // die, and a dead shard's listener stayed in the `SO_REUSEPORT` group
+    // routing connections to a port nobody accepted on. The plan says how many
+    // shards may have one, and each of those gets a ring sized for what is left;
+    // the rest serve on epoll, which is the same codec over a different syscall.
+    let plan = config::ring_plan(
+        total,
+        config::memlock_bytes(),
+        config::pbuf_override().unwrap_or(config::MAX_BUFFERS),
+    );
+    let uring_budget = if io == Io::Uring {
+        plan.uring_shards
+    } else {
+        0
+    };
+
     // Resolve, then bind every shard's listener, before any shard runs: a name's
     // addresses are tried in order until one takes all of them, and a failure is
     // a startup error rather than a thread that quietly exits.
-    let (pinned_tx, pinned_rx) = std::sync::mpsc::channel();
+    let (report_tx, report_rx) = std::sync::mpsc::channel();
     let mut threads = Vec::with_capacity(total);
     let mut banners = Vec::with_capacity(sockets.len());
     let mut next_cpu = 0usize;
+    // The ring budget is split between the protocols rather than spent on the
+    // one that happens to be spawned first: half a server on the ring and half
+    // on epoll is worse than every shard on the same backend.
+    let protocols = sockets.len();
+    let mut ring_shares = (0..protocols)
+        .map(|k| uring_budget / protocols + usize::from(k < uring_budget % protocols));
 
     for (protocol, port) in sockets {
         let candidates = match resolve_bind_addrs(&config.host, port) {
@@ -497,6 +584,9 @@ pub fn run() {
         };
         banners.push((protocol, addr));
 
+        // This protocol's share of the ring budget, and no more.
+        let mut rings_left = ring_shares.next().unwrap_or(0);
+
         for (id, listener) in listeners.into_iter().enumerate() {
             // One codec per listener, cloned into its shards: the PostgreSQL
             // catalog is shared by them all, and the MySQL codec holds nothing
@@ -504,38 +594,101 @@ pub fn run() {
             let codec = Codec::new(protocol);
             let cpu = cpus[next_cpu];
             next_cpu += 1;
-            let pinned = pinned_tx.clone();
+            let report = report_tx.clone();
+            let backend = if rings_left > 0 {
+                rings_left -= 1;
+
+                Io::Uring
+            } else {
+                Io::Epoll
+            };
+            let spec = ShardSpec {
+                protocol,
+                cpu,
+                backend,
+                buffers: plan.buffers,
+                codec,
+            };
             threads.push(
                 std::thread::Builder::new()
                     .name(format!("dbnoop-{}-{id}", protocol.name()))
-                    .spawn(move || run_shard(id, listener, cpu, pinned, io, codec))
+                    .spawn(move || run_shard(id, listener, report, spec))
                     .expect("spawn shard"),
             );
         }
     }
-    drop(pinned_tx);
+    drop(report_tx);
 
-    // Every shard reports its pin before it serves, so the banner states what
-    // happened -- `pinned=31/32` is a fact, `pinned=true` was a plan. One report
-    // per shard; a shard that died before reporting counts as unpinned.
-    let pinned = (0..total)
-        .filter(|_| pinned_rx.recv().unwrap_or(false))
-        .count();
+    // **Every shard reports before it serves**, so the banner states what is
+    // true: how many shards are serving, on which backend, and how many are
+    // pinned. Each shard sends two messages -- its pin, then its backend -- and a
+    // shard that died before sending is a shard the banner does not count. The
+    // timeout is what turns that into a line rather than a hang.
+    let mut reports: Vec<Report> = Vec::with_capacity(total * 2);
+    for _ in 0..total * 2 {
+        match report_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(report) => reports.push(report),
+            Err(_) => break,
+        }
+    }
 
     for (protocol, addr) in &banners {
+        let pinned = reports
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    Report::Pinned { protocol: p, pinned: true } if *p == *protocol
+                )
+            })
+            .count();
+        let serving = reports
+            .iter()
+            .filter(|r| matches!(r, Report::Serving { protocol: p, .. } if *p == *protocol))
+            .count();
+        let ring = reports
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    Report::Serving { protocol: p, backend: Io::Uring } if *p == *protocol
+                )
+            })
+            .count();
+
         eprintln!(
-            "dbnoop {} listening on {addr} ({shards} shards, {}, SO_REUSEPORT, pinned={pinned}/{total})",
+            "dbnoop {} listening on {addr} ({shards} shards, SO_REUSEPORT, \
+             serving {serving}/{shards} (io_uring {ring}, epoll {}), pinned={pinned}/{shards})",
             protocol.name(),
-            io.as_str(),
+            serving - ring,
         );
     }
 
-    // What the ring actually granted. Reported here as well as at startup
-    // because this is the line a run's log keeps, and a measurement is only
-    // reproducible if it says which ring produced it.
+    let serving = reports
+        .iter()
+        .filter(|r| matches!(r, Report::Serving { .. }))
+        .count();
+    if serving < total {
+        eprintln!(
+            "dbnoop: **{} of {total} shards are not serving**; the rest are. A shard \
+             that cannot start leaves its port with fewer listeners, and with none at \
+             all if every shard of a protocol failed.",
+            total - serving
+        );
+    }
+
+    // What the ring actually granted, and how it was paid for. Reported here as
+    // well as at startup because this is the line a run's log keeps, and a
+    // measurement is only reproducible if it says which ring produced it.
     #[cfg(target_os = "linux")]
-    if io == Io::Uring {
-        eprintln!("dbnoop: io_uring {}", crate::uring::report());
+    if ring_serving(&reports) > 0 {
+        eprintln!(
+            "dbnoop: io_uring {}; {} shard(s) on the ring with {} buffer(s) each, \
+             the rest on epoll",
+            crate::uring::report(),
+            ring_serving(&reports),
+            plan.buffers,
+        );
     }
 
     // A server whose every shard failed must not exit 0. Discarding the join

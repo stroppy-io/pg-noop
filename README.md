@@ -399,6 +399,15 @@ dbnoop: io_uring granted: SINGLE_ISSUER DEFER_TASKRUN COOP_TASKRUN TASKRUN_FLAG
 * **Multishot receive** is one request per connection that the kernel re-issues
   by itself; a kernel that will not take it says so once and every receive is a
   one-shot instead.
+* **A shard that cannot have a ring serves on epoll.** Ring memory — the queues,
+  and the pages a provided-buffer ring pins — is charged to the *user*, not to
+  the shard that has it, and `RLIMIT_MEMLOCK` is 8 MiB on a default Linux host.
+  The default `--workers 0` on a 32-CPU box is 64 shards, which cannot all have a
+  ring: `--memlock`/`RLIMIT_MEMLOCK` is divided into a plan, each ring shard gets
+  a ring sized for what is left (`DBNOOP_PBUF` is a ceiling on it), and the rest
+  serve the same codec over epoll. The banner says how it was spent —
+  `serving 64/64 (io_uring 12, epoll 52)` — and a shard that cannot start at all
+  is counted in it rather than silently missing from its `SO_REUSEPORT` group.
 * **Backpressure**: a reply is staged while a write is in flight, and past
   256 KiB of staged reply the receive is cancelled until the write drains. A
   client that pipelines and never reads its answers is then pushed back through
