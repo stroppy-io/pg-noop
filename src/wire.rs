@@ -5,7 +5,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::plan::{CatalogView, CopyDirection, CopyFormat, PlanKind, PreparedPlan};
+use crate::catalog::CatalogView;
+use crate::plan::{CopyDirection, CopyFormat, PlanKind, PreparedPlan};
 
 /// Frontend messages the blackhole understands.
 /// Anything else is consumed and answered as though it succeeded, which is the whole
@@ -615,7 +616,12 @@ impl Conn {
 
     /// Consume every COMPLETE message in `input`, appending replies to `out`.
     /// Returns how many bytes were consumed.
-    pub fn advance(&mut self, input: &[u8], out: &mut Vec<u8>, catalog: &CatalogView) -> usize {
+    pub(crate) fn advance(
+        &mut self,
+        input: &[u8],
+        out: &mut Vec<u8>,
+        catalog: &CatalogView,
+    ) -> usize {
         let mut pos = 0usize;
 
         loop {
@@ -1978,7 +1984,7 @@ fn cstr_at(body: &[u8], from: usize) -> Option<(&str, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::NoopHandler;
+    use crate::catalog::NoopHandler;
     use std::sync::Arc;
 
     fn view() -> CatalogView {

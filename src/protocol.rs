@@ -4,8 +4,8 @@
 
 use std::sync::Arc;
 
+use crate::catalog::{CatalogView, NoopHandler};
 use crate::config::Io;
-use crate::plan::{CatalogView, NoopHandler};
 use crate::mysql;
 use crate::wire;
 

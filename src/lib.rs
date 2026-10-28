@@ -2,9 +2,10 @@
 //! It answers the PostgreSQL and MySQL wire protocols with valid, empty
 //! responses, so a benchmark measures the client and not the database.
 
+pub mod catalog;
 pub mod config;
-pub mod plan;
 pub mod mysql;
+pub mod plan;
 pub mod protocol;
 pub mod sql;
 pub mod tpcc;
