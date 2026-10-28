@@ -345,19 +345,19 @@ pub fn failure(sql: &str) -> Option<Failure> {
         .next()
         .is_some_and(|w| w.eq_ignore_ascii_case("SIGNAL"))
     {
+        // `SIGNAL '<code>'` without the keyword, else the generic one.
         let code = sql::quoted_argument(trimmed, "SQLSTATE")
+            .map(str::to_string)
             .or_else(|| {
-                // `SIGNAL '<code>'` without the keyword.
                 let rest = sql::trim_leading(&trimmed["SIGNAL".len()..]);
 
                 rest.strip_prefix('\'')
                     .and_then(|r| r.split('\'').next())
                     .map(str::to_string)
-                    .map(|s| Box::leak(s.into_boxed_str()) as &str)
             })
-            .unwrap_or("45000");
+            .unwrap_or_else(|| "45000".to_string());
 
-        return Some(Failure::Signal(code.to_string()));
+        return Some(Failure::Signal(code));
     }
 
     // `RAISE`, as a word anywhere: `select raise(...)`, `raise_exception(...)`,
