@@ -938,7 +938,7 @@ fn run_until(listener: TcpListener, codec: Codec, tuning: Tuning) -> io::Result<
     let mut spare: Vec<Spare> = Vec::new();
     let mut bufs: Option<BufRing> = None;
 
-    passes(
+    let outcome = passes(
         listener,
         codec,
         tuning,
@@ -946,14 +946,21 @@ fn run_until(listener: TcpListener, codec: Codec, tuning: Tuning) -> io::Result<
         &mut free_slots,
         &mut spare,
         &mut bufs,
-    )?;
+    );
 
-    // The ring is closed and nothing of its own is in flight: every descriptor
-    // the shard still holds is closed here. A shard that stops used to leave one
-    // open per connection that was still connected.
-    close_all(&mut slots);
+    finish(outcome, &mut slots)
+}
 
-    Ok(())
+/// The loop's outcome, with the shard's descriptors closed whatever it was.
+///
+/// **Closed on the way out, error or not.** The ring is closed by then and
+/// nothing of its own is in flight, so every descriptor the shard still holds is
+/// its own to close. `?` on the loop skipped that: a shard that died of a ring
+/// error left every connection it had accepted open until the process exited.
+fn finish(outcome: io::Result<()>, slots: &mut [Option<Slot>]) -> io::Result<()> {
+    close_all(slots);
+
+    outcome
 }
 
 /// One shard's event loop, until the listener fails or a test asks it to stop.
@@ -3163,6 +3170,33 @@ mod tests {
         let mut body = vec![0u8; len];
         second.read_exact(&mut body).expect("an answer body");
         assert_eq!(body, vec![1], "a one-column result set");
+    }
+
+    /// **A shard that ends with an error still closes its sockets.**
+    ///
+    /// The loop's `?` skipped the teardown, so a shard that died of a ring error
+    /// left every connection it had accepted open until the process exited --
+    /// and a supervisor restarting shards turns that into a process out of
+    /// descriptors.
+    #[test]
+    fn a_shard_that_ends_with_an_error_closes_its_descriptors() {
+        let codec = Codec::new(crate::protocol::Protocol::Postgres);
+        // A descriptor the slot owns, the way an accepted socket is.
+        let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        assert!(fd >= 0, "opening /dev/null: {}", io::Error::last_os_error());
+
+        let mut slots: Vec<Option<Slot>> =
+            vec![None, Some(Slot::new(fd, None, Spare::default(), &codec))];
+
+        let outcome = finish(Err(io::Error::from_raw_os_error(libc::EBADF)), &mut slots);
+
+        assert!(outcome.is_err(), "the error is the caller's to report");
+        // SAFETY: a plain fcntl on a descriptor this test opened.
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) },
+            -1,
+            "the socket must be closed even though the shard ended in an error"
+        );
     }
 
     /// **A parked receive is armed again once, not twice.**
