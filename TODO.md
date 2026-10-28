@@ -12,6 +12,11 @@ the loop needs, and enough that a fast client can be waiting on the server it is
 supposed to be measuring. That is the one number that decides whether a db-noop
 comparison is about the clients.
 
+The reasoning and the evidence behind both sections are in
+[`docs/review/2026-10-28-design-panel.md`](docs/review/2026-10-28-design-panel.md),
+the 2026-10-28 design review panel's record; each item below names the finding it
+answers.
+
 ## B — the hot path
 
 **B1. Classify once, at Parse; never re-scan a statement per execution.**
