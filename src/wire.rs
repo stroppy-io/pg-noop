@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::handler::{CatalogView, CopyDirection, CopyFormat, PlanKind, PreparedPlan};
+use crate::plan::{CatalogView, CopyDirection, CopyFormat, PlanKind, PreparedPlan};
 
 /// Frontend messages the blackhole understands.
 /// Anything else is consumed and answered as though it succeeded, which is the whole
@@ -849,7 +849,7 @@ impl Conn {
                 );
             } else {
                 let plan = PreparedPlan::build(body);
-                let params = crate::handler::parameter_types(body, &[]).unwrap_or_default();
+                let params = crate::plan::parameter_types(body, &[]).unwrap_or_default();
                 self.statements.insert(
                     name.to_string(),
                     std::sync::Arc::new(Statement { plan, params }),
@@ -969,7 +969,7 @@ impl Conn {
             );
         }
 
-        let params = match crate::handler::parameter_types(sql, &declared) {
+        let params = match crate::plan::parameter_types(sql, &declared) {
             Ok(params) => params,
             Err(e) => {
                 return self.refuse(true, out, e.sqlstate(), &e.message());
@@ -1978,7 +1978,7 @@ fn cstr_at(body: &[u8], from: usize) -> Option<(&str, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::NoopHandler;
+    use crate::plan::NoopHandler;
     use std::sync::Arc;
 
     fn view() -> CatalogView {

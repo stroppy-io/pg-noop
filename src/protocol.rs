@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use crate::config::Io;
-use crate::handler::{CatalogView, NoopHandler};
+use crate::plan::{CatalogView, NoopHandler};
 use crate::mysql;
 use crate::wire;
 
