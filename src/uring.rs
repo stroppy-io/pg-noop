@@ -71,10 +71,33 @@ const PBUF_COUNT: u16 = 256;
 /// the ring is shared by the connections, not owned by them.
 const PBUF_GROUP: u16 = 0;
 
-/// Operation kind, packed into the low bits of `user_data`.
+/// Operation kind, packed into the low bits of `user_data`. The cancel is a
+/// request of its own -- it names the receive it cancels by THAT request's
+/// `user_data`, so it cannot use the same one.
 const OP_ACCEPT: u64 = 0;
 const OP_RECV: u64 = 1;
 const OP_SEND: u64 = 2;
+const OP_CANCEL: u64 = 3;
+
+/// How much reply a connection may hold while a write is in flight before the
+/// shard stops reading from it.
+///
+/// A multishot receive runs AHEAD of the write by design: the kernel hands over
+/// whatever the client pipelined, and the reply is staged until the socket can
+/// take it. A client that pipelines and never reads replies (a bug, or on
+/// purpose) therefore grows that staged buffer without limit -- the server
+/// would hold the whole run's answer in memory. Past this mark the receive is
+/// cancelled and re-armed only once the write has drained, which pushes back on
+/// the client through its own receive window.
+///
+/// What a parked connection holds is this mark plus the reads the kernel had
+/// already completed when the park was decided -- bytes in provided buffers that
+/// cannot be put back unread -- so the bound is the mark plus one ring of
+/// receives, and it does not grow with what the client writes.
+///
+/// Large enough that ordinary pipelining never reaches it: at depth 32 the
+/// staged bytes are one batch's answer, a few hundred bytes.
+const STAGED_HIGH_WATER: usize = 256 * 1024;
 
 /// How long a paused accept stays paused after `EMFILE`/`ENFILE`/`ENOMEM`/
 /// `ENOBUFS`. Long enough for a closed connection to release its fd, short
@@ -142,6 +165,10 @@ struct Slot {
     /// The previous receive found no buffer in the ring, so the next one reads
     /// into this connection's own buffer.
     private: bool,
+    /// The read side is parked on purpose: the connection is holding more reply
+    /// than `STAGED_HIGH_WATER` while a write is in flight, so no receive is
+    /// armed until that write has drained.
+    parked: bool,
     /// The slot is on its way out and must not arm anything new.
     closing: bool,
     /// When this connection stops being allowed to sit in startup. `None` once
@@ -162,10 +189,59 @@ impl Slot {
             sending: false,
             recv_armed: false,
             private: false,
+            parked: false,
             closing: false,
             startup_deadline,
         }
     }
+
+    /// The reply this connection is holding: the part of `send` the kernel has
+    /// not taken, plus everything staged behind it.
+    fn queued(&self) -> usize {
+        (self.send.len() - self.sent) + self.staged.len()
+    }
+}
+
+/// What a connection needs next, given what is in flight.
+///
+/// The staged reply is moved into `send` here, because this is the moment a
+/// write slot is free; three callers deciding that for themselves is how the
+/// send path and the receive path came to disagree about which buffer a reply
+/// was in.
+fn next_for(slot: &mut Slot) -> Next {
+    if !slot.sending && slot.send.is_empty() && !slot.staged.is_empty() {
+        std::mem::swap(&mut slot.send, &mut slot.staged);
+        slot.staged.clear();
+        slot.sent = 0;
+    }
+
+    if !slot.send.is_empty() && !slot.sending {
+        return Next::Send;
+    }
+    if slot.closing || slot.conn.is_closed() {
+        return Next::Close;
+    }
+    if slot.parked {
+        // The read side stays off until the reply it outran has gone out --
+        // including the one still staged, which the two checks above have just
+        // taken into `send`.
+        if slot.queued() > STAGED_HIGH_WATER {
+            return Next::Idle;
+        }
+        slot.parked = false;
+    }
+    // Checked before the arm below, and not only while a write is in flight: a
+    // read that arrives while the connection is already this far behind is
+    // exactly the read that must not happen, whether or not a receive is armed
+    // for it.
+    if slot.queued() >= STAGED_HIGH_WATER {
+        return Next::Park;
+    }
+    if !slot.recv_armed {
+        return Next::Arm;
+    }
+
+    Next::Idle
 }
 
 /// What a shard is allowed to ask the kernel for, and what it was refused.
@@ -721,6 +797,13 @@ struct Stats {
     /// `multi_arms` is one where the kernel is re-issuing the request, which is
     /// the whole point of arming it as multishot.
     reads: std::sync::atomic::AtomicUsize,
+    /// Reads stopped because the connection was holding more reply than
+    /// `STAGED_HIGH_WATER`, and the most reply a connection was ever holding.
+    /// The second is the whole of the backpressure: without it a client that
+    /// pipelines and never reads grows a `staged` buffer for as long as it
+    /// keeps writing.
+    parks: std::sync::atomic::AtomicUsize,
+    staged_high: std::sync::atomic::AtomicUsize,
 }
 
 /// `run`, with the shard's knobs supplied rather than read from the process.
@@ -1028,10 +1111,11 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
                                 slot.private = true;
                                 Next::Arm
                             }
-                            // Cancelled: only a shutdown of ours can still do
-                            // this, and the slot is then closing.
+                            // Cancelled: by a park of ours, whose own
+                            // completion is what resumes the read side, or by a
+                            // slot on its way out.
                             r if r == -libc::ECANCELED => {
-                                if slot.closing {
+                                if slot.parked || slot.closing {
                                     Next::Idle
                                 } else {
                                     Next::Arm
@@ -1112,15 +1196,12 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
                         slot.startup_deadline = None;
                     }
 
-                    let next = if !slot.send.is_empty() && !slot.sending {
-                        Next::Send
-                    } else if slot.closing || slot.conn.is_closed() {
-                        Next::Close
-                    } else if !slot.recv_armed {
-                        Next::Arm
-                    } else {
-                        Next::Idle
-                    };
+                    #[cfg(test)]
+                    if let Some(s) = &tuning.stats {
+                        s.staged_high.fetch_max(slot.queued(), Ordering::Relaxed);
+                    }
+
+                    let next = next_for(slot);
                     match next {
                         Next::Send => submit_send(&mut ring, &mut slots, idx)?,
                         Next::Close => {
@@ -1129,6 +1210,7 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
                         Next::Arm => {
                             arm_recv(&mut ring, &mut slots, bufs.as_ref(), idx, multishot)?
                         }
+                        Next::Park => park_recv(&mut ring, &mut slots, idx)?,
                         Next::Idle => {}
                     }
                 }
@@ -1153,19 +1235,7 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
                                 slot.send.clear();
                                 slot.sent = 0;
 
-                                if slot.closing || slot.conn.is_closed() {
-                                    Next::Close
-                                } else if !slot.staged.is_empty() {
-                                    // The reply that arrived while this one was
-                                    // in flight.
-                                    std::mem::swap(&mut slot.send, &mut slot.staged);
-                                    slot.staged.clear();
-                                    Next::Send
-                                } else if !slot.recv_armed {
-                                    Next::Arm
-                                } else {
-                                    Next::Idle
-                                }
+                                next_for(slot)
                             }
                         }
                     };
@@ -1177,6 +1247,34 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
                         Next::Arm => {
                             arm_recv(&mut ring, &mut slots, bufs.as_ref(), idx, multishot)?
                         }
+                        Next::Park => park_recv(&mut ring, &mut slots, idx)?,
+                        Next::Idle => {}
+                    }
+                }
+
+                OP_CANCEL => {
+                    let next = {
+                        let Some(slot) = slots.get_mut(idx).and_then(|s| s.as_mut()) else {
+                            continue;
+                        };
+                        // The target is gone, but only a cancel that SUCCEEDED
+                        // says so: `-ENOENT` (or any other answer) means the
+                        // receive had already completed, and its completion in
+                        // this pass has the truth about `recv_armed`.
+                        if res == 0 {
+                            slot.recv_armed = false;
+                        }
+                        next_for(slot)
+                    };
+                    match next {
+                        Next::Send => submit_send(&mut ring, &mut slots, idx)?,
+                        Next::Close => {
+                            begin_close(&mut slots, &mut free_slots, &mut spare, bufs.as_mut(), idx)
+                        }
+                        Next::Arm => {
+                            arm_recv(&mut ring, &mut slots, bufs.as_ref(), idx, multishot)?
+                        }
+                        Next::Park => park_recv(&mut ring, &mut slots, idx)?,
                         Next::Idle => {}
                     }
                 }
@@ -1384,6 +1482,8 @@ enum Next {
     Send,
     Close,
     Arm,
+    /// Cancel the receive and stop reading until the write drains.
+    Park,
     Idle,
 }
 
@@ -1490,6 +1590,37 @@ fn arm_recv(
         s.arms.fetch_add(1, Ordering::Relaxed);
     }
     Ok(())
+}
+
+/// Stop reading from a connection until the reply it has outrun has gone out.
+///
+/// A multishot receive cannot simply be "not re-armed": the kernel owns the
+/// request and keeps handing data over. Cancelling it is the only way to stop
+/// the read side, and `parked` is what says the cancellation was ours -- so the
+/// ECANCELED it produces is not answered by arming another receive, and the
+/// cancel's own completion is what resumes reading once the write has drained.
+fn park_recv(ring: &mut Ring, slots: &mut [Option<Slot>], idx: usize) -> io::Result<()> {
+    let Some(slot) = slots.get_mut(idx).and_then(|s| s.as_mut()) else {
+        return Ok(());
+    };
+    slot.parked = true;
+    #[cfg(test)]
+    if let Some(s) = &ring.stats {
+        s.parks.fetch_add(1, Ordering::Relaxed);
+    }
+    if !slot.recv_armed {
+        // Nothing in flight to cancel; the read side is already off and
+        // `next_for` will arm it when the connection drains.
+        return Ok(());
+    }
+
+    // By `user_data`: a cancel names the request it targets, and the tag is
+    // what both a one-shot and a multishot receive carry.
+    let e = opcode::AsyncCancel::new(tag(idx, OP_RECV))
+        .build()
+        .user_data(tag(idx, OP_CANCEL));
+    // SAFETY: a cancel points at no user buffer.
+    unsafe { ring.push(&e) }
 }
 
 fn submit_send(ring: &mut Ring, slots: &mut [Option<Slot>], idx: usize) -> io::Result<()> {
@@ -2556,6 +2687,134 @@ mod tests {
             "one multishot arm must serve more than one read (reads {}, arms {})",
             stats.reads.load(Ordering::Relaxed),
             stats.multi_arms.load(Ordering::Relaxed)
+        );
+    }
+
+    /// **A client that writes and never reads cannot grow the server.**
+    ///
+    /// A multishot receive runs ahead of the write: the kernel hands over
+    /// whatever the client pipelined, and with a write in flight every answer is
+    /// staged. A client that never reads its replies therefore grew `staged`
+    /// for as long as it kept writing -- the server holding a whole run's answer
+    /// in memory. Past `STAGED_HIGH_WATER` the receive is cancelled, which is
+    /// the only way to stop a request the kernel owns, and the connection is
+    /// read from again once the write has drained.
+    ///
+    /// Two things are pinned: the connection never held much more than the
+    /// water mark, and it is still a working connection afterwards -- parking
+    /// is a pause, not a break.
+    #[test]
+    fn a_client_that_never_reads_cannot_grow_the_shard_memory() {
+        let stats = Arc::new(Stats::default());
+        let tuning = Tuning {
+            entries: 256,
+            pbuf_count: 32,
+            stats: Some(Arc::clone(&stats)),
+            ..Tuning::default()
+        };
+        let Some((addr, _tid, _shard)) = spawn_shard(tuning) else {
+            return;
+        };
+
+        let mut s = TcpStream::connect(addr).expect("connect");
+        s.set_nodelay(true).expect("nodelay");
+        // The write side is bounded: once the server stops reading, the client's
+        // own socket buffer fills and `write_all` would block forever.
+        s.set_write_timeout(Some(Duration::from_millis(50)))
+            .expect("write timeout");
+
+        // A wide result set: the answer is several times the size of the query,
+        // so a few megabytes of writes are tens of megabytes of reply -- more
+        // than any socket buffer will absorb.
+        let wide = format!("select {}", vec!["1"; 200].join(", "));
+        let query = query_message(&wide);
+        let mut batch = Vec::new();
+        for _ in 0..16 {
+            batch.extend_from_slice(&query);
+        }
+        s.write_all(&startup_message()).expect("startup");
+
+        // Write until the shard stops reading from this connection. A write
+        // that times out is retried: the pipeline is full for the moment, and
+        // the server is still working through it.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline && stats.parks.load(Ordering::Relaxed) == 0 {
+            if s.write_all(&batch).is_err() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        let held = stats.staged_high.load(Ordering::Relaxed);
+        assert!(
+            stats.parks.load(Ordering::Relaxed) > 0,
+            "the shard never stopped reading from a connection holding {held} bytes \
+             of unanswered reply"
+        );
+        // What a parked connection still holds is the water mark plus the
+        // reads the kernel had ALREADY completed when the park was decided --
+        // bytes in provided buffers that nobody can put back unread. Bounded by
+        // the ring, not by what the client writes.
+        assert!(
+            held <= STAGED_HIGH_WATER + PBUF_COUNT as usize * RECV_BUF * 16,
+            "a connection that never reads grew the server's buffer to {held} bytes \
+             (water mark {STAGED_HIGH_WATER})"
+        );
+
+        // The property that matters is that growth STOPS. The same client keeps
+        // writing and still reads nothing; once the reads it had already been
+        // given are behind it, its queue does not move again.
+        let settled = |s: &Stats| {
+            let before = s.staged_high.load(Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(200));
+            before == s.staged_high.load(Ordering::Relaxed)
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline && !settled(&stats) {
+            let _ = s.write_all(&batch);
+        }
+        let settled_at = stats.staged_high.load(Ordering::Relaxed);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let _ = s.write_all(&batch);
+        }
+        assert_eq!(
+            stats.staged_high.load(Ordering::Relaxed),
+            settled_at,
+            "a parked connection grew its queue from {settled_at} bytes while its \
+             peer kept writing"
+        );
+
+        // Another connection is served normally while the first is parked: the
+        // park is per-connection, not per-shard.
+        let mut polite = TcpStream::connect(addr).expect("connect");
+        polite.set_nodelay(true).expect("nodelay");
+        polite
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        polite.write_all(&startup_message()).expect("startup");
+        read_until_ready(&mut polite).expect("handshake reply");
+        for _ in 0..16 {
+            let frames = ask(&mut polite, "select 1").expect("reply");
+            assert_eq!(frames.len(), 4);
+        }
+
+        // And the parked connection is read from again once its peer drains.
+        s.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut ready = 0usize;
+        let mut buf = vec![0u8; 64 * 1024];
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while ready < 100 && Instant::now() < deadline {
+            match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => ready += buf[..n].iter().filter(|&&b| b == b'Z').count(),
+            }
+        }
+        assert!(
+            ready >= 100,
+            "a parked connection must be read from again once its peer drains: \
+             {ready} answers"
         );
     }
 
