@@ -1993,15 +1993,7 @@ mod tests {
 
     /// A startup packet: [len][code][payload].
     fn startup_msg() -> Vec<u8> {
-        let mut b = Vec::new();
-        b.extend_from_slice(&0i32.to_be_bytes());
-        b.extend_from_slice(&196608i32.to_be_bytes());
-        cstr(&mut b, "user");
-        cstr(&mut b, "bench");
-        b.push(0);
-        let len = b.len() as i32;
-        b[0..4].copy_from_slice(&len.to_be_bytes());
-        b
+        crate::protocol::startup_message()
     }
 
     fn tagged(tag: u8, body: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
@@ -2248,17 +2240,7 @@ mod tests {
 
         // The name is an ordinary prepared statement from here: Bind/Execute it.
         let mut out = Vec::new();
-        c.advance(
-            &tagged(b'B', |b| {
-                cstr(b, "");
-                cstr(b, "neword");
-                b.extend_from_slice(&0i16.to_be_bytes());
-                b.extend_from_slice(&0i16.to_be_bytes());
-                b.extend_from_slice(&0i16.to_be_bytes());
-            }),
-            &mut out,
-            &v,
-        );
+        c.advance(&bind_msg("", "neword"), &mut out, &v);
         assert_eq!(out[0], b'2', "BindComplete, not 26000: {out:?}");
 
         let mut out = Vec::new();
@@ -2882,28 +2864,14 @@ mod tests {
         let (mut c, v) = connected();
         let mut out = Vec::new();
         c.advance(
-            &tagged(b'P', |b| {
-                cstr(b, "ins");
-                cstr(b, "insert into new_order values (1, NULL, 3)");
-                b.extend_from_slice(&0i16.to_be_bytes());
-            }),
+            &parse_msg("ins", "insert into new_order values (1, NULL, 3)", &[]),
             &mut out,
             &v,
         );
         assert_eq!(out[0], b'1', "Parse is answered first: {out:?}");
 
         let mut out = Vec::new();
-        c.advance(
-            &tagged(b'B', |b| {
-                cstr(b, "");
-                cstr(b, "ins");
-                b.extend_from_slice(&0i16.to_be_bytes());
-                b.extend_from_slice(&0i16.to_be_bytes());
-                b.extend_from_slice(&0i16.to_be_bytes());
-            }),
-            &mut out,
-            &v,
-        );
+        c.advance(&bind_msg("", "ins"), &mut out, &v);
         c.advance(
             &tagged(b'E', |b| {
                 cstr(b, "");
@@ -3856,6 +3824,29 @@ mod tests {
         assert_eq!(first_sqlstate(&out), "08P01");
     }
 
+    /// A Parse of `sql` under `name`, with the declared parameter type oids.
+    fn parse_msg(name: &str, sql: &str, params: &[u32]) -> Vec<u8> {
+        tagged(b'P', |b| {
+            cstr(b, name);
+            cstr(b, sql);
+            b.extend_from_slice(&(params.len() as i16).to_be_bytes());
+            for oid in params {
+                b.extend_from_slice(&(*oid as i32).to_be_bytes());
+            }
+        })
+    }
+
+    /// A Bind of `stmt` to `portal`, all text formats and no parameters.
+    fn bind_msg(portal: &str, stmt: &str) -> Vec<u8> {
+        tagged(b'B', |b| {
+            cstr(b, portal);
+            cstr(b, stmt);
+            b.extend_from_slice(&0i16.to_be_bytes());
+            b.extend_from_slice(&0i16.to_be_bytes());
+            b.extend_from_slice(&0i16.to_be_bytes());
+        })
+    }
+
     /// Execute a named portal with a row limit, then Sync.
     fn execute(c: &mut Conn, v: &CatalogView, portal: &str, max_rows: i32) -> Vec<u8> {
         let mut input = tagged(b'E', |b| {
@@ -3870,18 +3861,8 @@ mod tests {
 
     /// Parse `sql` and bind it to portal `p1`, text formats.
     fn bind_p1(c: &mut Conn, v: &CatalogView, sql: &str) {
-        let mut input = tagged(b'P', |b| {
-            cstr(b, "s1");
-            cstr(b, sql);
-            b.extend_from_slice(&0i16.to_be_bytes());
-        });
-        input.extend(tagged(b'B', |b| {
-            cstr(b, "p1");
-            cstr(b, "s1");
-            b.extend_from_slice(&0i16.to_be_bytes());
-            b.extend_from_slice(&0i16.to_be_bytes());
-            b.extend_from_slice(&0i16.to_be_bytes());
-        }));
+        let mut input = parse_msg("s1", sql, &[]);
+        input.extend(bind_msg("p1", "s1"));
         let mut out = Vec::new();
         c.advance(&input, &mut out, v);
         assert_eq!(tags(&out), vec![b'1', b'2']);

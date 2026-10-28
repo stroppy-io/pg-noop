@@ -73,6 +73,19 @@ impl Codec {
     }
 }
 
+/// The startup message a PostgreSQL client sends, for the crate's tests.
+#[cfg(test)]
+pub(crate) fn startup_message() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&196_608u32.to_be_bytes()); // protocol 3.0
+    body.extend_from_slice(b"user\0bench\0\0");
+
+    let mut msg = ((body.len() + 4) as u32).to_be_bytes().to_vec();
+    msg.extend_from_slice(&body);
+
+    msg
+}
+
 /// Feed bytes from a socket into a session, keeping what an incomplete message
 /// holds.
 ///
