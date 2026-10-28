@@ -326,7 +326,17 @@ impl Conn {
     /// An error, and the recovery the protocol prescribes for where it happened.
     /// In the simple protocol the reply ends with `ReadyForQuery` and the next message
     /// runs.
-    fn refuse(&mut self, extended: bool, out: &mut Vec<u8>, code: &str, message: &str) {
+    /// Answer the error a message earned, and say the message was answered.
+    ///
+    /// `Some(())` and not `None`: a refusal is a handled message, and `None` means a
+    /// body that could not be read at all.
+    fn refuse(
+        &mut self,
+        extended: bool,
+        out: &mut Vec<u8>,
+        code: &str,
+        message: &str,
+    ) -> Option<()> {
         self.error(out, code, message);
 
         if extended {
@@ -334,6 +344,8 @@ impl Conn {
         } else {
             self.ready(out);
         }
+
+        Some(())
     }
 
     /// What a statement did to the transaction state.
@@ -826,9 +838,7 @@ impl Conn {
 
                 // A failed transaction runs nothing until it is ended.
                 if self.failed() && !ends_transaction(&plan.kind) {
-                    self.refuse(false, out, "25P02", ABORTED);
-
-                    return Some(());
+                    return self.refuse(false, out, "25P02", ABORTED);
                 }
 
                 // COPY is decided by its direction, once, in the plan.
@@ -902,30 +912,24 @@ impl Conn {
                 let plan = PreparedPlan::build(sql);
 
                 if self.failed() && !ends_transaction(&plan.kind) {
-                    self.refuse(true, out, "25P02", ABORTED);
-
-                    return Some(());
+                    return self.refuse(true, out, "25P02", ABORTED);
                 }
 
                 // A named statement is not replaced in place: PostgreSQL answers 42P05,
                 // and a driver that wants the name back closes it first.
                 if !name.is_empty() && self.statements.contains_key(name) {
-                    self.refuse(
+                    return self.refuse(
                         true,
                         out,
                         "42P05",
                         &format!("prepared statement \"{name}\" already exists"),
                     );
-
-                    return Some(());
                 }
 
                 let params = match crate::handler::parameter_types(sql, &declared) {
                     Ok(params) => params,
                     Err(e) => {
-                        self.refuse(true, out, e.sqlstate(), &e.message());
-
-                        return Some(());
+                        return self.refuse(true, out, e.sqlstate(), &e.message());
                     }
                 };
                 self.statements
@@ -943,28 +947,24 @@ impl Conn {
                 // A statement that was never prepared -- or was closed -- is not bound
                 // to; it is reported.
                 let Some(statement) = self.statements.get(stmt) else {
-                    self.refuse(
+                    return self.refuse(
                         true,
                         out,
                         "26000",
                         &format!("prepared statement \"{stmt}\" does not exist"),
                     );
-
-                    return Some(());
                 };
 
                 let Statement { plan, params } = &**statement;
 
                 if self.failed() && !ends_transaction(&plan.kind) {
-                    self.refuse(true, out, "25P02", ABORTED);
-
-                    return Some(());
+                    return self.refuse(true, out, "25P02", ABORTED);
                 }
 
                 // The counts PostgreSQL checks, with its SQLSTATE and wording.
                 if bind.params != params.len() {
                     let want = params.len();
-                    self.refuse(
+                    return self.refuse(
                         true,
                         out,
                         "08P01",
@@ -973,12 +973,10 @@ impl Conn {
                             bind.params
                         ),
                     );
-
-                    return Some(());
                 }
 
                 if let Some(mismatch) = bind.format_mismatch {
-                    self.refuse(
+                    return self.refuse(
                         true,
                         out,
                         "08P01",
@@ -987,8 +985,6 @@ impl Conn {
                             bind.params
                         ),
                     );
-
-                    return Some(());
                 }
 
                 // A per-column result-format list has to be one per column.
@@ -1002,7 +998,7 @@ impl Conn {
                         _ => 0,
                     };
                     if bind.result_formats != columns {
-                        self.refuse(
+                        return self.refuse(
                             true,
                             out,
                             "08P01",
@@ -1011,22 +1007,18 @@ impl Conn {
                                 bind.result_formats
                             ),
                         );
-
-                        return Some(());
                     }
                 }
 
                 // A named portal is not rebound in place either: 42P03, as PostgreSQL
                 // answers, until it is closed.
                 if !portal.is_empty() && self.portals.contains_key(portal) {
-                    self.refuse(
+                    return self.refuse(
                         true,
                         out,
                         "42P03",
                         &format!("portal \"{portal}\" already exists"),
                     );
-
-                    return Some(());
                 }
 
                 // One String allocation per query if done unconditionally, and a driver
@@ -1064,14 +1056,12 @@ impl Conn {
                     } else {
                         ("34000", "portal")
                     };
-                    self.refuse(
+                    return self.refuse(
                         true,
                         out,
                         code,
                         &format!("{what} \"{name}\" does not exist"),
                     );
-
-                    return Some(());
                 };
 
                 // PostgreSQL refuses to describe a statement that returns rows inside a
@@ -1083,9 +1073,7 @@ impl Conn {
                         PlanKind::SelectMeta { .. } | PlanKind::SelectStub { .. }
                     )
                 {
-                    self.refuse(true, out, "25P02", ABORTED);
-
-                    return Some(());
+                    return self.refuse(true, out, "25P02", ABORTED);
                 }
 
                 // A described STATEMENT also gets its parameter types.
@@ -1130,22 +1118,18 @@ impl Conn {
                 // The plan is the portal's own, so one lookup finds both.
                 let Some(portal) = self.portals.get_mut(name) else {
                     // PostgreSQL reports it, and so does this.
-                    self.refuse(
+                    return self.refuse(
                         true,
                         out,
                         "34000",
                         &format!("portal \"{name}\" does not exist"),
                     );
-
-                    return Some(());
                 };
                 let statement = Arc::clone(&portal.statement);
                 let p = &statement.plan;
 
                 if failed && !ends_transaction(&p.kind) {
-                    self.refuse(true, out, "25P02", ABORTED);
-
-                    return Some(());
+                    return self.refuse(true, out, "25P02", ABORTED);
                 }
 
                 // A COPY that streams from the client needs the connection to change
@@ -1269,9 +1253,7 @@ impl Conn {
 
                     if let Some(violation) = violation {
                         self.leave_copy_in();
-                        self.refuse(extended, out, "22P04", violation);
-
-                        return Some(());
+                        return self.refuse(extended, out, "22P04", violation);
                     }
                 } else {
                     // A quote still open at the end is PostgreSQL's error for it; a
@@ -1279,9 +1261,12 @@ impl Conn {
                     // data rather than a newline.
                     if self.copy_lines.in_quotes {
                         self.leave_copy_in();
-                        self.refuse(extended, out, "22P04", "unterminated CSV quoted field");
-
-                        return Some(());
+                        return self.refuse(
+                            extended,
+                            out,
+                            "22P04",
+                            "unterminated CSV quoted field",
+                        );
                     }
 
                     if self.copy_lines.line_open && !self.copy_lines.ended {
