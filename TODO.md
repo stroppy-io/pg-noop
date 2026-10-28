@@ -63,3 +63,17 @@ when off; there is no way to ask for a simulated failure today.*
 should add db-noop's CPU per query (from `/proc/self/stat` over the interval) and
 each shard's busy fraction, next to the counters, and say `synthetic NOPM`.
 *Cost: two reads per interval; nothing on the loop.*
+
+## Deferred from the clean-code review
+
+Carried over rather than done, with the reasoning in
+[`docs/review/2026-10-28-clean-code.md`](docs/review/2026-10-28-clean-code.md):
+
+- One answer-decision type shared by both codecs (Reviewer C item 7).
+- `Run`'s three flag arguments become one enum (item 9).
+- The simple-query COPY arm calls `answer` instead of repeating it (item 10).
+- The catalog write moves out of `answer` into dispatch (item 10).
+- A `field(body, i)` helper for the RowDescription test (item 13).
+- The rest of `run()`: the bind-and-spawn loop and the join.
+- The remaining hand-built test frames: DESCRIBE and the COPY bodies.
+- The macOS build of the library, which needs a macOS host.
