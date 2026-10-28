@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use packet::Reader;
 use result::{Column, Kind};
 
-use crate::sql;
+use crate::sql::{self, Dialect};
 use crate::tpcc;
 
 pub use handshake::greeting;
@@ -445,7 +445,7 @@ impl Conn {
         // An empty segment -- `a;;b`, or a trailing `;` -- is not a statement:
         // a client counting results would wait for one that never comes.
         let statements: Vec<&str> = if self.multi_statements() {
-            sql::split_statements(sql)
+            sql::split_statements(sql, Dialect::MySql)
         } else {
             vec![sql]
         };
@@ -602,7 +602,7 @@ impl Conn {
         };
 
         let answer = classify(sql);
-        let params = sql::count_placeholders(sql);
+        let params = sql::count_placeholders(sql, Dialect::MySql);
         let id = self.next_stmt;
         self.next_stmt += 1;
 
@@ -663,8 +663,8 @@ impl Conn {
 
 /// What a statement answers, from its text alone.
 fn classify(sql: &str) -> Answer {
-    let trimmed = sql::trim_leading(sql);
-    let head = sql::first_word(trimmed);
+    let trimmed = sql::trim_leading(sql, Dialect::MySql);
+    let head = sql::first_word(trimmed, Dialect::MySql);
 
     let tx = if head.eq_ignore_ascii_case("BEGIN") || starts_transaction(trimmed) {
         Tx::Begin
@@ -684,19 +684,19 @@ fn classify(sql: &str) -> Answer {
 
     // The TPC-C rules come first.
     let mut kind = None;
-    let shape = if let Some(failure) = tpcc::failure(trimmed) {
+    let shape = if let Some(failure) = tpcc::failure(trimmed, Dialect::MySql) {
         // The rollback path a client injects: an error, so its own error handling runs
         // and its rollback is counted -- an OK here turns the rollback into a commit.
         Shape::Failure(failure)
     // The synthetic answers are the profile's: with it off, these are ordinary
     // selects and fall through to the empty result set below.
-    } else if let Some((name, value)) = tpcc::number_query(trimmed) {
+    } else if let Some((name, value)) = tpcc::number_query(trimmed, Dialect::MySql) {
         Shape::Number(name, value)
-    } else if tpcc::profile() && tpcc::show_status(trimmed).is_some() {
-        Shape::Status(tpcc::show_status(trimmed).unwrap_or(None))
-    } else if let Some(names) = tpcc::select_vars(trimmed) {
+    } else if tpcc::profile() && tpcc::show_status(trimmed, Dialect::MySql).is_some() {
+        Shape::Status(tpcc::show_status(trimmed, Dialect::MySql).unwrap_or(None))
+    } else if let Some(names) = tpcc::select_vars(trimmed, Dialect::MySql) {
         Shape::Vars(names)
-    } else if let Some(items) = sql::constant_select(trimmed) {
+    } else if let Some(items) = sql::constant_select(trimmed, Dialect::MySql) {
         Shape::Constant(items)
     } else if head.eq_ignore_ascii_case("SELECT") {
         Shape::Empty(select_columns(trimmed))
@@ -711,7 +711,7 @@ fn classify(sql: &str) -> Answer {
         // Statements that may return rows but have no `SELECT` to read the shape from.
         Shape::Empty(vec!["result".to_string()])
     } else {
-        kind = tpcc::statement_kind(trimmed);
+        kind = tpcc::statement_kind(trimmed, Dialect::MySql);
         Shape::Ok
     };
 
@@ -732,7 +732,7 @@ fn text_columns<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<Column<'a>>
 
 /// `START TRANSACTION`, with any of its modifiers.
 fn starts_transaction(sql: &str) -> bool {
-    let mut words = sql::Words::new(sql);
+    let mut words = sql::Words::new(sql, Dialect::MySql);
     if !words
         .next()
         .is_some_and(|w| w.eq_ignore_ascii_case("START"))
@@ -747,15 +747,15 @@ fn starts_transaction(sql: &str) -> bool {
 
 /// Whether the statement mentions a word anywhere, outside quotes and comments.
 fn mentions(sql: &str, word: &str) -> bool {
-    sql::Words::new(sql).any(|w| w.eq_ignore_ascii_case(word))
+    sql::Words::new(sql, Dialect::MySql).any(|w| w.eq_ignore_ascii_case(word))
 }
 
 /// The columns of a `SELECT`, named after the select-list items.
 fn select_columns(sql: &str) -> Vec<String> {
-    let Some(list) = sql::select_list(sql) else {
+    let Some(list) = sql::select_list(sql, Dialect::MySql) else {
         return vec!["result".to_string()];
     };
-    let columns: Vec<String> = sql::split_top_level(list)
+    let columns: Vec<String> = sql::split_top_level(list, Dialect::MySql)
         .into_iter()
         .map(|item| {
             let name = item.trim();

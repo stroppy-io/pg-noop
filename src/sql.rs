@@ -1,11 +1,23 @@
 //! The little SQL this server reads: the first word, the select list, the
 //! statement boundaries and the placeholders. Nothing here interprets a value.
 
+/// Which SQL dialect the lexer is reading.
+///
+/// The two differ in three places, and each of them can swallow a statement: a
+/// backslash escapes a quote in MySQL always and in PostgreSQL only after `E`; block
+/// comments nest in PostgreSQL; and `$tag$` is a literal in PostgreSQL while a `$` is
+/// part of an identifier in MySQL.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dialect {
+    Postgres,
+    MySql,
+}
+
 /// What the MySQL handshake calls itself, which `@@version` answers.
 pub const SERVER_VERSION: &str = "8.0.0-db-noop";
 
 /// A comma- or semicolon-level split, with the delimiters left out.
-fn split_on(text: &str, delimiter: u8, parens: bool) -> Vec<&str> {
+fn split_on(text: &str, delimiter: u8, parens: bool, dialect: Dialect) -> Vec<&str> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut start = 0usize;
@@ -22,8 +34,9 @@ fn split_on(text: &str, delimiter: u8, parens: bool) -> Vec<&str> {
                 depth = depth.saturating_sub(1);
                 i += 1;
             }
-            b'\'' | b'"' | b'`' | b'$' => i = skip_literal(bytes, i),
-            b'-' | b'#' | b'/' => match skip_comment(bytes, i) {
+            b'\'' | b'"' | b'`' => i = skip_literal(bytes, i, dialect),
+            b'$' if dialect == Dialect::Postgres => i = skip_literal(bytes, i, dialect),
+            b'-' | b'#' | b'/' => match skip_comment(bytes, i, dialect) {
                 Some(next) => i = next,
                 None => i += 1,
             },
@@ -45,7 +58,7 @@ fn split_on(text: &str, delimiter: u8, parens: bool) -> Vec<&str> {
 /// Split a multi-statement query on top-level `;`, keeping empty segments: which of
 /// them answer is the caller's rule.
 /// A stored routine's body is one statement.
-pub fn split_statements(sql: &str) -> Vec<&str> {
+pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<&str> {
     let bytes = sql.as_bytes();
     let mut out = Vec::new();
     let mut start = 0usize;
@@ -59,8 +72,9 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
 
     while i < bytes.len() {
         match bytes[i] {
-            b'\'' | b'"' | b'`' | b'$' => i = skip_literal(bytes, i),
-            b'-' | b'#' | b'/' => match skip_comment(bytes, i) {
+            b'\'' | b'"' | b'`' => i = skip_literal(bytes, i, dialect),
+            b'$' if dialect == Dialect::Postgres => i = skip_literal(bytes, i, dialect),
+            b'-' | b'#' | b'/' => match skip_comment(bytes, i, dialect) {
                 Some(next) => i = next,
                 None => i += 1,
             },
@@ -88,7 +102,7 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
                     // -- closes with an END of its own.
                     *body.as_mut().expect("in a body") += 1;
                 } else if word.eq_ignore_ascii_case("END") {
-                    let next = skip_space(bytes, i);
+                    let next = skip_space(bytes, i, dialect);
                     // `END IF`, `END LOOP`, `END WHILE` and `END REPEAT` close forms
                     // that opened nothing here.
                     let closes_nothing = word_end(bytes, next).is_some_and(|end| {
@@ -124,20 +138,21 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
 }
 
 /// Split on top-level commas.
-pub fn split_top_level(text: &str) -> Vec<&str> {
-    split_on(text, b',', true)
+pub fn split_top_level(text: &str, dialect: Dialect) -> Vec<&str> {
+    split_on(text, b',', true, dialect)
 }
 
 /// How many placeholders a statement has: `?` outside quotes, comments and identifiers.
-pub fn count_placeholders(sql: &str) -> u16 {
+pub fn count_placeholders(sql: &str, dialect: Dialect) -> u16 {
     let bytes = sql.as_bytes();
     let mut i = 0usize;
     let mut count = 0u16;
 
     while i < bytes.len() {
         match bytes[i] {
-            b'\'' | b'"' | b'`' | b'$' => i = skip_literal(bytes, i),
-            b'-' | b'#' | b'/' => match skip_comment(bytes, i) {
+            b'\'' | b'"' | b'`' => i = skip_literal(bytes, i, dialect),
+            b'$' if dialect == Dialect::Postgres => i = skip_literal(bytes, i, dialect),
+            b'-' | b'#' | b'/' => match skip_comment(bytes, i, dialect) {
                 Some(next) => i = next,
                 None => i += 1,
             },
@@ -155,7 +170,7 @@ pub fn count_placeholders(sql: &str) -> u16 {
 /// The offset of the first top-level `keyword` at or after `from`.
 /// Top level is outside parentheses, quotes and comments: `select coalesce(a, 'from')`
 /// names no table, and `select (select 1 from t)` does.
-pub fn find_keyword(sql: &str, from: usize, keyword: &str) -> Option<usize> {
+pub fn find_keyword(sql: &str, from: usize, keyword: &str, dialect: Dialect) -> Option<usize> {
     let bytes = sql.as_bytes();
     let mut i = from;
     let mut depth = 0usize;
@@ -170,8 +185,9 @@ pub fn find_keyword(sql: &str, from: usize, keyword: &str) -> Option<usize> {
                 depth = depth.saturating_sub(1);
                 i += 1;
             }
-            b'\'' | b'"' | b'`' | b'$' => i = skip_literal(bytes, i),
-            b'-' | b'#' | b'/' => match skip_comment(bytes, i) {
+            b'\'' | b'"' | b'`' => i = skip_literal(bytes, i, dialect),
+            b'$' if dialect == Dialect::Postgres => i = skip_literal(bytes, i, dialect),
+            b'-' | b'#' | b'/' => match skip_comment(bytes, i, dialect) {
                 Some(next) => i = next,
                 None => i += 1,
             },
@@ -191,10 +207,10 @@ pub fn find_keyword(sql: &str, from: usize, keyword: &str) -> Option<usize> {
 
 /// The text of a keyword's argument when it is a single-quoted literal: `LIKE 'Com%'`
 /// gives `Com%`.
-pub fn quoted_argument<'a>(sql: &'a str, keyword: &str) -> Option<&'a str> {
-    let at = find_keyword(sql, 0, keyword)?;
+pub fn quoted_argument<'a>(sql: &'a str, keyword: &str, dialect: Dialect) -> Option<&'a str> {
+    let at = find_keyword(sql, 0, keyword, dialect)?;
     let rest = &sql[at + keyword.len()..];
-    let rest = trim_leading(rest);
+    let rest = trim_leading(rest, dialect);
     let rest = rest.strip_prefix('\'')?;
     let end = rest.find('\'')?;
 
@@ -219,27 +235,27 @@ const CLAUSES: [&str; 10] = [
 /// The select list: the text between `SELECT` (and `DISTINCT`) and the first top-level
 /// clause -- `FROM`, or a `LIMIT`/`ORDER`/… with no table at all.
 /// `None` when the statement does not start with `SELECT` or has no list.
-pub fn select_list(sql: &str) -> Option<&str> {
+pub fn select_list(sql: &str, dialect: Dialect) -> Option<&str> {
     let bytes = sql.as_bytes();
-    let start = skip_space(bytes, 0);
+    let start = skip_space(bytes, 0, dialect);
     if !matches!(word_end(bytes, start), Some(end) if sql[start..end].eq_ignore_ascii_case("SELECT"))
     {
         return None;
     }
-    let mut i = skip_space(bytes, word_end(bytes, start)?);
+    let mut i = skip_space(bytes, word_end(bytes, start)?, dialect);
     // `DISTINCT` / `ALL` / `DISTINCTROW`
     if let Some(end) = word_end(bytes, i) {
         if ["DISTINCT", "ALL", "DISTINCTROW"]
             .iter()
             .any(|kw| sql[i..end].eq_ignore_ascii_case(kw))
         {
-            i = skip_space(bytes, end);
+            i = skip_space(bytes, end, dialect);
         }
     }
 
     let stop = CLAUSES
         .iter()
-        .filter_map(|clause| find_keyword(sql, i, clause))
+        .filter_map(|clause| find_keyword(sql, i, clause, dialect))
         .min()
         .unwrap_or(bytes.len());
     let list = &sql[i..stop];
@@ -269,16 +285,16 @@ pub enum ConstantKind {
 
 /// A select list of literals and variables, which is a row the server can state without
 /// knowing anything about the data.
-pub fn constant_select(sql: &str) -> Option<Vec<Constant>> {
+pub fn constant_select(sql: &str, dialect: Dialect) -> Option<Vec<Constant>> {
     // A select over rows is not a row of constants.
-    if find_keyword(sql, first_word(sql).len(), "FROM").is_some() {
+    if find_keyword(sql, first_word(sql, dialect).len(), "FROM", dialect).is_some() {
         return None;
     }
-    let list = select_list(sql)?;
+    let list = select_list(sql, dialect)?;
 
     let mut items = Vec::new();
-    for item in split_top_level(list) {
-        items.push(constant_item(trim_leading(item))?);
+    for item in split_top_level(list, dialect) {
+        items.push(constant_item(trim_leading(item, dialect), dialect)?);
     }
     if items.is_empty() {
         return None;
@@ -288,10 +304,10 @@ pub fn constant_select(sql: &str) -> Option<Vec<Constant>> {
 }
 
 /// One item of a select list, when it is a literal or a variable.
-fn constant_item(item: &str) -> Option<Constant> {
+fn constant_item(item: &str, dialect: Dialect) -> Option<Constant> {
     // A trailing comment is not part of the value: `select 1 /* padding */` is still
     // the literal 1, which is what a padded query is for.
-    let item = strip_trailing_comment(item).trim_end();
+    let item = strip_trailing_comment(item, dialect).trim_end();
     if item.is_empty() {
         return None;
     }
@@ -344,13 +360,14 @@ fn constant_item(item: &str) -> Option<Constant> {
 }
 
 /// A statement item with any trailing comment removed.
-fn strip_trailing_comment(item: &str) -> &str {
+fn strip_trailing_comment(item: &str, dialect: Dialect) -> &str {
     let bytes = item.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'\'' | b'"' | b'`' | b'$' => i = skip_literal(bytes, i),
-            b'-' | b'#' | b'/' => match skip_comment(bytes, i) {
+            b'\'' | b'"' | b'`' => i = skip_literal(bytes, i, dialect),
+            b'$' if dialect == Dialect::Postgres => i = skip_literal(bytes, i, dialect),
+            b'-' | b'#' | b'/' => match skip_comment(bytes, i, dialect) {
                 Some(_) => return &item[..i],
                 None => i += 1,
             },
@@ -363,30 +380,30 @@ fn strip_trailing_comment(item: &str) -> &str {
 
 /// SQL `PREPARE name AS body`, which is a prepared statement made from a statement
 /// rather than from a Parse message.
-pub fn sql_prepare(sql: &str) -> Option<(&str, &str)> {
+pub fn sql_prepare(sql: &str, dialect: Dialect) -> Option<(&str, &str)> {
     let bytes = sql.as_bytes();
-    let start = skip_space(bytes, 0);
+    let start = skip_space(bytes, 0, dialect);
     let end = word_end(bytes, start)?;
     if !sql[start..end].eq_ignore_ascii_case("PREPARE") {
         return None;
     }
 
     // `PREPARE name AS body`, with the name optionally quoted.
-    let at = skip_space(bytes, end);
+    let at = skip_space(bytes, end, dialect);
     let (name, after) = if bytes.get(at) == Some(&b'"') {
-        let close = skip_quoted(bytes, at);
+        let close = skip_quoted(bytes, at, dialect);
         (&sql[at + 1..close.saturating_sub(1)], close)
     } else {
         let name_end = word_end(bytes, at)?;
         (&sql[at..name_end], name_end)
     };
-    let at = skip_space(bytes, after);
+    let at = skip_space(bytes, after, dialect);
     let as_end = word_end(bytes, at)?;
     if !sql[at..as_end].eq_ignore_ascii_case("AS") {
         return None;
     }
 
-    let body = trim_leading(&sql[skip_space(bytes, as_end)..]);
+    let body = trim_leading(&sql[skip_space(bytes, as_end, dialect)..], dialect);
     if body.is_empty() || name.is_empty() {
         return None;
     }
@@ -434,10 +451,10 @@ fn variable(name: &str) -> Option<(String, ConstantKind)> {
 ///
 /// `$tag$ ... $tag$` is PostgreSQL's other literal, and its body may hold
 /// anything, semicolons included.
-pub fn skip_literal(bytes: &[u8], i: usize) -> usize {
+pub fn skip_literal(bytes: &[u8], i: usize, dialect: Dialect) -> usize {
     match bytes.get(i) {
-        Some(b'\'' | b'"' | b'`') => skip_quoted(bytes, i),
-        Some(b'$') => skip_dollar(bytes, i),
+        Some(b'\'' | b'"' | b'`') => skip_quoted(bytes, i, dialect),
+        Some(b'$') if dialect == Dialect::Postgres => skip_dollar(bytes, i),
         _ => i + 1,
     }
 }
@@ -466,7 +483,7 @@ fn skip_dollar(bytes: &[u8], i: usize) -> usize {
 }
 
 /// The offset after the `)` matching the `(` at `open`, if there is one.
-pub fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
+pub fn matching_paren(bytes: &[u8], open: usize, dialect: Dialect) -> Option<usize> {
     let mut depth = 0usize;
     let mut i = open;
     while i < bytes.len() {
@@ -482,8 +499,9 @@ pub fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
                     return Some(i);
                 }
             }
-            b'\'' | b'"' | b'`' | b'$' => i = skip_literal(bytes, i),
-            b'-' | b'#' | b'/' => match skip_comment(bytes, i) {
+            b'\'' | b'"' | b'`' => i = skip_literal(bytes, i, dialect),
+            b'$' if dialect == Dialect::Postgres => i = skip_literal(bytes, i, dialect),
+            b'-' | b'#' | b'/' => match skip_comment(bytes, i, dialect) {
                 Some(next) => i = next,
                 None => i += 1,
             },
@@ -497,11 +515,20 @@ pub fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
 /// Skip a quoted run, `i` at its opening quote.
 /// A doubled quote inside is an escaped one, which is how SQL spells a quote in a
 /// literal.
-pub fn skip_quoted(bytes: &[u8], i: usize) -> usize {
+pub fn skip_quoted(bytes: &[u8], i: usize, dialect: Dialect) -> usize {
     let quote = bytes[i];
+    let escapes = match dialect {
+        // A backtick is an identifier in both dialects, and has no backslash escape.
+        Dialect::MySql => quote != b'`',
+        // PostgreSQL escapes only in an E string: `E'a\''` is one literal, `'a\'`
+        // is a literal holding a backslash.
+        Dialect::Postgres => {
+            quote == b'\''
+                && matches!(bytes.get(i.wrapping_sub(1)), Some(b'E' | b'e'))
+                && (i < 2 || !is_word_byte(bytes[i - 2]))
+        }
+    };
     let mut i = i + 1;
-    // A backtick is an identifier: it has no backslash escape.
-    let escapes = quote != b'`';
     while i < bytes.len() {
         if escapes && bytes[i] == b'\\' {
             i += 2;
@@ -525,16 +552,17 @@ pub fn skip_quoted(bytes: &[u8], i: usize) -> usize {
 
 /// Skip a comment, `i` at its first byte, or `None` when what is there only looks like
 /// one (`-` that is not `--`, `/` that is not `/*`).
-pub fn skip_comment(bytes: &[u8], i: usize) -> Option<usize> {
+pub fn skip_comment(bytes: &[u8], i: usize, dialect: Dialect) -> Option<usize> {
     match *bytes.get(i)? {
         b'#' => Some(line_end(bytes, i + 1)),
         b'-' if bytes.get(i + 1) == Some(&b'-') => Some(line_end(bytes, i + 2)),
         b'/' if bytes.get(i + 1) == Some(&b'*') => {
-            // PostgreSQL's block comments nest.
+            // **Only PostgreSQL nests them**; in MySQL the first `*/` ends the comment.
+            let nested = dialect == Dialect::Postgres;
             let mut depth = 1;
             let mut j = i + 2;
             while j + 1 < bytes.len() {
-                if bytes[j] == b'/' && bytes[j + 1] == b'*' {
+                if nested && bytes[j] == b'/' && bytes[j + 1] == b'*' {
                     depth += 1;
                     j += 2;
                 } else if bytes[j] == b'*' && bytes[j + 1] == b'/' {
@@ -563,12 +591,12 @@ fn line_end(bytes: &[u8], mut i: usize) -> usize {
 }
 
 /// Whitespace, comments included: `select /* x */ 1` is `select 1`.
-pub fn skip_space(bytes: &[u8], mut i: usize) -> usize {
+pub fn skip_space(bytes: &[u8], mut i: usize, dialect: Dialect) -> usize {
     loop {
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        match skip_comment(bytes, i) {
+        match skip_comment(bytes, i, dialect) {
             Some(next) if next > i => i = next,
             _ => return i,
         }
@@ -576,8 +604,8 @@ pub fn skip_space(bytes: &[u8], mut i: usize) -> usize {
 }
 
 /// The statement with leading whitespace and comments removed.
-pub fn trim_leading(sql: &str) -> &str {
-    let start = skip_space(sql.as_bytes(), 0);
+pub fn trim_leading(sql: &str, dialect: Dialect) -> &str {
+    let start = skip_space(sql.as_bytes(), 0, dialect);
 
     &sql[start..]
 }
@@ -600,9 +628,9 @@ pub fn word_end(bytes: &[u8], i: usize) -> Option<usize> {
 }
 
 /// The first word of a statement.
-pub fn first_word(sql: &str) -> &str {
+pub fn first_word(sql: &str, dialect: Dialect) -> &str {
     let bytes = sql.as_bytes();
-    let start = skip_space(bytes, 0);
+    let start = skip_space(bytes, 0, dialect);
     match word_end(bytes, start) {
         Some(end) => &sql[start..end],
         None => "",
@@ -612,13 +640,18 @@ pub fn first_word(sql: &str) -> &str {
 /// The words of a statement, outside quotes and comments -- all this server reads of a
 /// statement it does not interpret.
 pub struct Words<'a> {
+    dialect: Dialect,
     sql: &'a str,
     pos: usize,
 }
 
 impl<'a> Words<'a> {
-    pub fn new(sql: &'a str) -> Self {
-        Words { sql, pos: 0 }
+    pub fn new(sql: &'a str, dialect: Dialect) -> Self {
+        Words {
+            sql,
+            pos: 0,
+            dialect,
+        }
     }
 }
 
@@ -631,13 +664,16 @@ impl<'a> Iterator for Words<'a> {
         let bytes = sql.as_bytes();
 
         loop {
-            self.pos = skip_space(bytes, self.pos);
+            self.pos = skip_space(bytes, self.pos, self.dialect);
             if self.pos >= bytes.len() {
                 return None;
             }
             match bytes[self.pos] {
                 // A literal or a quoted identifier is not a word.
-                b'\'' | b'"' | b'`' | b'$' => self.pos = skip_literal(bytes, self.pos),
+                b'\'' | b'"' | b'`' => self.pos = skip_literal(bytes, self.pos, self.dialect),
+                b'$' if self.dialect == Dialect::Postgres => {
+                    self.pos = skip_literal(bytes, self.pos, self.dialect)
+                }
                 c if is_word_byte(c) => {
                     let end = word_end(bytes, self.pos).unwrap_or(bytes.len());
                     let word = &sql[self.pos..end];
@@ -654,6 +690,38 @@ impl<'a> Iterator for Words<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dialect most of these tests are about; the differences have their own
+    /// tests below.
+    const PG: Dialect = Dialect::Postgres;
+
+    fn split_statements(sql: &str) -> Vec<&str> {
+        super::split_statements(sql, PG)
+    }
+
+    fn count_placeholders(sql: &str) -> u16 {
+        super::count_placeholders(sql, PG)
+    }
+
+    fn quoted_argument<'a>(sql: &'a str, keyword: &str) -> Option<&'a str> {
+        super::quoted_argument(sql, keyword, PG)
+    }
+
+    fn select_list(sql: &str) -> Option<&str> {
+        super::select_list(sql, PG)
+    }
+
+    fn constant_select(sql: &str) -> Option<Vec<Constant>> {
+        super::constant_select(sql, PG)
+    }
+
+    fn sql_prepare(sql: &str) -> Option<(&str, &str)> {
+        super::sql_prepare(sql, PG)
+    }
+
+    fn first_word(sql: &str) -> &str {
+        super::first_word(sql, PG)
+    }
 
     /// A semicolon inside a literal or a comment is not a statement boundary, and an
     /// empty segment is a segment: which of them answer is the caller's rule.
@@ -679,7 +747,7 @@ mod tests {
     #[test]
     fn commas_split_only_at_the_top_level() {
         assert_eq!(
-            split_top_level("a, coalesce(b, 'x,y'), (select 1 from t)"),
+            super::split_top_level("a, coalesce(b, 'x,y'), (select 1 from t)", PG),
             vec!["a", " coalesce(b, 'x,y')", " (select 1 from t)"]
         );
     }
@@ -776,6 +844,43 @@ mod tests {
         assert_eq!(sql_prepare("DEALLOCATE neword"), None);
     }
 
+    /// **A backslash escapes a quote in MySQL and only in an E string in
+    /// PostgreSQL.** Treating it as an escape everywhere swallowed the rest of a
+    /// statement into a literal that never ended.
+    #[test]
+    fn a_backslash_escapes_only_where_the_dialect_says() {
+        // MySQL: always inside quotes, so the literal runs to the end.
+        assert_eq!(
+            super::count_placeholders("insert into t values ('a\\', ?)", Dialect::MySql),
+            0
+        );
+        assert_eq!(
+            super::count_placeholders("insert into t values ('it''s', ?)", Dialect::MySql),
+            1
+        );
+
+        // PostgreSQL: the backslash is part of the literal, which ends at the next
+        // quote; in MySQL the same backslash escapes it, so the literal runs on.
+        let text = b"('a\\', 1)";
+        assert_eq!(super::skip_quoted(text, 1, Dialect::Postgres), 5);
+        assert_eq!(super::skip_quoted(text, 1, Dialect::MySql), text.len());
+    }
+
+    /// **Only PostgreSQL nests block comments**, and only it has `$tag$` literals.
+    #[test]
+    fn the_dialects_differ_on_comments_and_dollar_quotes() {
+        let sql = "/* a /* b */ c */ select 1";
+        assert_eq!(first_word(sql), "select");
+        assert_eq!(super::first_word(sql, Dialect::MySql), "c");
+
+        assert_eq!(super::split_top_level("$q$a,b$q$, c", PG).len(), 2);
+        assert_eq!(
+            super::split_top_level("x$t$, y", Dialect::MySql),
+            vec!["x$t$", " y"],
+            "in MySQL a dollar is part of an identifier"
+        );
+    }
+
     /// **A dollar-quoted body is one literal**, and may hold anything.
     #[test]
     fn a_dollar_quoted_body_is_one_literal() {
@@ -787,8 +892,11 @@ mod tests {
             split_statements("select $fn$ a; b $fn$, 1 from t"),
             vec!["select $fn$ a; b $fn$, 1 from t"]
         );
-        assert_eq!(split_top_level("$q$a,b$q$, c"), vec!["$q$a,b$q$", " c"]);
-        assert_eq!(skip_literal(b"$q$a;b$q$ tail", 0), 9);
+        assert_eq!(
+            super::split_top_level("$q$a,b$q$, c", PG),
+            vec!["$q$a,b$q$", " c"]
+        );
+        assert_eq!(super::skip_literal(b"$q$a;b$q$ tail", 0, PG), 9);
     }
 
     /// **A leading comment is not a word.** `/* x */ INSERT` classified as
@@ -806,7 +914,7 @@ mod tests {
     #[test]
     fn words_skip_quotes_and_comments() {
         let words: Vec<&str> =
-            Words::new("select 'call', `payment`, 1 -- neword\n from t").collect();
+            Words::new("select 'call', `payment`, 1 -- neword\n from t", PG).collect();
         assert_eq!(words, vec!["select", "1", "from", "t"]);
     }
 }

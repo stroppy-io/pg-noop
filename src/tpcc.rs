@@ -4,7 +4,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::sql;
+use crate::sql::{self, Dialect};
 
 /// A TPC-C transaction, by the procedure that runs it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -137,13 +137,13 @@ pub fn profile() -> bool {
 }
 
 /// A one-number answer a TPC-C client reads, when the profile is on.
-pub fn number_query(sql: &str) -> Option<(&'static str, u64)> {
+pub fn number_query(sql: &str, dialect: Dialect) -> Option<(&'static str, u64)> {
     if !profile() {
         return None;
     }
 
-    let trimmed = sql::trim_leading(sql);
-    let mut words = sql::Words::new(trimmed).map(|w| w.to_ascii_lowercase());
+    let trimmed = sql::trim_leading(sql, dialect);
+    let mut words = sql::Words::new(trimmed, dialect).map(|w| w.to_ascii_lowercase());
     let first = words.next()?;
     if first != "select" {
         return None;
@@ -357,9 +357,9 @@ pub enum Failure {
 
 /// The failure a statement asks for, if it asks for one.
 /// Deliberately mechanical: the shapes are listed here and nowhere else.
-pub fn failure(sql: &str) -> Option<Failure> {
-    let trimmed = sql::trim_leading(sql);
-    let mut words = sql::Words::new(trimmed);
+pub fn failure(sql: &str, dialect: Dialect) -> Option<Failure> {
+    let trimmed = sql::trim_leading(sql, dialect);
+    let mut words = sql::Words::new(trimmed, dialect);
 
     // `SIGNAL [SQLSTATE] '<code>'`
     if words
@@ -367,10 +367,10 @@ pub fn failure(sql: &str) -> Option<Failure> {
         .is_some_and(|w| w.eq_ignore_ascii_case("SIGNAL"))
     {
         // `SIGNAL '<code>'` without the keyword, else the generic one.
-        let code = sql::quoted_argument(trimmed, "SQLSTATE")
+        let code = sql::quoted_argument(trimmed, "SQLSTATE", dialect)
             .map(str::to_string)
             .or_else(|| {
-                let rest = sql::trim_leading(&trimmed["SIGNAL".len()..]);
+                let rest = sql::trim_leading(&trimmed["SIGNAL".len()..], dialect);
 
                 rest.strip_prefix('\'')
                     .and_then(|r| r.split('\'').next())
@@ -384,7 +384,7 @@ pub fn failure(sql: &str) -> Option<Failure> {
     // `RAISE`, as a word anywhere: `select raise(...)`, `raise_exception(...)`,
     // `raise_sqlstate(...)`.
     // `raise_notice` is a warning and is not one.
-    if sql::Words::new(trimmed).any(|w| {
+    if sql::Words::new(trimmed, dialect).any(|w| {
         let lower = w.to_ascii_lowercase();
 
         (lower == "raise" || lower.starts_with("raise_")) && lower != "raise_notice"
@@ -393,18 +393,15 @@ pub fn failure(sql: &str) -> Option<Failure> {
     }
 
     // A NULL in the statement's values.
-    if writes_null(trimmed) {
+    if writes_null(trimmed, dialect) {
         return Some(Failure::Null);
     }
 
     // `CALL name(...)`: known procedures are transactions, the rest are not.
-    if let Some(first) = sql::first_word(trimmed).to_uppercase().as_str().into() {
-        let _ = first;
-    }
-    if sql::Words::new(trimmed)
+    if sql::Words::new(trimmed, dialect)
         .next()
         .is_some_and(|w| w.eq_ignore_ascii_case("CALL"))
-        && statement_kind(trimmed).is_none()
+        && statement_kind(trimmed, dialect).is_none()
     {
         return Some(Failure::UnknownProcedure);
     }
@@ -413,18 +410,18 @@ pub fn failure(sql: &str) -> Option<Failure> {
 }
 
 /// Whether an INSERT or UPDATE writes the SQL `NULL` literal into a column.
-fn writes_null(sql: &str) -> bool {
-    let head = sql::first_word(sql);
+fn writes_null(sql: &str, dialect: Dialect) -> bool {
+    let head = sql::first_word(sql, dialect);
     if !head.eq_ignore_ascii_case("INSERT") && !head.eq_ignore_ascii_case("UPDATE") {
         return false;
     }
 
-    sql::Words::new(sql).any(|w| w.eq_ignore_ascii_case("NULL"))
+    sql::Words::new(sql, dialect).any(|w| w.eq_ignore_ascii_case("NULL"))
 }
 
 /// The transaction a statement is, when it is a TPC-C one.
-pub fn statement_kind(sql: &str) -> Option<Kind> {
-    let mut words = sql::Words::new(sql);
+pub fn statement_kind(sql: &str, dialect: Dialect) -> Option<Kind> {
+    let mut words = sql::Words::new(sql, dialect);
 
     match words.next() {
         Some(word) if word.eq_ignore_ascii_case("CALL") => {
@@ -442,7 +439,7 @@ pub fn statement_kind(sql: &str) -> Option<Kind> {
         // A PostgreSQL TPC-C client calls a procedure as a function, in a SELECT:
         // `select neword(...)`, `select * from neword(...)`.
         Some(word) if word.eq_ignore_ascii_case("SELECT") || word.eq_ignore_ascii_case("WITH") => {
-            called_procedure(sql)
+            called_procedure(sql, dialect)
         }
         Some(word) if word.eq_ignore_ascii_case("INSERT") => {
             let names_new_order = words.any(|w| {
@@ -458,21 +455,21 @@ pub fn statement_kind(sql: &str) -> Option<Kind> {
 }
 
 /// The TPC-C procedure a statement CALLS, as `name(` outside quotes and comments.
-fn called_procedure(sql: &str) -> Option<Kind> {
+fn called_procedure(sql: &str, dialect: Dialect) -> Option<Kind> {
     let bytes = sql.as_bytes();
     let mut i = 0usize;
 
     while i < bytes.len() {
         match bytes[i] {
-            b'\'' | b'"' | b'`' => i = sql::skip_quoted(bytes, i),
-            b'-' | b'#' | b'/' => match sql::skip_comment(bytes, i) {
+            b'\'' | b'"' | b'`' => i = sql::skip_quoted(bytes, i, dialect),
+            b'-' | b'#' | b'/' => match sql::skip_comment(bytes, i, dialect) {
                 Some(next) => i = next,
                 None => i += 1,
             },
             c if sql::is_word_byte(c) => {
                 let end = sql::word_end(bytes, i)?;
                 let word = &sql[i..end];
-                let after = sql::skip_space(bytes, end);
+                let after = sql::skip_space(bytes, end, dialect);
                 if after < bytes.len() && bytes[after] == b'(' {
                     if let Some(kind) = Kind::from_procedure(word) {
                         return Some(kind);
@@ -490,8 +487,8 @@ fn called_procedure(sql: &str) -> Option<Kind> {
 /// `SHOW GLOBAL STATUS`, and the filter a client gives it.
 /// HammerDB reads `Com_commit` and `Com_rollback` from it; a `LIKE` filter is how it
 /// asks for one at a time.
-pub fn show_status(sql: &str) -> Option<Option<String>> {
-    let mut words = sql::Words::new(sql);
+pub fn show_status(sql: &str, dialect: Dialect) -> Option<Option<String>> {
+    let mut words = sql::Words::new(sql, dialect);
     if !words.next()?.eq_ignore_ascii_case("SHOW") {
         return None;
     }
@@ -505,7 +502,7 @@ pub fn show_status(sql: &str) -> Option<Option<String>> {
         return None;
     }
 
-    Some(sql::quoted_argument(sql, "LIKE").map(str::to_string))
+    Some(sql::quoted_argument(sql, "LIKE", dialect).map(str::to_string))
 }
 
 /// The status rows this server reports, in MySQL's own order, with the `LIKE` filter
@@ -560,11 +557,11 @@ fn like(pattern: &str, text: &str) -> bool {
 /// `SELECT @var, ...`: the OUT parameters a stored-procedure client reads after its
 /// `CALL`.
 /// Only user variables, and only variables: a select of a column is not this.
-pub fn select_vars(sql: &str) -> Option<Vec<String>> {
-    let list = sql::select_list(sql)?;
+pub fn select_vars(sql: &str, dialect: Dialect) -> Option<Vec<String>> {
+    let list = sql::select_list(sql, dialect)?;
 
     let mut names = Vec::new();
-    for item in sql::split_top_level(list) {
+    for item in sql::split_top_level(list, dialect) {
         let name = item.trim().strip_prefix('@')?;
         // `@@version` is a system variable, and this rule does not answer it.
         if name.starts_with('@') {
@@ -603,11 +600,17 @@ mod tests {
             ("call SLEV(1, 2, 3, 4)", Kind::StockLevel),
             ("call tpcc.neword(1, 2, 3, 4)", Kind::NewOrder),
         ] {
-            assert_eq!(statement_kind(sql), Some(kind), "{sql}");
+            assert_eq!(statement_kind(sql, Dialect::Postgres), Some(kind), "{sql}");
         }
 
-        assert_eq!(statement_kind("call unknown_proc(1)"), None);
-        assert_eq!(statement_kind("insert into warehouse values (1)"), None);
+        assert_eq!(
+            statement_kind("call unknown_proc(1)", Dialect::Postgres),
+            None
+        );
+        assert_eq!(
+            statement_kind("insert into warehouse values (1)", Dialect::Postgres),
+            None
+        );
     }
 
     /// A PostgreSQL TPC-C client calls its procedures as functions, in a SELECT:
@@ -629,17 +632,23 @@ mod tests {
             // not when it is parsed.
             ("select * from neword($1, $2, $3, $4)", Kind::NewOrder),
         ] {
-            assert_eq!(statement_kind(sql), Some(kind), "{sql}");
+            assert_eq!(statement_kind(sql, Dialect::Postgres), Some(kind), "{sql}");
         }
 
         // A name that is not called is not a transaction: a column called `payment`, or
         // a table someone named after the procedure.
-        assert_eq!(statement_kind("select payment from orders"), None);
         assert_eq!(
-            statement_kind("select * from orders where payment = 1"),
+            statement_kind("select payment from orders", Dialect::Postgres),
             None
         );
-        assert_eq!(statement_kind("select count(*) from new_order"), None);
+        assert_eq!(
+            statement_kind("select * from orders where payment = 1", Dialect::Postgres),
+            None
+        );
+        assert_eq!(
+            statement_kind("select count(*) from new_order", Dialect::Postgres),
+            None
+        );
     }
 
     /// A plain-SQL NewOrder is an INSERT into the new_order table, which is the one
@@ -651,27 +660,40 @@ mod tests {
             "INSERT INTO tpcc_new_order (no_w_id) VALUES (1)",
             "insert into tpcc.new_order (no_w_id) values (1)",
         ] {
-            assert_eq!(statement_kind(sql), Some(Kind::NewOrder), "{sql}");
+            assert_eq!(
+                statement_kind(sql, Dialect::Postgres),
+                Some(Kind::NewOrder),
+                "{sql}"
+            );
         }
 
-        assert_eq!(statement_kind("insert into orders values (1)"), None);
+        assert_eq!(
+            statement_kind("insert into orders values (1)", Dialect::Postgres),
+            None
+        );
     }
 
     /// `show global status`, and the `LIKE` a client filters it with.
     #[test]
     fn show_global_status_is_recognised_with_its_filter() {
-        assert_eq!(show_status("show global status"), Some(None));
-        assert_eq!(show_status("SHOW STATUS"), Some(None));
         assert_eq!(
-            show_status("show global status like 'Com_commit'"),
+            show_status("show global status", Dialect::Postgres),
+            Some(None)
+        );
+        assert_eq!(show_status("SHOW STATUS", Dialect::Postgres), Some(None));
+        assert_eq!(
+            show_status("show global status like 'Com_commit'", Dialect::Postgres),
             Some(Some("Com_commit".to_string()))
         );
         assert_eq!(
-            show_status("show global status like 'Com%'"),
+            show_status("show global status like 'Com%'", Dialect::Postgres),
             Some(Some("Com%".to_string()))
         );
-        assert_eq!(show_status("show tables"), None);
-        assert_eq!(show_status("show global variables"), None);
+        assert_eq!(show_status("show tables", Dialect::Postgres), None);
+        assert_eq!(
+            show_status("show global variables", Dialect::Postgres),
+            None
+        );
     }
 
     /// The filter decides which counters are reported, with MySQL's wildcard rules.
@@ -700,35 +722,41 @@ mod tests {
     #[test]
     fn an_injected_failure_is_recognised() {
         assert_eq!(
-            failure("SIGNAL SQLSTATE '45000'"),
+            failure("SIGNAL SQLSTATE '45000'", Dialect::Postgres),
             Some(Failure::Signal("45000".to_string()))
         );
         assert_eq!(
-            failure("signal '40001'"),
+            failure("signal '40001'", Dialect::Postgres),
             Some(Failure::Signal("40001".to_string()))
         );
         assert_eq!(
-            failure("insert into new_order (no_w_id) values (NULL)"),
+            failure(
+                "insert into new_order (no_w_id) values (NULL)",
+                Dialect::Postgres
+            ),
             Some(Failure::Null)
         );
         assert_eq!(
-            failure("update district set d_next_o_id = NULL"),
+            failure("update district set d_next_o_id = NULL", Dialect::Postgres),
             Some(Failure::Null)
         );
         assert_eq!(
-            failure("select raise_exception('no stock')"),
+            failure("select raise_exception('no stock')", Dialect::Postgres),
             Some(Failure::Raise)
         );
         assert_eq!(
-            failure("call nosuch_procedure(1, 2)"),
+            failure("call nosuch_procedure(1, 2)", Dialect::Postgres),
             Some(Failure::UnknownProcedure)
         );
 
         // A known procedure is a transaction, not a failure; a NULL in a SELECT is a
         // value the server answers.
-        assert_eq!(failure("call NEWORD(1, 2, 3, 4)"), None);
-        assert_eq!(failure("select NULL"), None);
-        assert_eq!(failure("insert into new_order values (1, 2, 3)"), None);
+        assert_eq!(failure("call NEWORD(1, 2, 3, 4)", Dialect::Postgres), None);
+        assert_eq!(failure("select NULL", Dialect::Postgres), None);
+        assert_eq!(
+            failure("insert into new_order values (1, 2, 3)", Dialect::Postgres),
+            None
+        );
     }
 
     /// `SELECT @a, @b` answers its variables, and a select of columns is not mistaken
@@ -736,14 +764,20 @@ mod tests {
     #[test]
     fn select_variables_are_recognised() {
         assert_eq!(
-            select_vars("select @neword_out, @d_next_o_id"),
+            select_vars("select @neword_out, @d_next_o_id", Dialect::Postgres),
             Some(vec!["neword_out".to_string(), "d_next_o_id".to_string()])
         );
-        assert_eq!(select_vars("select @x"), Some(vec!["x".to_string()]));
-        assert_eq!(select_vars("select @@version"), None);
-        assert_eq!(select_vars("select w_id from warehouse"), None);
         assert_eq!(
-            select_vars("select @x, w_id"),
+            select_vars("select @x", Dialect::Postgres),
+            Some(vec!["x".to_string()])
+        );
+        assert_eq!(select_vars("select @@version", Dialect::Postgres), None);
+        assert_eq!(
+            select_vars("select w_id from warehouse", Dialect::Postgres),
+            None
+        );
+        assert_eq!(
+            select_vars("select @x, w_id", Dialect::Postgres),
             None,
             "mixed is not this rule"
         );
@@ -780,36 +814,47 @@ mod tests {
             "select max(w_id) from warehouse",
             "select count(*) from orders",
         ] {
-            assert_eq!(number_query(sql), None, "{sql} without the profile");
+            assert_eq!(
+                number_query(sql, Dialect::Postgres),
+                None,
+                "{sql} without the profile"
+            );
         }
 
         set_profile(true);
         assert_eq!(
-            number_query("select sum(d_next_o_id) from district"),
+            number_query("select sum(d_next_o_id) from district", Dialect::Postgres),
             Some(("sum(d_next_o_id)", 3001 * 100 + new_orders()))
         );
         assert_eq!(
-            number_query("select max(w_id) from warehouse"),
+            number_query("select max(w_id) from warehouse", Dialect::Postgres),
             Some(("max(w_id)", 10))
         );
         assert_eq!(
-            number_query("select max(d_id) from district"),
+            number_query("select max(d_id) from district", Dialect::Postgres),
             Some(("max(d_id)", 10))
         );
         assert_eq!(
-            number_query("select count(*) from orders"),
+            number_query("select count(*) from orders", Dialect::Postgres),
             Some(("count(*)", 3000 * 100 + new_orders()))
         );
         assert_eq!(
-            number_query("select count(*) from new_order"),
+            number_query("select count(*) from new_order", Dialect::Postgres),
             Some(("count(*)", 900 * 100))
         );
         assert_eq!(
-            number_query("select sum(xact_commit+xact_rollback) from pg_stat_database"),
+            number_query(
+                "select sum(xact_commit+xact_rollback) from pg_stat_database",
+                Dialect::Postgres
+            ),
             Some(("sum", com_commit() + com_rollback()))
         );
-        assert_eq!(number_query("select 1"), None, "a literal is not a count");
-        assert_eq!(number_query("select a from t"), None);
+        assert_eq!(
+            number_query("select 1", Dialect::Postgres),
+            None,
+            "a literal is not a count"
+        );
+        assert_eq!(number_query("select a from t", Dialect::Postgres), None);
 
         // The line says which kind of number it is reporting.
         assert!(line().contains("[synthetic NOPM]"));
