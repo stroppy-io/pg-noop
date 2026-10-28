@@ -1122,3 +1122,31 @@ fn a_plain_query_still_splits_and_a_case_expression_closes_nothing() {
     );
     assert_eq!(packets.len(), 5, "the definition and one row: {packets:?}");
 }
+
+/// **A trailing `LIMIT` is a clause, not part of the select list.** The mariadb
+/// client asks `select @@version_comment limit 1` at connect, and a list that
+/// swallowed the `LIMIT` was neither a variable nor a literal, so the client got
+/// zero rows for a value it cannot start without.
+#[test]
+fn a_trailing_limit_still_leaves_a_constant() {
+    let mut c = connected(CAPS);
+
+    for (sql, columns, expected) in [
+        ("select 1 limit 1", 1, "1"),
+        (
+            "select @@version_comment limit 1",
+            1,
+            "db-noop: a no-op server for measuring clients",
+        ),
+        ("select 7, 'x' limit 1", 2, "7"),
+    ] {
+        let packets = round_trip(&mut c, &query(sql));
+        let (got_columns, rows, _) = result_set(&packets);
+        assert_eq!((got_columns, rows), (columns, 1), "{sql}: {packets:?}");
+        assert_eq!(row_value(&packets[columns + 1]), expected, "{sql}");
+    }
+
+    // The column is named after the list, not after the clause.
+    let packets = round_trip(&mut c, &query("select 1 limit 1"));
+    assert_eq!(definition_name(&packets[1]), "1");
+}

@@ -221,9 +221,24 @@ pub fn quoted_argument<'a>(sql: &'a str, keyword: &str) -> Option<&'a str> {
     Some(&rest[..end])
 }
 
+/// The words that end a select list: everything after the list is a clause about
+/// the rows rather than a column of them.
+const CLAUSES: [&str; 10] = [
+    "FROM",
+    "LIMIT",
+    "ORDER",
+    "GROUP",
+    "HAVING",
+    "OFFSET",
+    "UNION",
+    "INTO",
+    "FOR",
+    "PROCEDURE",
+];
+
 /// The select list: the text between `SELECT` (and `DISTINCT`) and the first
-/// top-level `FROM`, or the end of the statement. `None` when the statement does
-/// not start with `SELECT` or has no list.
+/// top-level clause -- `FROM`, or a `LIMIT`/`ORDER`/… with no table at all.
+/// `None` when the statement does not start with `SELECT` or has no list.
 pub fn select_list(sql: &str) -> Option<&str> {
     let bytes = sql.as_bytes();
     let start = skip_space(bytes, 0);
@@ -242,7 +257,11 @@ pub fn select_list(sql: &str) -> Option<&str> {
         }
     }
 
-    let stop = find_keyword(sql, i, "FROM").unwrap_or(bytes.len());
+    let stop = CLAUSES
+        .iter()
+        .filter_map(|clause| find_keyword(sql, i, clause))
+        .min()
+        .unwrap_or(bytes.len());
     let list = &sql[i..stop];
     if list.trim().is_empty() {
         return None;
@@ -440,7 +459,7 @@ mod tests {
         assert_eq!(count_placeholders("select /* ? */ ?"), 1);
     }
 
-    /// The select list ends at a top-level `FROM` -- not at one inside a call,
+    /// The select list ends at a top-level clause -- not at one inside a call,
     /// a literal or a subquery's own `from`.
     #[test]
     fn the_select_list_ends_at_its_own_from() {
@@ -455,6 +474,11 @@ mod tests {
             Some("(select 1 from t) ")
         );
         assert_eq!(select_list("select distinct a from t"), Some("a "));
+        assert_eq!(select_list("select 1 limit 1"), Some("1 "));
+        assert_eq!(
+            select_list("select @@version_comment limit 1"),
+            Some("@@version_comment ")
+        );
         assert_eq!(select_list("insert into t values (1)"), None);
         assert_eq!(select_list("select"), None);
     }
