@@ -5,10 +5,20 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::plan::{
-    consume_keyword, find_matching_paren, parse_identifier, parse_qualified_name, skip_ws,
-    split_top_level, SelectColumn,
-};
+use crate::plan::{parse_identifier, parse_qualified_name, SelectColumn};
+use crate::sql::{self, Dialect};
+
+/// The keyword at `pos` (after any whitespace and comments), and where it ends.
+fn consume_keyword(sql: &str, pos: usize, keyword: &str) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let at = sql::skip_space(bytes, pos, Dialect::Postgres);
+    let end = sql::word_end(bytes, at)?;
+    if sql[at..end].eq_ignore_ascii_case(keyword) {
+        Some(end)
+    } else {
+        None
+    }
+}
 
 pub struct NoopHandler {
     catalog: RwLock<SchemaCatalog>,
@@ -137,7 +147,7 @@ impl SchemaCatalog {
 }
 
 pub(crate) fn parse_create_table(sql: &str) -> Option<(Vec<String>, Vec<ColumnInfo>)> {
-    let mut pos = skip_ws(sql, 0);
+    let mut pos = sql::skip_space(sql.as_bytes(), 0, Dialect::Postgres);
     pos = consume_keyword(sql, pos, "CREATE")?;
 
     if let Some(next) = consume_keyword(sql, pos, "UNLOGGED") {
@@ -156,12 +166,12 @@ pub(crate) fn parse_create_table(sql: &str) -> Option<(Vec<String>, Vec<ColumnIn
     }
 
     let (table_name, after_name) = parse_qualified_name(sql, pos)?;
-    pos = skip_ws(sql, after_name);
+    pos = sql::skip_space(sql.as_bytes(), after_name, Dialect::Postgres);
     if sql.as_bytes().get(pos) != Some(&b'(') {
         return None;
     }
 
-    let close = find_matching_paren(sql, pos)?;
+    let close = sql::matching_paren(sql.as_bytes(), pos, Dialect::Postgres)?;
     let columns = parse_column_defs(&sql[pos + 1..close]);
     if columns.is_empty() {
         return None;
@@ -171,7 +181,7 @@ pub(crate) fn parse_create_table(sql: &str) -> Option<(Vec<String>, Vec<ColumnIn
 }
 
 pub(crate) fn parse_drop_table(sql: &str) -> Option<Vec<Vec<String>>> {
-    let mut pos = skip_ws(sql, 0);
+    let mut pos = sql::skip_space(sql.as_bytes(), 0, Dialect::Postgres);
     pos = consume_keyword(sql, pos, "DROP")?;
     pos = consume_keyword(sql, pos, "TABLE")?;
 
@@ -185,7 +195,7 @@ pub(crate) fn parse_drop_table(sql: &str) -> Option<Vec<Vec<String>>> {
     }
 
     let mut tables = Vec::new();
-    for part in split_top_level(names, ',') {
+    for part in sql::split_top_level(names, Dialect::Postgres) {
         let part = part.trim();
         if part.is_empty() {
             continue;
@@ -209,7 +219,7 @@ pub(crate) fn parse_drop_table(sql: &str) -> Option<Vec<Vec<String>>> {
 }
 
 fn parse_column_defs(defs: &str) -> Vec<ColumnInfo> {
-    split_top_level(defs, ',')
+    sql::split_top_level(defs, Dialect::Postgres)
         .into_iter()
         .filter_map(parse_column_def)
         .collect()
@@ -279,9 +289,9 @@ pub(crate) fn type_words(sql: &str, max_words: usize) -> Vec<String> {
     let mut words = Vec::new();
     let mut pos = 0;
     while words.len() < max_words {
-        pos = skip_ws(sql, pos);
+        pos = sql::skip_space(sql.as_bytes(), pos, Dialect::Postgres);
         if sql.as_bytes().get(pos) == Some(&b'(') {
-            pos = match find_matching_paren(sql, pos) {
+            pos = match sql::matching_paren(sql.as_bytes(), pos, Dialect::Postgres) {
                 Some(close) => close + 1,
                 None => break,
             };
@@ -396,6 +406,40 @@ mod tests {
         assert_eq!(columns[3].oid, 1700);
         assert_eq!(columns[4].oid, 1114);
         assert_eq!(columns[5].oid, 16);
+    }
+
+    /// **A comment before CREATE does not keep the table out of the catalog.** The
+    /// keyword walk used a whitespace-only skip, so `/* x */ CREATE TABLE t (a int)`
+    /// was tagged as DDL and then parsed as nothing.
+    #[test]
+    fn a_comment_before_create_still_builds_the_table() {
+        let view = CatalogView(Arc::new(NoopHandler::new()));
+
+        view.apply("/* x */ CREATE TABLE t (a INT, b TEXT)");
+
+        let columns = view
+            .columns_for(
+                &["t".to_string()],
+                &[SelectColumn {
+                    name: Some("a".to_string()),
+                    is_star: false,
+                }],
+            )
+            .expect("the table is in the catalog");
+        assert_eq!(columns, vec![("a".to_string(), 23)]);
+
+        // And a comment inside the column list is not part of a column.
+        view.apply("CREATE TABLE u (a INT /* the id */, b TEXT)");
+        let columns = view
+            .columns_for(
+                &["u".to_string()],
+                &[SelectColumn {
+                    name: None,
+                    is_star: true,
+                }],
+            )
+            .expect("the table is in the catalog");
+        assert_eq!(columns.len(), 2, "{columns:?}");
     }
 
     #[test]

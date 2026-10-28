@@ -4,7 +4,7 @@
 
 use std::fmt::Debug;
 
-use crate::sql::Dialect;
+use crate::sql::{self, Dialect};
 
 pub(crate) fn starts_with_keyword(sql: &str, kw: &str) -> bool {
     let bytes = sql.trim_start().as_bytes();
@@ -594,55 +594,6 @@ pub(crate) fn split_top_level(sql: &str, delimiter: char) -> Vec<&str> {
     parts
 }
 
-pub(crate) fn find_matching_paren(sql: &str, open_pos: usize) -> Option<usize> {
-    let bytes = sql.as_bytes();
-    if bytes.get(open_pos) != Some(&b'(') {
-        return None;
-    }
-
-    let mut pos = open_pos;
-    let mut depth: u32 = 0;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-
-    while pos < bytes.len() {
-        let byte = bytes[pos];
-        if in_single_quote {
-            if byte == b'\'' {
-                if bytes.get(pos + 1) == Some(&b'\'') {
-                    pos += 2;
-                    continue;
-                }
-                in_single_quote = false;
-            }
-        } else if in_double_quote {
-            if byte == b'"' {
-                if bytes.get(pos + 1) == Some(&b'"') {
-                    pos += 2;
-                    continue;
-                }
-                in_double_quote = false;
-            }
-        } else {
-            match byte {
-                b'\'' => in_single_quote = true,
-                b'"' => in_double_quote = true,
-                b'(' => depth += 1,
-                b')' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        return Some(pos);
-                    }
-                }
-                _ => {}
-            }
-        }
-        pos += 1;
-    }
-
-    None
-}
-
 fn find_top_level_keyword(sql: &str, start: usize, keyword: &str) -> Option<usize> {
     let bytes = sql.as_bytes();
     let mut pos = start;
@@ -710,11 +661,8 @@ pub(crate) fn keyword_at(sql: &str, pos: usize, keyword: &str) -> bool {
     true
 }
 
-pub(crate) fn skip_ws(sql: &str, mut pos: usize) -> usize {
-    while pos < sql.len() && sql.as_bytes()[pos].is_ascii_whitespace() {
-        pos += 1;
-    }
-    pos
+pub(crate) fn skip_ws(sql: &str, pos: usize) -> usize {
+    sql::skip_space(sql.as_bytes(), pos, Dialect::Postgres)
 }
 
 /// What a statement will do, decided ONCE when it is prepared.
