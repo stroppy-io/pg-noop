@@ -480,9 +480,8 @@ fn compute_plan() -> Plan {
     let defer = crate::config::env("NO_DEFER").is_none();
     let sqpoll = crate::config::env("SQPOLL").and_then(|v| v.parse::<u32>().ok());
 
-    // The completion queue is sized for four times the connection capacity -- `entries`
-    // submission slots is the capacity a shard is built for -- so a burst of
-    // completions is drained rather than pushed into the kernel's overflow list, which
+    // The completion queue is four times the submission capacity, so a burst is
+    // drained rather than pushed into the kernel's overflow list.
     let mut plan = match climb(defer, 1, |s| build(s, ENTRIES).map(drop)) {
         Ok(p) => p,
         Err(e) => {
@@ -1440,9 +1439,8 @@ fn passes(
                     slot.startup_deadline = None;
                 }
 
-                // `shutdown`, not `close`: a slot with a receive in flight may not be
-                // freed, and shutting the socket down is what makes that receive return
-                // 0, so the ordinary path reaps it -- and gives its buffer back on the
+                // `shutdown`, not `close`: a receive in flight may not be freed, and
+                // shutting down makes it return 0 so the ordinary path reaps it.
                 begin_close(slots, free_slots, spare, bufs.as_mut(), idx);
             }
             std::mem::swap(&mut startup, &mut scratch);

@@ -439,8 +439,7 @@ impl Conn {
         };
 
         // An empty segment -- `a;;b`, or a trailing `;` -- is not a statement:
-        // answering one would be a result the client is not counting on, and leaving
-        // `MORE_RESULTS_EXISTS` on it would make the client wait for a result that
+        // a client counting results would wait for one that never comes.
         let statements: Vec<&str> = if self.multi_statements() {
             sql::split_statements(sql)
         } else {
