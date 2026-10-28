@@ -62,7 +62,7 @@ pub enum Kind {
     Text,
     /// `MYSQL_TYPE_LONGLONG`, for the one number this server really produces: the TPC-C
     /// district sum in `crate::tpcc`.
-        LongLong,
+    LongLong,
 }
 
 impl Kind {

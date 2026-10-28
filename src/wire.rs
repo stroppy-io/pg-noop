@@ -799,9 +799,8 @@ impl Conn {
                 // EmptyQueryResponse where PostgreSQL answers 08P01.
                 let (sql, end) = cstr_at(body, 0)?;
                 exhausted(body, end)?;
-                // `PREPARE name AS body` registers a statement, which is how a
-                // SQL-preparing client (HammerDB's PostgreSQL TPC-C at login) makes
-                // one: the name has to be found by a later Bind, or every execution is
+                // `PREPARE name AS body` registers a statement: a SQL-preparing
+                // client sends no Parse, and an unregistered name is 26000 on Bind.
                 if let Some((name, body)) = crate::sql::sql_prepare(sql) {
                     if self.statements.contains_key(name) {
                         self.error(
@@ -3492,9 +3491,8 @@ mod tests {
         assert_eq!(first_sqlstate(&out), "22P04");
     }
 
-    /// The trailer is how a writer says it is done, but PostgreSQL's reader
-    /// (`CopyFromBinaryOneRow`) treats a clean EOF at a tuple boundary the same way --
-    /// "EOF detected (end of file, or trailer)" -- so a stream that omits it is
+    /// The trailer says the writer is done, and PostgreSQL's reader treats a clean
+    /// EOF at a tuple boundary the same way.
     #[test]
     fn binary_copy_without_a_trailer_is_still_complete() {
         let mut stream = binary_header(0, &[]);
