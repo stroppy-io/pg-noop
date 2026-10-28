@@ -21,10 +21,7 @@ use pgwire::messages::PgWireBackendMessage;
 
 pub struct NoopHandler {
     catalog: RwLock<SchemaCatalog>,
-    /// One parser for the life of the server. `query_parser()` is called on the
-    /// extended-query path for EVERY statement, and it used to return
-    /// `Arc::new(NoopQueryParser)` -- a heap allocation per query to hand back a
-    /// zero-sized type.
+    /// One parser for the life of the server.
     parser: Arc<PlanParser>,
 }
 
@@ -173,17 +170,7 @@ impl SchemaCatalog {
 // Accept all connections without authentication.
 impl NoopStartupHandler for NoopHandler {}
 
-/// Builds N FieldInfo entries typed as INT8 (text format). Matches the stroppy
-/// noop driver which returns int64(1) for every column, giving workloads a
-/// non-null, non-zero value so null-row checks and counting guards execute
-/// without errors.
-/// True when `sql`, ignoring leading whitespace, begins with `kw` compared
-/// case-insensitively.
-///
-/// This exists to delete `sql.trim().to_ascii_uppercase()` from the hot path.
-/// That call allocated and copied the WHOLE statement so the next line could
-/// look at its first six bytes, and it happened at least twice per query --
-/// once in classify_*, once more in count_select_columns.
+/// Builds N FieldInfo entries typed as INT8 (text format).
 fn starts_with_keyword(sql: &str, kw: &str) -> bool {
     let bytes = sql.trim_start().as_bytes();
     let kw_bytes = kw.as_bytes();
@@ -192,11 +179,8 @@ fn starts_with_keyword(sql: &str, kw: &str) -> bool {
 }
 
 /// The leading alphabetic keyword of `sql`, as a slice into it -- no allocation.
-///
-/// The classify chains used to build an uppercase COPY of the whole statement
-/// and then ask it eleven `starts_with` questions. Matching the first word in
-/// place answers the same questions, and is strictly more precise: `starts_with`
-/// also accepted "SELECTED" as a SELECT.
+/// Matching the first word in place answers the same questions, and is strictly more
+/// precise: `starts_with` also accepted "SELECTED" as a SELECT.
 fn first_keyword(sql: &str) -> &str {
     let rest = sql.trim_start();
     let end = rest
@@ -206,9 +190,9 @@ fn first_keyword(sql: &str) -> &str {
     &rest[..end]
 }
 
-/// Pre-built stub field vectors for the column counts a benchmark actually
-/// produces. `stub_fields` allocated an Arc, a Vec and a String per column on
-/// every SELECT that was not a metadata select -- which is every `select 1`.
+/// Pre-built stub field vectors for the column counts a benchmark actually produces.
+/// `stub_fields` allocated an Arc, a Vec and a String per column on every SELECT that
+/// was not a metadata select -- which is every `select 1`.
 static STUB_FIELD_CACHE: OnceLock<Vec<Arc<Vec<FieldInfo>>>> = OnceLock::new();
 
 const STUB_FIELD_CACHE_MAX: usize = 16;
@@ -235,8 +219,8 @@ fn build_stub_fields(n: usize) -> Arc<Vec<FieldInfo>> {
 /// Counts SELECT columns at paren-depth 0 between SELECT and FROM.
 /// Works reliably for pgx's `select "c1", "c2" from "t"` pattern.
 fn count_select_columns(sql: &str) -> usize {
-    // No uppercase copy: the scan below only looks at ASCII punctuation and at
-    // the " FROM " keyword, which is matched case-insensitively in place.
+    // No uppercase copy: the scan below only looks at ASCII punctuation and at the "
+    // FROM " keyword, which is matched case-insensitively in place.
     let trimmed = sql.trim();
     if !starts_with_keyword(trimmed, "SELECT ") {
         return 1;
@@ -251,9 +235,9 @@ fn count_select_columns(sql: &str) -> usize {
         match bytes[i] {
             b'(' => depth += 1,
             b')' => depth = depth.saturating_sub(1),
-            // Case-insensitive in place: this branch removed the uppercase
-            // copy of the whole statement, so the keyword has to be matched
-            // here rather than in an uppercased buffer.
+            // Case-insensitive in place: this branch removed the uppercase copy of the
+            // whole statement, so the keyword has to be matched here rather than in an
+            // uppercased buffer.
             b' ' if depth == 0
                 && body.as_bytes()[i..].len() >= 6
                 && body.as_bytes()[i..i + 6].eq_ignore_ascii_case(b" FROM ") =>
@@ -281,12 +265,6 @@ fn count_select_columns(sql: &str) -> usize {
 }
 
 /// The row format a COPY declares in its options.
-///
-/// Read from the OPTIONS -- what follows the direction's target -- and not
-/// from any `BINARY` or `CSV` token in the statement: a column named
-/// `binary`, or the word inside a comment, is not a format. The format
-/// decides how rows are counted, which is the difference between counting
-/// tuples, counting lines, and counting lines outside quotes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyFormat {
     Text,
@@ -295,27 +273,26 @@ pub enum CopyFormat {
 }
 
 /// Which way a COPY moves rows, decided from the statement text.
-///
-/// One matcher, used by every caller that needs to know. The alternative was
-/// what the code did: `wire.rs` matched one or two spaces and `handler.rs`
-/// matched exactly one, so `COPY t FROM  STDIN` was two different statements
-/// depending on which path asked -- a conversation on one and a finished
-/// statement on the other, which desynchronises the stream.
+/// One matcher, used by every caller that needs to know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyDirection {
-    /// `COPY ... FROM STDIN`: the client streams rows next. A conversation.
+    /// `COPY ...
+    /// FROM STDIN`: the client streams rows next.
+    /// A conversation.
     FromStdin,
-    /// `COPY ... TO STDOUT`: the server would stream rows. A blackhole has none.
+    /// `COPY ...
+    /// TO STDOUT`: the server would stream rows.
+    /// A blackhole has none.
     ToStdout,
-    /// `COPY ... FROM '/path'`: the server reads a file. No conversation.
+    /// `COPY ...
+    /// FROM '/path'`: the server reads a file.
+    /// No conversation.
     FromFile,
 }
 
 /// The direction of a COPY statement, or `None` if it is not a COPY.
-///
-/// SQL whitespace between the keywords is whatever the client sent: spaces,
-/// tabs, newlines, any number. Matching literal spellings is what made tabs and
-/// three spaces behave differently from one space.
+/// SQL whitespace between the keywords is whatever the client sent: spaces, tabs,
+/// newlines, any number.
 pub(crate) fn copy_direction(sql: &str) -> Option<CopyDirection> {
     let mut words = SqlWords::new(sql);
 
@@ -329,8 +306,8 @@ pub(crate) fn copy_direction(sql: &str) -> Option<CopyDirection> {
         let word = words.next()?;
 
         if word.eq_ignore_ascii_case("FROM") {
-            // `FROM STDIN` is a stream; `FROM 'file'` is a path. A path arrives
-            // as a quoted literal, which `next` reports as one word.
+            // `FROM STDIN` is a stream; `FROM 'file'` is a path.
+            // A path arrives as a quoted literal, which `next` reports as one word.
             return match words.next() {
                 Some(target) if target.eq_ignore_ascii_case("STDIN") => {
                     Some(CopyDirection::FromStdin)
@@ -345,26 +322,22 @@ pub(crate) fn copy_direction(sql: &str) -> Option<CopyDirection> {
                 Some(target) if target.eq_ignore_ascii_case("STDOUT") => {
                     Some(CopyDirection::ToStdout)
                 }
-                // `TO '/path'` writes a file, which is the same non-conversation
-                // as `FROM '/path'` from a client's point of view.
+                // `TO '/path'` writes a file, which is the same non-conversation as
+                // `FROM '/path'` from a client's point of view.
                 Some(_) => Some(CopyDirection::FromFile),
                 None => None,
             };
         }
 
         // The table name, a schema-qualified name, a column list: keep walking.
-        // A quoted identifier or literal is one word, so a comma inside it does
-        // not split it.
+        // A quoted identifier or literal is one word, so a comma inside it does not
+        // split it.
     }
 }
 
 /// The format the statement's options declare.
-///
-/// pgx sends `copy t ( a ) from stdin binary`; libpq sends `... WITH (FORMAT
-/// binary)`; the old syntax allows `WITH BINARY` and `CSV HEADER`. All are
-/// read after the direction's target (`STDIN`, `STDOUT` or a file), where the
-/// options live. This used to accept a `BINARY` token anywhere, including a
-/// comment, and text rows then failed the binary signature check.
+/// pgx sends `copy t ( a ) from stdin binary`; libpq sends `...
+/// WITH (FORMAT binary)`; the old syntax allows `WITH BINARY` and `CSV HEADER`.
 pub(crate) fn copy_format(sql: &str) -> CopyFormat {
     let mut words = SqlWords::new(sql);
 
@@ -411,8 +384,8 @@ pub(crate) fn copy_format(sql: &str) -> CopyFormat {
     CopyFormat::Text
 }
 
-/// The comma-separated pieces of an option list, ignoring commas inside
-/// quotes and nested parentheses.
+/// The comma-separated pieces of an option list, ignoring commas inside quotes and
+/// nested parentheses.
 fn split_top_level_commas(inner: &str) -> Vec<&str> {
     let b = inner.as_bytes();
     let mut pieces = Vec::new();
@@ -445,11 +418,6 @@ fn split_top_level_commas(inner: &str) -> Vec<&str> {
 }
 
 /// Walks a SQL statement and yields one word at a time.
-///
-/// Handles what a COPY statement actually contains: whitespace of any kind,
-/// quoted identifiers (`"my table"`), string literals (`'/tmp/x.csv'`, doubled
-/// quotes inside) and parenthesised column lists, which are skipped rather than
-/// split. Enough to find the keywords without pretending to be a parser.
 struct SqlWords<'a> {
     rest: &'a str,
 }
@@ -464,9 +432,7 @@ impl<'a> SqlWords<'a> {
     }
 
     fn next(&mut self) -> Option<&'a str> {
-        // Whitespace, statement separators and COMMENTS are all between
-        // words. A comment used to be read as words: `COPY t /* FROM STDIN */
-        // TO STDOUT` found its direction inside the comment.
+        // Whitespace, statement separators and COMMENTS are all between words.
         loop {
             self.rest = self
                 .rest
@@ -518,11 +484,8 @@ impl<'a> SqlWords<'a> {
             return Some(word);
         }
 
-        // A parenthesised group: skipped whole, so a comma inside does not
-        // become a word and a newline inside does not end the search. Whole
-        // means to the MATCHING parenthesis: this used to stop at the first
-        // `)`, so `("a)", b)` ended inside the quoted name, the direction
-        // after it was never found, and the statement was not a COPY at all.
+        // A parenthesised group: skipped whole, so a comma inside does not become a
+        // word and a newline inside does not end the search.
         if first == '(' {
             let end = group_end(self.rest);
             let word = &self.rest[..end];
@@ -531,10 +494,8 @@ impl<'a> SqlWords<'a> {
             return Some(word);
         }
 
-        // A word ends at whitespace, a parenthesis, a semicolon -- or the
-        // start of a comment. `/` used to be an ordinary byte, so `t/*x*/FROM`
-        // was one word and the direction inside it was never found; the next
-        // call skips the comment before reading `FROM`.
+        // A word ends at whitespace, a parenthesis, a semicolon -- or the start of a
+        // comment.
         let b = self.rest.as_bytes();
         let end = (0..b.len())
             .find(|&i| {
@@ -555,10 +516,8 @@ impl<'a> SqlWords<'a> {
     }
 }
 
-/// The index just past the parenthesis matching the `(` that starts `s`,
-/// or the end of `s` when it is unbalanced. Quotes of both kinds (with
-/// doubled quotes inside), comments of both kinds, and nested parentheses
-/// are all opaque to the match.
+/// The index just past the parenthesis matching the `(` that starts `s`, or the end of
+/// `s` when it is unbalanced.
 fn group_end(s: &str) -> usize {
     let b = s.as_bytes();
     let mut depth = 0usize;
@@ -606,8 +565,9 @@ fn group_end(s: &str) -> usize {
     b.len()
 }
 
-/// The text after a `/* ... */` comment that starts `s`, nested as PostgreSQL
-/// nests them. An unterminated comment swallows the rest, as it does there.
+/// The text after a `/* ...
+/// */` comment that starts `s`, nested as PostgreSQL nests them.
+/// An unterminated comment swallows the rest, as it does there.
 fn skip_block_comment(s: &str) -> &str {
     let b = s.as_bytes();
     let mut depth = 0usize;
@@ -631,22 +591,11 @@ fn skip_block_comment(s: &str) -> &str {
     ""
 }
 
-/// Counts columns in `COPY table (col1, col2) FROM STDIN` by finding the
-/// paren-group between the table name and the direction keyword.
+/// Counts columns in `COPY table (col1, col2) FROM STDIN` by finding the paren-group
+/// between the table name and the direction keyword.
 pub(crate) fn count_copy_columns(sql: &str) -> usize {
-    // **One string, walked once.**
-    //
-    // Two bugs lived here. The first: this `find`-ed in
-    // `sql.trim().to_ascii_uppercase()` and sliced `sql`, so a byte offset from
-    // the trimmed string cut the untrimmed one short by exactly the leading
-    // whitespace -- ` COPY t (a,b) FROM STDIN` lost its `)`, `rfind('(')` still
-    // matched, the closing paren did not, and the answer was 1, so
-    // `CopyInResponse` announced one format code for a two-column copy.
-    //
-    // The second was the match itself: `" FROM "` is one spelling of the
-    // separator, and SQL allows tabs, newlines and any number of spaces. The
-    // walker below takes the separator as *any* whitespace, which is the only
-    // version of this that is true for what clients actually send.
+    // One string, walked once.
+    // Two bugs lived here.
     let mut words = SqlWords::new(sql);
 
     if !words.next_is("COPY") {
@@ -675,8 +624,7 @@ pub(crate) fn count_copy_columns(sql: &str) -> usize {
     }
 }
 
-/// Commas that separate items, not commas inside a nested group or a quoted
-/// name.
+/// Commas that separate items, not commas inside a nested group or a quoted name.
 fn count_top_level_commas(s: &str) -> usize {
     let mut depth = 0usize;
     let mut quote: Option<char> = None;
@@ -823,8 +771,8 @@ fn is_table_constraint_keyword(word: &str) -> bool {
     )
 }
 
-/// The most parameters a statement may declare: ParameterDescription carries
-/// the count as an int16, and PostgreSQL has the same ceiling.
+/// The most parameters a statement may declare: ParameterDescription carries the count
+/// as an int16, and PostgreSQL has the same ceiling.
 pub(crate) const MAX_PARAMETERS: usize = 65535;
 
 /// A placeholder PostgreSQL would refuse, with the SQLSTATE it uses.
@@ -855,23 +803,7 @@ impl PlaceholderError {
 }
 
 /// The parameter types a Parse declares, completed from the SQL text.
-///
-/// `declared` is the Parse message's list, where 0 means "you decide". For
-/// each `$n` up to the highest one in the text, the declared type wins; an
-/// undeclared one is taken from a `::type` cast directly on the placeholder;
-/// and what is left is reported as unknown (OID 0). PostgreSQL would infer
-/// it from the column it is compared with, which a blackhole cannot; the
-/// alternative, text, was measured to break pgx, which then refuses to
-/// encode a Go integer into a text parameter -- whereas for an unknown OID
-/// it encodes from the Go value's own type. The count is what a driver
-/// checks its arguments against before it binds, so it has to cover every
-/// placeholder.
-///
-/// The count is BOUNDED before anything is allocated. `select $5000000`
-/// used to allocate and retain twenty megabytes on one unauthenticated
-/// connection; now it is refused at Parse, as `$0` is.
-///
-/// Text work, done once at Parse.
+/// `declared` is the Parse message's list, where 0 means "you decide".
 pub(crate) fn parameter_types(sql: &str, declared: &[u32]) -> Result<Vec<u32>, PlaceholderError> {
     let found = placeholders(sql)?;
     let highest = found.iter().map(|&(n, _)| n).max().unwrap_or(0);
@@ -888,12 +820,6 @@ pub(crate) fn parameter_types(sql: &str, declared: &[u32]) -> Result<Vec<u32>, P
 }
 
 /// Every `$n` where SQL would read one: its number and the index after it.
-///
-/// Skips what the SQL lexer skips -- `--` and `/* */` comments (nested, as
-/// PostgreSQL nests them), `'strings'` with `''` and the backslash escapes of
-/// `E'...'`, `"identifiers"`, and `$tag$ dollar quotes $tag$`. A `$1` inside
-/// any of those was counted, and pgx then refused a valid no-argument query
-/// with `expected 1 arguments, got 0`.
 fn placeholders(sql: &str) -> Result<Vec<(usize, usize)>, PlaceholderError> {
     let b = sql.as_bytes();
     let mut found = Vec::new();
@@ -911,7 +837,8 @@ fn placeholders(sql: &str) -> Result<Vec<(usize, usize)>, PlaceholderError> {
             continue;
         }
 
-        // /* ... */, nested.
+        // /* ...
+        // */, nested.
         if c == b'/' && b.get(i + 1) == Some(&b'*') {
             let mut depth = 1;
             i += 2;
@@ -929,8 +856,8 @@ fn placeholders(sql: &str) -> Result<Vec<(usize, usize)>, PlaceholderError> {
             continue;
         }
 
-        // 'string' and "identifier": doubled quotes are one quote. An E'...'
-        // string also escapes with a backslash.
+        // 'string' and "identifier": doubled quotes are one quote.
+        // An E'...' string also escapes with a backslash.
         if c == b'\'' || c == b'"' {
             let escapes = c == b'\''
                 && i > 0
@@ -978,9 +905,8 @@ fn placeholders(sql: &str) -> Result<Vec<(usize, usize)>, PlaceholderError> {
                 continue;
             }
 
-            // $tag$ ... $tag$: skip to the matching close. A tag is letters,
-            // digits and underscores -- not `$`, which `is_ident_continue`
-            // allows inside an identifier.
+            // $tag$ ...
+            // $tag$: skip to the matching close.
             let tag_end = (i + 1..b.len())
                 .find(|&k| !(b[k].is_ascii_alphanumeric() || b[k] == b'_'))
                 .unwrap_or(b.len());
@@ -1016,8 +942,8 @@ fn cast_on_placeholder<'a>(sql: &'a str, found: &[(usize, usize)], n: usize) -> 
         }
         i = skip_ws(sql, i + 2);
 
-        // The type name, possibly two words ("double precision", "character
-        // varying"), possibly with a modifier in parentheses.
+        // The type name, possibly two words ("double precision", "character varying"),
+        // possibly with a modifier in parentheses.
         let start = i;
         let mut end = start;
         while end < b.len() && is_ident_continue(b[end]) {
@@ -1425,10 +1351,8 @@ fn table_lookup_keys(table_name: &[String]) -> Vec<String> {
 }
 
 /// Builds a single DataRow with `n` columns, each containing int64(1).
-/// Mirrors the stroppy noop driver's one-row stub: using 1 rather than 0
-/// prevents workload guards like `if (nameCount === 0) throw` from tripping.
-/// The fields of a constant select list: one per item, typed the way the value
-/// is sent.
+/// Mirrors the stroppy noop driver's one-row stub: using 1 rather than 0 prevents
+/// workload guards like `if (nameCount === 0) throw` from tripping.
 fn constant_fields(items: &[crate::sql::Constant]) -> Arc<Vec<FieldInfo>> {
     Arc::new(
         items
@@ -1456,22 +1380,20 @@ fn empty_query(fields: &Arc<Vec<FieldInfo>>) -> QueryResponse {
 }
 
 /// The schema, as the sans-io codec is allowed to see it.
-///
-/// Two methods, both of which the codec needs and neither of which involves a
-/// socket. It exists so `wire.rs` can stay pure: the codec is handed a view and
-/// never learns there is a lock behind it.
+/// Two methods, both of which the codec needs and neither of which involves a socket.
 #[derive(Clone)]
 pub struct CatalogView(pub Arc<NoopHandler>);
 
 impl CatalogView {
-    /// Apply a CREATE/DROP TABLE. Called at EXECUTION, never at Parse: a
-    /// prepared-but-never-executed DDL must not change the schema.
+    /// Apply a CREATE/DROP TABLE.
+    /// Called at EXECUTION, never at Parse: a prepared-but-never-executed DDL must not
+    /// change the schema.
     pub fn apply(&self, sql: &str) {
         self.0.apply_schema_change(sql);
     }
 
-    /// The (name, type oid) of each column a metadata select asked for, or None
-    /// when the table is unknown -- in which case the caller falls back to stubs.
+    /// The (name, type oid) of each column a metadata select asked for, or None when
+    /// the table is unknown -- in which case the caller falls back to stubs.
     pub fn columns_for(
         &self,
         table: &[String],
@@ -1489,19 +1411,6 @@ impl CatalogView {
 }
 
 /// What a statement will do, decided ONCE when it is prepared.
-///
-/// pgwire's own `NoopQueryParser` sets `Statement = String`, so the server gets
-/// the raw SQL back on every Execute and has to work out the answer again --
-/// for a client-cached prepared statement that is the identical bytes, every
-/// time, forever. Measured: a `select 1` re-ran a failed CREATE TABLE
-/// parse, a failed DROP TABLE parse, a scan for FROM and a comma count on every
-/// single execution.
-///
-/// `QueryParser::parse_sql` is called once, at Parse. Everything that is a pure
-/// function of the SQL TEXT belongs there. What deliberately does NOT is the
-/// catalog lookup: a table can be created after a statement is prepared, so the
-/// metadata select keeps its parsed table/column names here and resolves them
-/// against the catalog at execution.
 #[derive(Debug, Clone)]
 pub enum PlanKind {
     /// A SELECT naming a table: resolve against the catalog at execution.
@@ -1509,10 +1418,8 @@ pub enum PlanKind {
         table: Vec<String>,
         columns: Vec<SelectColumn>,
     },
-    /// A SELECT that names no table and no literal: `n` stub columns and no
-    /// rows, which is what a SELECT on a table the server has never seen also
-    /// answers. One row shape for both protocols: a row is something the server
-    /// can only state for a constant select list (see `PlanKind::Constant`).
+    /// A SELECT that names no table and no literal: `n` stub columns and no rows, which
+    /// is what a SELECT on a table the server has never seen also answers.
     SelectStub {
         columns: usize,
     },
@@ -1524,33 +1431,24 @@ pub enum PlanKind {
     Begin,
     Commit,
     Rollback,
-    /// DDL, and the only kind that still touches the SQL text at execution,
-    /// because it mutates the catalog.
+    /// DDL, and the only kind that still touches the SQL text at execution, because it
+    /// mutates the catalog.
     Ddl,
     /// A COPY, with the direction its text declared.
-    ///
-    /// The direction is the whole reason this is a `PlanKind` rather than part
-    /// of `FromText`: `FROM STDIN` is a conversation that must be answered with
-    /// `CopyInResponse` before the client speaks, `TO STDOUT` is a
-    /// `CopyOutResponse` followed by no rows at all, and `FROM '/path'` is a
-    /// file the server reads with no conversation. All three used to answer
-    /// `CommandComplete("SELECT 0")`, which is not a thing a client can be told
-    /// for any of them.
     Copy {
         direction: CopyDirection,
-        /// Columns announced in `CopyInResponse`; the format code count has to
-        /// match the client's.
+        /// Columns announced in `CopyInResponse`; the format code count has to match
+        /// the client's.
         columns: usize,
-        /// How the rows are framed, which is what decides how they are
-        /// counted.
+        /// How the rows are framed, which is what decides how they are counted.
         format: CopyFormat,
     },
-    /// Nothing at all: `""`, `";"`, or whitespace and semicolons. PostgreSQL
-    /// answers EmptyQueryResponse, and a client that sends one -- some do, as
-    /// a liveness probe -- reads that byte and not a CommandComplete.
+    /// Nothing at all: `""`, `";"`, or whitespace and semicolons.
+    /// PostgreSQL answers EmptyQueryResponse, and a client that sends one -- some do,
+    /// as a liveness probe -- reads that byte and not a CommandComplete.
     Empty,
-    /// Anything unrecognised: decided from the text as before. Rare, and not on
-    /// any benchmark's hot path.
+    /// Anything unrecognised: decided from the text as before.
+    /// Rare, and not on any benchmark's hot path.
     FromText,
 }
 
@@ -1569,13 +1467,9 @@ impl PreparedPlan {
             || head.eq_ignore_ascii_case("TABLE")
             || head.eq_ignore_ascii_case("VALUES")
         {
-            // **A literal answers a row; anything naming data answers none.**
-            // `select 1` and `select @@version` are values the server can state
-            // without knowing anything, and both protocols answer them the same
-            // way. A table, a column or a function is a row the server does not
-            // have, whether or not DDL has been seen for the table: the same
-            // plain-SQL client must not find every item on one protocol and none
-            // on the other.
+            // A literal answers a row; anything naming data answers none.
+            // `select 1` and `select @@version` are values the server can state without
+            // knowing anything, and both protocols answer them the same way.
             if let Some(items) = crate::sql::constant_select(sql) {
                 PlanKind::Constant(items)
             } else {
@@ -1618,8 +1512,8 @@ impl PreparedPlan {
         }
     }
 
-    /// The fields a Describe should report, resolved now rather than at Parse
-    /// so a table created since preparation is still seen.
+    /// The fields a Describe should report, resolved now rather than at Parse so a
+    /// table created since preparation is still seen.
     fn describe_fields(&self, handler: &NoopHandler) -> Option<Arc<Vec<FieldInfo>>> {
         match &self.kind {
             PlanKind::SelectMeta { table, columns } => Some(
@@ -1653,16 +1547,14 @@ impl QueryParser for PlanParser {
         Ok(PreparedPlan::build(sql))
     }
 
-    /// A blackhole resolves no parameter types: it never looks at the values,
-    /// and claiming a type it did not derive would be a lie the client acts on.
+    /// A blackhole resolves no parameter types: it never looks at the values, and
+    /// claiming a type it did not derive would be a lie the client acts on.
     fn get_parameter_types(&self, _stmt: &Self::Statement) -> PgWireResult<Vec<Type>> {
         Ok(vec![])
     }
 
-    /// The result schema IS known at Parse for a stub select, but not for one
-    /// naming a table -- that needs the catalog, which the parser does not hold.
-    /// The handler's own do_describe_* resolve it, so report nothing here rather
-    /// than report it wrongly.
+    /// The result schema IS known at Parse for a stub select, but not for one naming a
+    /// table -- that needs the catalog, which the parser does not hold.
     fn get_result_schema(
         &self,
         _stmt: &Self::Statement,
@@ -1672,12 +1564,13 @@ impl QueryParser for PlanParser {
     }
 }
 
-/// Execute a prepared plan. No text scanning except for DDL and COPY.
+/// Execute a prepared plan.
+/// No text scanning except for DDL and COPY.
 fn respond_to_plan(handler: &NoopHandler, plan: &PreparedPlan) -> Response {
     match &plan.kind {
         PlanKind::SelectMeta { table, columns } => {
-            // A table the catalog has not seen gets stub fields and no rows: a
-            // row is not something this server can state for a table.
+            // A table the catalog has not seen gets stub fields and no rows: a row is
+            // not something this server can state for a table.
             let fields = handler
                 .fields_for_parsed_select(table, columns)
                 .unwrap_or_else(|| stub_fields(columns.len().max(1)));
@@ -1686,16 +1579,15 @@ fn respond_to_plan(handler: &NoopHandler, plan: &PreparedPlan) -> Response {
         }
         PlanKind::SelectStub { columns } => Response::Query(empty_query(&stub_fields(*columns))),
         PlanKind::Constant(items) => Response::Query(empty_query(&constant_fields(items))),
-        // **Nothing was written, so nothing is reported written.** The tags say
-        // what the README says: a no-op changes no rows.
+        // Nothing was written, so nothing is reported written.
         PlanKind::Insert => Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(0)),
         PlanKind::Update => Response::Execution(Tag::new("UPDATE").with_rows(0)),
         PlanKind::Delete => Response::Execution(Tag::new("DELETE").with_rows(0)),
         PlanKind::Begin => Response::TransactionStart(Tag::new("BEGIN")),
         PlanKind::Commit => Response::TransactionEnd(Tag::new("COMMIT")),
         PlanKind::Rollback => Response::TransactionEnd(Tag::new("ROLLBACK")),
-        // The catalog is mutated here, not at Parse: a prepared DDL statement
-        // that is never executed must not change the schema.
+        // The catalog is mutated here, not at Parse: a prepared DDL statement that is
+        // never executed must not change the schema.
         PlanKind::Ddl => {
             handler.apply_schema_change(&plan.sql);
             classify_extended(handler, &plan.sql)
@@ -1752,17 +1644,18 @@ fn classify_simple(handler: &NoopHandler, sql: &str) -> Vec<Response> {
     } else if head.eq_ignore_ascii_case("ROLLBACK") {
         vec![Response::TransactionEnd(Tag::new("ROLLBACK"))]
     } else if head.eq_ignore_ascii_case("COPY") {
-        // The direction comes from the shared matcher, not from a literal
-        // spelling: `FROM STDIN` with a tab or three spaces is the same
-        // statement, and answering it as `CopyOut` desynchronised the stream.
+        // The direction comes from the shared matcher, not from a literal spelling:
+        // `FROM STDIN` with a tab or three spaces is the same statement, and answering
+        // it as `CopyOut` desynchronised the stream.
         vector_for_copy(sql)
     } else {
         vec![Response::Execution(Tag::new("OK"))]
     }
 }
 
-/// The pgwire-handler replies for a COPY, by direction. Used by the handler
-/// path; the codec path builds its own bytes from the same direction.
+/// The pgwire-handler replies for a COPY, by direction.
+/// Used by the handler path; the codec path builds its own bytes from the same
+/// direction.
 fn vector_for_copy(sql: &str) -> Vec<Response> {
     let columns = count_copy_columns(sql);
     let binary = copy_format(sql) == CopyFormat::Binary;
@@ -1977,17 +1870,9 @@ mod tests {
 mod copy_columns {
     use super::count_copy_columns;
 
-    /// **The index came from the trimmed string and sliced the untrimmed one.**
-    ///
-    /// `upper.find(" FROM ")` counts bytes in `sql.trim().to_ascii_uppercase()`,
-    /// and `&sql[..i]` then cuts the ORIGINAL — short by exactly the leading
-    /// whitespace. ` COPY t (a,b) FROM STDIN` lost its `)`, `rfind('(')` still
-    /// matched, `after_open.find(')')` did not, and the function returned 1.
-    ///
-    /// `CopyInResponse` then announces one format code for a two-column copy,
-    /// which a client reads as a malformed message. Latent while this was only
-    /// called from the pgwire path; reachable the moment `wire.rs` started
-    /// calling it, which is what a reviewer noticed and these tests did not.
+    /// The index came from the trimmed string and sliced the untrimmed one.
+    /// `upper.find(" FROM ")` counts bytes in `sql.trim().to_ascii_uppercase()`, and
+    /// `&sql[..i]` then cuts the ORIGINAL — short by exactly the leading whitespace.
     #[test]
     fn leading_whitespace_does_not_shift_the_from_offset() {
         for (sql, want) in [
@@ -2012,8 +1897,9 @@ mod copy_columns {
         }
     }
 
-    /// SQL whitespace is not one space. The column list is found by walking the
-    /// statement, so tabs, newlines and any number of spaces all land the same.
+    /// SQL whitespace is not one space.
+    /// The column list is found by walking the statement, so tabs, newlines and any
+    /// number of spaces all land the same.
     #[test]
     fn any_whitespace_finds_the_column_list() {
         for (sql, want) in [
@@ -2027,8 +1913,8 @@ mod copy_columns {
         }
     }
 
-    /// A quoted name is one thing, even with a comma in it -- otherwise a table
-    /// called `"a,b"` would look like a two-column list.
+    /// A quoted name is one thing, even with a comma in it -- otherwise a table called
+    /// `"a,b"` would look like a two-column list.
     #[test]
     fn commas_inside_a_quoted_name_do_not_count() {
         assert_eq!(count_copy_columns(r#"COPY "a,b" (x) FROM STDIN"#), 1);
@@ -2040,12 +1926,7 @@ mod copy_columns {
 mod copy_direction_tests {
     use super::{copy_direction, copy_format, CopyDirection, CopyFormat};
 
-    /// **A comment is not syntax.** The word walker read `FROM STDIN` inside
-    /// a comment as the direction, and `binary` inside one as the format:
-    /// `COPY t /* FROM STDIN */ TO STDOUT` got CopyInResponse where
-    /// PostgreSQL sends CopyOutResponse, and `COPY t FROM STDIN /* binary */`
-    /// was read as binary, so ordinary text rows failed with `22P04 COPY file
-    /// signature not recognized` where PostgreSQL answers `COPY 1`.
+    /// A comment is not syntax.
     #[test]
     fn comments_are_skipped_by_the_copy_walker() {
         assert_eq!(
@@ -2071,12 +1952,9 @@ mod copy_direction_tests {
         assert_eq!(copy_format("COPY t FROM STDIN -- csv\n"), CopyFormat::Text);
     }
 
-    /// **A comment glued to a token is still a comment.** Comments were
-    /// skipped only between words: while a word was being read, `/` was not
-    /// a boundary, so `t/*x*/FROM` was one word and the direction was never
-    /// found. `COPY t/*x*/FROM STDIN` answered CommandComplete where
-    /// PostgreSQL enters COPY, and the CopyFrom client behind it then wrote
-    /// rows into a connection that never entered it.
+    /// A comment glued to a token is still a comment.
+    /// Comments were skipped only between words: while a word was being read, `/` was
+    /// not a boundary, so `t/*x*/FROM` was one word and the direction was never found.
     #[test]
     fn a_comment_adjacent_to_a_token_ends_the_token() {
         for sql in [
@@ -2108,12 +1986,7 @@ mod copy_direction_tests {
         assert_eq!(copy_format("COPY t FROM STDIN/*binary*/"), CopyFormat::Text);
     }
 
-    /// **A parenthesised group ends at its matching parenthesis.** The walker
-    /// took a group through the first literal `)`, ignoring quotes and
-    /// nesting, so `COPY t ("a)", b) FROM STDIN` ended the column list inside
-    /// the quoted name and the direction was never found -- the statement
-    /// fell through to `SELECT 0` and the client's CopyData then arrived
-    /// outside a COPY. PostgreSQL enters COPY with two columns.
+    /// A parenthesised group ends at its matching parenthesis.
     #[test]
     fn a_parenthesised_group_honours_quotes_and_nesting() {
         for (sql, columns) in [
@@ -2141,8 +2014,8 @@ mod copy_direction_tests {
         );
     }
 
-    /// The format is an OPTION, read after the direction's target, not any
-    /// `BINARY` or `CSV` token anywhere in the statement.
+    /// The format is an OPTION, read after the direction's target, not any `BINARY` or
+    /// `CSV` token anywhere in the statement.
     #[test]
     fn format_is_read_from_the_options_clause() {
         for (sql, want) in [
@@ -2181,10 +2054,7 @@ mod copy_direction_tests {
         }
     }
 
-    /// **The reviewer's case.** `COPY t FROM    STDIN` used to answer `SELECT 0`
-    /// because the match allowed one or two spaces, and the following `CopyData`
-    /// then arrived outside a COPY -- every later reply read against the wrong
-    /// message. Three spaces, a tab and a newline are the same statement.
+    /// Three spaces, a tab and a newline are the same statement.
     #[test]
     fn from_stdin_survives_any_whitespace() {
         for sql in [
@@ -2204,7 +2074,7 @@ mod copy_direction_tests {
         }
     }
 
-    /// The other two directions, which used to be the same case.
+    /// The direction is read from the statement's options.
     #[test]
     fn direction_is_read_from_the_statement() {
         for sql in [
@@ -2231,8 +2101,8 @@ mod copy_direction_tests {
         assert_eq!(copy_direction("COPY"), None);
     }
 
-    /// A table name containing the word STDOUT or STDIN is not a direction: the
-    /// keyword is only read after the table name and any column list.
+    /// A table name containing the word STDOUT or STDIN is not a direction: the keyword
+    /// is only read after the table name and any column list.
     #[test]
     fn a_table_name_is_not_a_direction() {
         assert_eq!(
@@ -2245,8 +2115,8 @@ mod copy_direction_tests {
         );
     }
 
-    /// Both spellings of the binary request, because they come from different
-    /// clients: pgx appends `binary`, libpq wraps it in a WITH clause.
+    /// Both spellings of the binary request, because they come from different clients:
+    /// pgx appends `binary`, libpq wraps it in a WITH clause.
     #[test]
     fn binary_is_recognised_in_both_spellings() {
         for sql in [
@@ -2272,11 +2142,7 @@ mod placeholder_tests {
         parameter_types(sql, &[]).expect(sql).len()
     }
 
-    /// **`$n` is a placeholder only where SQL would read one.** The scanner
-    /// skipped single-quoted strings and nothing else, so a `$1` inside a
-    /// comment, a dollar-quoted string or a quoted identifier was counted, and
-    /// pgx refused the valid no-argument query with `expected 1 arguments, got
-    /// 0` where PostgreSQL reports zero and runs it.
+    /// `$n` is a placeholder only where SQL would read one.
     #[test]
     fn placeholders_in_comments_and_quotes_are_not_parameters() {
         for sql in [
@@ -2297,8 +2163,8 @@ mod placeholder_tests {
         }
     }
 
-    /// And where SQL would read one, it still is -- after a comment, after a
-    /// string, and inside parentheses.
+    /// And where SQL would read one, it still is -- after a comment, after a string,
+    /// and inside parentheses.
     #[test]
     fn real_placeholders_are_still_found() {
         assert_eq!(count("select $1 -- $2"), 1);
@@ -2310,9 +2176,8 @@ mod placeholder_tests {
         assert_eq!(count("select E'\\'' || $1"), 1);
     }
 
-    /// `$0` is not a parameter in PostgreSQL, and the count is bounded BEFORE
-    /// anything is allocated: `select $5000000` used to allocate and retain
-    /// twenty megabytes on one unauthenticated connection.
+    /// `$0` is not a parameter in PostgreSQL, and the count is bounded before anything
+    /// is allocated: one unauthenticated statement can otherwise ask for gigabytes.
     #[test]
     fn zero_and_oversized_indices_are_refused_before_allocating() {
         assert!(parameter_types("select $0", &[]).is_err());

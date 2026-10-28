@@ -1,9 +1,6 @@
 //! Which wire protocol a listener speaks.
-//!
-//! The shard loop moves bytes and nothing else, so what it drives is a codec per
-//! connection rather than a protocol baked into itself: one shot's worth of
-//! accepts, receives and sends serves PostgreSQL and MySQL alike, and the two
-//! differ only in the module behind `Session`.
+//! The shard loop moves bytes and knows nothing else, so the protocol lives in the
+//! codec a connection is given.
 
 use std::sync::Arc;
 
@@ -13,10 +10,6 @@ use crate::mysql;
 use crate::wire;
 
 /// One protocol, decided per listener and fixed for the shard that serves it.
-///
-/// A shard is a thread pinned to a core with its own listener, so a protocol per
-/// listener is also a protocol per shard: there is no per-connection switch and
-/// no branch in the hot path beyond the codec's own.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Protocol {
     Postgres,
@@ -32,14 +25,8 @@ impl Protocol {
     }
 }
 
-/// What a shard needs to serve a connection: the protocol, and the one piece of
-/// state the PostgreSQL codec shares between connections.
-///
-/// The catalog is shared for correctness rather than speed: DDL arriving on a
-/// connection the kernel put on shard 3 must be visible to a metadata SELECT on
-/// shard 17. It is off the hot path -- an ordinary SELECT returns from the
-/// parser before the lock is reached. The MySQL codec keeps nothing shared, and
-/// says so by not being handed anything.
+/// What a shard needs to serve a connection: the protocol, and the one piece of state
+/// the PostgreSQL codec shares between connections.
 #[derive(Clone)]
 pub struct Codec {
     protocol: Protocol,
@@ -67,9 +54,9 @@ impl Codec {
         }
     }
 
-    /// The bytes this protocol's server speaks before the client has said
-    /// anything. PostgreSQL has none -- it waits for the startup message -- and
-    /// MySQL has its greeting, which a client waits for before it writes.
+    /// The bytes this protocol's server speaks before the client has said anything.
+    /// PostgreSQL has none -- it waits for the startup message -- and MySQL has its
+    /// greeting, which a client waits for before it writes.
     pub fn prelude(&self) -> Option<&'static [u8]> {
         match self.protocol {
             Protocol::Postgres => None,
@@ -87,11 +74,6 @@ impl Codec {
 }
 
 /// What a shard tells the process about itself, for the startup banner.
-///
-/// Two messages, because they are known at two moments: the pin before anything
-/// is decided, and the backend once its ring exists -- or does not, in which case
-/// the shard serves on epoll instead of dying and leaving a `SO_REUSEPORT` port
-/// with one listener fewer.
 pub enum Report {
     Pinned { protocol: Protocol, pinned: bool },
     Serving { protocol: Protocol, backend: Io },
@@ -112,8 +94,7 @@ impl Session {
     }
 
     /// True until the handshake is over: the one state in which a client may
-    /// legitimately have sent nothing, and so the one a startup deadline is
-    /// about.
+    /// legitimately have sent nothing, and so the one a startup deadline is about.
     pub fn awaiting_startup(&self) -> bool {
         match self {
             Session::Postgres(conn) => conn.awaiting_startup(),
@@ -126,10 +107,7 @@ impl Session {
 mod tests {
     use super::*;
 
-    /// **Only MySQL speaks first.** A PostgreSQL client sends the startup
-    /// message and waits for the answer; a MySQL client waits for the greeting
-    /// before it sends anything at all, so a shard that read first would deadlock
-    /// against it.
+    /// Only MySQL speaks first.
     #[test]
     fn only_mysql_has_a_prelude() {
         assert!(Codec::new(Protocol::Postgres).prelude().is_none());
@@ -139,8 +117,8 @@ mod tests {
         assert_eq!(&greeting[4..5], &[10], "HandshakeV10");
     }
 
-    /// Each protocol gets its own codec, and the same byte reading as a query is
-    /// not the same in both: a PostgreSQL `Q` frame is a MySQL command byte.
+    /// Each protocol gets its own codec, and the same byte reading as a query is not
+    /// the same in both: a PostgreSQL `Q` frame is a MySQL command byte.
     #[test]
     fn each_protocol_is_driven_by_its_own_codec() {
         let pg = Codec::new(Protocol::Postgres);

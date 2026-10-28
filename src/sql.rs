@@ -1,15 +1,5 @@
-//! The little SQL this server reads.
-//!
-//! A no-op does not parse SQL. It reads four things, and this is the code that
-//! reads them: where a statement ends (multi-statement queries), how many
-//! placeholders it has (a prepare response), the first word (which decides the
-//! answer's shape), and the select list (the columns of a result set). The
-//! TPC-C rules in `crate::tpcc` read the same words, which is why the scanner is
-//! here rather than inside a protocol.
-//!
-//! Everything is done on bytes, outside quotes and comments: a `;` inside a
-//! literal is data, a `-- from` comment is not a clause, and a comma inside a
-//! function call is not a column boundary.
+//! The little SQL this server reads: the first word, the select list, the
+//! statement boundaries and the placeholders. Nothing here interprets a value.
 
 /// A comma- or semicolon-level split, with the delimiters left out.
 fn split_on(text: &str, delimiter: u8, parens: bool) -> Vec<&str> {
@@ -49,20 +39,9 @@ fn split_on(text: &str, delimiter: u8, parens: bool) -> Vec<&str> {
     out
 }
 
-/// Split a multi-statement query on top-level `;`, keeping empty segments: which
-/// of them answer is the caller's rule.
-///
-/// **A stored routine's body is one statement.** `CREATE PROCEDURE … BEGIN … ;
-/// … END` is how every driver sends one -- there is no DELIMITER on the wire --
-/// and splitting it at the body's semicolons answers each line of the body as a
-/// statement: the client sees "Commands out of sync", and the `BEGIN` piece
-/// arrives as a transaction of its own. A `BEGIN … END` body is therefore
-/// counted, and its semicolons do not split.
-///
-/// `END IF`, `END LOOP`, `END WHILE` and `END REPEAT` close forms that opened
-/// nothing here, so they do not decrement; `BEGIN` and `CASE` do -- a `CASE`
-/// expression inside a body closes with an `END` of its own, and counting it is
-/// what keeps that `END` from ending the routine.
+/// Split a multi-statement query on top-level `;`, keeping empty segments: which of
+/// them answer is the caller's rule.
+/// A stored routine's body is one statement.
 pub fn split_statements(sql: &str) -> Vec<&str> {
     let bytes = sql.as_bytes();
     let mut out = Vec::new();
@@ -89,8 +68,8 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
                 words += 1;
 
                 if body.is_none() {
-                    // `CREATE [DEFINER = …] PROCEDURE|FUNCTION|TRIGGER|EVENT`,
-                    // and the few words in between, before the body starts.
+                    // `CREATE [DEFINER = …] PROCEDURE|FUNCTION|TRIGGER|EVENT`, and the
+                    // few words in between, before the body starts.
                     if words == 1 {
                         routine = word.eq_ignore_ascii_case("CREATE");
                     } else if routine && !routine_named && words <= 8 {
@@ -102,13 +81,13 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
                         body = Some(1);
                     }
                 } else if word.eq_ignore_ascii_case("BEGIN") || word.eq_ignore_ascii_case("CASE") {
-                    // A block opens with BEGIN, and a CASE -- expression or
-                    // statement -- closes with an END of its own.
+                    // A block opens with BEGIN, and a CASE -- expression or statement
+                    // -- closes with an END of its own.
                     *body.as_mut().expect("in a body") += 1;
                 } else if word.eq_ignore_ascii_case("END") {
                     let next = skip_space(bytes, i);
-                    // `END IF`, `END LOOP`, `END WHILE` and `END REPEAT` close
-                    // forms that opened nothing here.
+                    // `END IF`, `END LOOP`, `END WHILE` and `END REPEAT` close forms
+                    // that opened nothing here.
                     let closes_nothing = word_end(bytes, next).is_some_and(|end| {
                         ["IF", "LOOP", "WHILE", "REPEAT"]
                             .iter()
@@ -146,8 +125,7 @@ pub fn split_top_level(text: &str) -> Vec<&str> {
     split_on(text, b',', true)
 }
 
-/// How many placeholders a statement has: `?` outside quotes, comments and
-/// identifiers.
+/// How many placeholders a statement has: `?` outside quotes, comments and identifiers.
 pub fn count_placeholders(sql: &str) -> u16 {
     let bytes = sql.as_bytes();
     let mut i = 0usize;
@@ -172,9 +150,8 @@ pub fn count_placeholders(sql: &str) -> u16 {
 }
 
 /// The offset of the first top-level `keyword` at or after `from`.
-///
-/// Top level is outside parentheses, quotes and comments: `select coalesce(a,
-/// 'from')` names no table, and `select (select 1 from t)` does.
+/// Top level is outside parentheses, quotes and comments: `select coalesce(a, 'from')`
+/// names no table, and `select (select 1 from t)` does.
 pub fn find_keyword(sql: &str, from: usize, keyword: &str) -> Option<usize> {
     let bytes = sql.as_bytes();
     let mut i = from;
@@ -209,8 +186,8 @@ pub fn find_keyword(sql: &str, from: usize, keyword: &str) -> Option<usize> {
     None
 }
 
-/// The text of a keyword's argument when it is a single-quoted literal:
-/// `LIKE 'Com%'` gives `Com%`.
+/// The text of a keyword's argument when it is a single-quoted literal: `LIKE 'Com%'`
+/// gives `Com%`.
 pub fn quoted_argument<'a>(sql: &'a str, keyword: &str) -> Option<&'a str> {
     let at = find_keyword(sql, 0, keyword)?;
     let rest = &sql[at + keyword.len()..];
@@ -221,8 +198,8 @@ pub fn quoted_argument<'a>(sql: &'a str, keyword: &str) -> Option<&'a str> {
     Some(&rest[..end])
 }
 
-/// The words that end a select list: everything after the list is a clause about
-/// the rows rather than a column of them.
+/// The words that end a select list: everything after the list is a clause about the
+/// rows rather than a column of them.
 const CLAUSES: [&str; 10] = [
     "FROM",
     "LIMIT",
@@ -236,8 +213,8 @@ const CLAUSES: [&str; 10] = [
     "PROCEDURE",
 ];
 
-/// The select list: the text between `SELECT` (and `DISTINCT`) and the first
-/// top-level clause -- `FROM`, or a `LIMIT`/`ORDER`/… with no table at all.
+/// The select list: the text between `SELECT` (and `DISTINCT`) and the first top-level
+/// clause -- `FROM`, or a `LIMIT`/`ORDER`/… with no table at all.
 /// `None` when the statement does not start with `SELECT` or has no list.
 pub fn select_list(sql: &str) -> Option<&str> {
     let bytes = sql.as_bytes();
@@ -270,8 +247,8 @@ pub fn select_list(sql: &str) -> Option<&str> {
     Some(list)
 }
 
-/// One item of a constant select list: the text a client wrote, the value the
-/// server answers, and what kind of value it is.
+/// One item of a constant select list: the text a client wrote, the value the server
+/// answers, and what kind of value it is.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Constant {
     pub name: String,
@@ -287,16 +264,8 @@ pub enum ConstantKind {
     Text,
 }
 
-/// **A select list of literals and variables**, which is a row the server can
-/// state without knowing anything about the data.
-///
-/// `select 1` answers one row on both protocols -- PostgreSQL has always said
-/// one and MySQL said none, and a `mariadb -e 'select 1'` that printed nothing
-/// reads as a broken server. Anything else a SELECT can name -- a table, a
-/// column, a function -- is a row the server does not have, and answers none.
-///
-/// `None` when the statement is not such a select: it does not start with
-/// `SELECT`, it names a table, or an item is not a literal or a variable.
+/// A select list of literals and variables, which is a row the server can state without
+/// knowing anything about the data.
 pub fn constant_select(sql: &str) -> Option<Vec<Constant>> {
     // A select over rows is not a row of constants.
     if find_keyword(sql, first_word(sql).len(), "FROM").is_some() {
@@ -317,8 +286,8 @@ pub fn constant_select(sql: &str) -> Option<Vec<Constant>> {
 
 /// One item of a select list, when it is a literal or a variable.
 fn constant_item(item: &str) -> Option<Constant> {
-    // A trailing comment is not part of the value: `select 1 /* padding */` is
-    // still the literal 1, which is what a padded query is for.
+    // A trailing comment is not part of the value: `select 1 /* padding */` is still
+    // the literal 1, which is what a padded query is for.
     let item = strip_trailing_comment(item).trim_end();
     if item.is_empty() {
         return None;
@@ -337,8 +306,8 @@ fn constant_item(item: &str) -> Option<Constant> {
         });
     }
 
-    // `@@name`, `@@session.name`, `@name`: a variable, by the value a client
-    // reads it as.
+    // `@@name`, `@@session.name`, `@name`: a variable, by the value a client reads it
+    // as.
     for prefix in ["@@", "@"] {
         if let Some(name) = item.strip_prefix(prefix) {
             if prefix == "@" && name.starts_with('@') {
@@ -389,12 +358,8 @@ fn strip_trailing_comment(item: &str) -> &str {
     item
 }
 
-/// **SQL `PREPARE name AS body`**, which is a prepared statement made from a
-/// statement rather than from a Parse message.
-///
-/// A client that prepares its statements with SQL -- HammerDB's PostgreSQL
-/// TPC-C does, at login, and then executes them by name -- never sends a Parse.
-/// The name it registers has to be found by Bind, or every execution is 26000.
+/// SQL `PREPARE name AS body`, which is a prepared statement made from a statement
+/// rather than from a Parse message.
 pub fn sql_prepare(sql: &str) -> Option<(&str, &str)> {
     let bytes = sql.as_bytes();
     let start = skip_space(bytes, 0);
@@ -427,12 +392,6 @@ pub fn sql_prepare(sql: &str) -> Option<(&str, &str)> {
 }
 
 /// The value of a variable a client reads at connect.
-///
-/// Every one of these is a fact about a MariaDB the caller believes it is
-/// talking to, and a driver that reads one at connect needs a value it can
-/// parse: an empty result set is a driver that cannot start. Names beyond the
-/// table answer `1` -- a plausible number -- because a variable this server has
-/// never heard of is still one a client is entitled to an answer for.
 fn variable(name: &str) -> Option<(String, ConstantKind)> {
     let text = |value: &str| Some((value.to_string(), ConstantKind::Text));
     let number = |value: &str| Some((value.to_string(), ConstantKind::Integer));
@@ -468,8 +427,9 @@ fn variable(name: &str) -> Option<(String, ConstantKind)> {
     }
 }
 
-/// Skip a quoted run, `i` at its opening quote. A doubled quote inside is an
-/// escaped one, which is how SQL spells a quote in a literal.
+/// Skip a quoted run, `i` at its opening quote.
+/// A doubled quote inside is an escaped one, which is how SQL spells a quote in a
+/// literal.
 pub fn skip_quoted(bytes: &[u8], i: usize) -> usize {
     let quote = bytes[i];
     let mut i = i + 1;
@@ -496,8 +456,8 @@ pub fn skip_quoted(bytes: &[u8], i: usize) -> usize {
     bytes.len()
 }
 
-/// Skip a comment, `i` at its first byte, or `None` when what is there only looks
-/// like one (`-` that is not `--`, `/` that is not `/*`).
+/// Skip a comment, `i` at its first byte, or `None` when what is there only looks like
+/// one (`-` that is not `--`, `/` that is not `/*`).
 pub fn skip_comment(bytes: &[u8], i: usize) -> Option<usize> {
     match *bytes.get(i)? {
         b'#' => Some(line_end(bytes, i + 1)),
@@ -572,8 +532,8 @@ pub fn first_word(sql: &str) -> &str {
     }
 }
 
-/// The words of a statement, outside quotes and comments -- all this server
-/// reads of a statement it does not interpret.
+/// The words of a statement, outside quotes and comments -- all this server reads of a
+/// statement it does not interpret.
 pub struct Words<'a> {
     sql: &'a str,
     pos: usize,
@@ -618,9 +578,8 @@ impl<'a> Iterator for Words<'a> {
 mod tests {
     use super::*;
 
-    /// A semicolon inside a literal or a comment is not a statement boundary,
-    /// and an empty segment is a segment: which of them answer is the caller's
-    /// rule.
+    /// A semicolon inside a literal or a comment is not a statement boundary, and an
+    /// empty segment is a segment: which of them answer is the caller's rule.
     #[test]
     fn statements_split_outside_quotes_and_comments() {
         assert_eq!(
@@ -657,8 +616,8 @@ mod tests {
         assert_eq!(count_placeholders("select /* ? */ ?"), 1);
     }
 
-    /// The select list ends at a top-level clause -- not at one inside a call,
-    /// a literal or a subquery's own `from`.
+    /// The select list ends at a top-level clause -- not at one inside a call, a
+    /// literal or a subquery's own `from`.
     #[test]
     fn the_select_list_ends_at_its_own_from() {
         assert_eq!(select_list("select 1, 2"), Some("1, 2"));
@@ -681,8 +640,8 @@ mod tests {
         assert_eq!(select_list("select"), None);
     }
 
-    /// A keyword's quoted argument is read without its quotes, which is what
-    /// `LIKE '<pattern>'` needs.
+    /// A keyword's quoted argument is read without its quotes, which is what `LIKE
+    /// '<pattern>'` needs.
     #[test]
     fn a_quoted_argument_is_read() {
         assert_eq!(
@@ -692,8 +651,8 @@ mod tests {
         assert_eq!(quoted_argument("show global status", "LIKE"), None);
     }
 
-    /// **A constant select is literals and variables, and nothing else.** Both
-    /// protocols answer one row for it and no rows for anything that names data.
+    /// A constant select is literals and variables, and nothing else.
+    /// Both protocols answer one row for it and no rows for anything that names data.
     #[test]
     fn a_constant_select_is_literals_and_variables() {
         let items = constant_select("select 1, 'abc', @@version").expect("a constant select");
@@ -722,8 +681,8 @@ mod tests {
         }
     }
 
-    /// **`PREPARE name AS body` is read as a name and a statement**, and a
-    /// statement that is not one of those is `None`.
+    /// `PREPARE name AS body` is read as a name and a statement, and a statement that
+    /// is not one of those is `None`.
     #[test]
     fn a_sql_prepare_is_a_name_and_a_body() {
         assert_eq!(
@@ -740,8 +699,8 @@ mod tests {
         assert_eq!(sql_prepare("DEALLOCATE neword"), None);
     }
 
-    /// The words of a statement skip literals, identifiers and comments, so a
-    /// keyword inside one is not a word.
+    /// The words of a statement skip literals, identifiers and comments, so a keyword
+    /// inside one is not a word.
     #[test]
     fn words_skip_quotes_and_comments() {
         let words: Vec<&str> =

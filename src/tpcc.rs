@@ -1,41 +1,6 @@
-//! The TPC-C rules: the small, explicit set of statements this server answers
-//! with something other than a no-op.
-//!
-//! # Why they exist
-//!
-//! A TPC-C client reports a throughput from what the server tells it. HammerDB
-//! reads `select sum(d_next_o_id) from district` before and after its window and
-//! calls the difference NOPM, and reads `show global status` for `Com_commit`
-//! and `Com_rollback` to report TPM. Against a server that answers nothing, both
-//! are zero and the run is unmeasurable -- even though the CLIENT is exactly
-//! what such a run is measuring.
-//!
-//! # What they are, and what they are not
-//!
-//! These are not SQL: they are a handful of shapes matched on the statement's
-//! own words, listed here in full so that a reader can see everything this
-//! server will ever answer with a number.
-//!
-//! * A transaction is counted by the procedure a client calls -- `CALL
-//!   NEWORD(...)`, `PAYMENT`, `DELIVERY`, `OSTAT`, `SLEV`, by name in any case,
-//!   with or without a schema prefix -- or, for a plain-SQL client, by an
-//!   INSERT that names the `new_order` table (or `tpcc_new_order`), which is
-//!   the one table only a NewOrder writes.
-//! * `select sum(d_next_o_id) from district` (any case and spacing, an
-//!   optional schema prefix, `district` or `tpcc_district`) answers
-//!   `3001 x districts + NewOrders seen`, which is what the schema holds at the
-//!   start plus one per NewOrder committed. Districts is 10 per warehouse, and
-//!   `--warehouses` says how many there are.
-//! * `show global status`, or with a `LIKE` filter, answers `Com_commit` and
-//!   `Com_rollback`: the first for every explicit COMMIT and -- because a
-//!   statement outside a transaction is a transaction of its own -- for every
-//!   counted TPC-C statement in autocommit mode.
-//! * `select @a, @b` answers one row whose values are all `1`: a plausible
-//!   number for an OUT parameter, and never NULL.
-//!
-//! Everything else is answered by the rules of the protocol's codec. A server
-//! that answered *only* these would be useless to the clients it exists for;
-//! one that answered more would be a database.
+//! The TPC-C rules: the only statements answered with more than a no-op.
+//! A TPC-C client reads its throughput from the server, so a handful of statement
+//! shapes are matched and answered with numbers derived from `--warehouses`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -52,9 +17,9 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// The procedure names this kind answers to. A TPC-C client spells them
-    /// `NEWORD`, `PAYMENT`, `DELIVERY`, `OSTAT`, `SLEV` (HammerDB's stored
-    /// procedures) or `neword`, `payment`, ... (its own naming).
+    /// The procedure names this kind answers to.
+    /// A TPC-C client spells them `NEWORD`, `PAYMENT`, `DELIVERY`, `OSTAT`, `SLEV`
+    /// (HammerDB's stored procedures) or `neword`, `payment`, ...
     fn from_procedure(word: &str) -> Option<Kind> {
         let word = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
         for (names, kind) in [
@@ -117,11 +82,6 @@ impl Kind {
 }
 
 /// The counters, process-wide.
-///
-/// They are shared by every shard because they are a fact about the server and
-/// not about a connection: a client's NewOrders do not belong to the thread the
-/// kernel put it on. Relaxed ordering throughout: nothing here orders anything
-/// else, and a count that a reader sees one behind is a count.
 struct Counters {
     new_order: AtomicU64,
     payment: AtomicU64,
@@ -142,13 +102,12 @@ static STATS: Counters = Counters {
     com_rollback: AtomicU64::new(0),
 };
 
-/// How many warehouses the schema is said to have. Read at startup from
-/// `--warehouses`, and a `OnceLock` rather than a constant because the district
-/// sum depends on it.
+/// How many warehouses the schema is said to have.
+/// Read at startup from `--warehouses`, and a `OnceLock` rather than a constant because
+/// the district sum depends on it.
 static WAREHOUSES: AtomicU64 = AtomicU64::new(DEFAULT_WAREHOUSES);
 
-/// HammerDB's own default schema: ten warehouses, and therefore a hundred
-/// districts.
+/// HammerDB's own default schema: ten warehouses, and therefore a hundred districts.
 pub const DEFAULT_WAREHOUSES: u64 = 10;
 
 /// The districts in the schema: ten per warehouse, as TPC-C defines them.
@@ -162,22 +121,11 @@ pub fn set_warehouses(n: u64) {
 }
 
 /// The sum a client reads before and after its window.
-///
-/// The schema holds `3001` per district at the start -- `d_next_o_id` begins at
-/// 3001 -- and every committed NewOrder increments one district's value, so the
-/// total is that plus the NewOrders this process has seen.
 pub fn district_sum() -> u64 {
     3001 * districts() + new_orders()
 }
 
 /// Whether the synthetic ANSWERS are on, which `--profile tpcc` says.
-///
-/// The counters are always on -- they cost a store -- but the answers that read
-/// like a database's (a district sum, a population count, `pg_stat_database`)
-/// are not: a server that answers them by default is asserting numbers it has no
-/// data for, and a client that has not asked for the profile may be one that
-/// validates rows. With the profile on, the stats line says `synthetic NOPM` so a
-/// figure taken this way can never be mistaken for a measurement.
 static PROFILE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn set_profile(on: bool) {
@@ -188,12 +136,7 @@ pub fn profile() -> bool {
     PROFILE.load(Ordering::Relaxed)
 }
 
-/// **A one-number answer a TPC-C client reads**, when the profile is on.
-///
-/// Every value derives from `--warehouses`: the schema TPC-C populates is
-/// 100,000 items, ten districts a warehouse holding 3,000 orders each and 900
-/// open new orders each, and a client that reads one of these is reading the
-/// population it expects -- not a measurement.
+/// A one-number answer a TPC-C client reads, when the profile is on.
 pub fn number_query(sql: &str) -> Option<(&'static str, u64)> {
     if !profile() {
         return None;
@@ -206,12 +149,13 @@ pub fn number_query(sql: &str) -> Option<(&'static str, u64)> {
         return None;
     }
 
-    // The aggregate, then the table it is over. The argument is skipped: the
-    // scanner drops punctuation, so `count(*)` is the one word `count`.
+    // The aggregate, then the table it is over.
+    // The argument is skipped: the scanner drops punctuation, so `count(*)` is the one
+    // word `count`.
     let aggregate = words.next()?;
     words.by_ref().find(|w| w == "from")?;
-    // The table is the LAST word before a clause: `from tpcc.district` is the
-    // words `tpcc` and `district`, and the table is the second.
+    // The table is the LAST word before a clause: `from tpcc.district` is the words
+    // `tpcc` and `district`, and the table is the second.
     let mut table = None;
     for word in words.by_ref() {
         if [
@@ -239,17 +183,17 @@ pub fn number_query(sql: &str) -> Option<(&'static str, u64)> {
         ("max", "district") => Some(("max(d_id)", 10)),
         ("max", "customer") => Some(("max(c_id)", 3000)),
         ("max", "orders") | ("max", "oorder") => Some(("max(o_id)", 3000)),
-        // A population count, plus the transactions this process has seen: a
-        // client that counts orders before and after its window reads a
-        // difference, exactly as it does with the district sum.
+        // A population count, plus the transactions this process has seen: a client
+        // that counts orders before and after its window reads a difference, exactly as
+        // it does with the district sum.
         ("count", "orders") | ("count", "oorder") => {
             Some(("count(*)", 3000 * districts + new_orders()))
         }
         ("count", "new_order") => Some(("count(*)", 900 * districts)),
         ("count", "warehouse") => Some(("count(*)", WAREHOUSES.load(Ordering::Relaxed))),
         ("count", "district") => Some(("count(*)", districts)),
-        // HammerDB's PostgreSQL TPM: the transactions the server has committed
-        // and rolled back.
+        // HammerDB's PostgreSQL TPM: the transactions the server has committed and
+        // rolled back.
         ("sum", "pg_stat_database") => Some(("sum", com_commit() + com_rollback())),
         _ => None,
     };
@@ -257,20 +201,15 @@ pub fn number_query(sql: &str) -> Option<(&'static str, u64)> {
     items
 }
 
-/// **What one connection has done but not yet committed.**
-///
-/// A transaction is counted when it COMMITS, not when its statement runs: a
-/// NewOrder that is rolled back raises no district's next order id, and counting
-/// it when it ran inflated NOPM by every failed transaction. The statements note
-/// their kind here, the connection folds the note into the shared counters at
-/// COMMIT (or at the end of an autocommit statement), and a ROLLBACK drops it.
+/// What one connection has done but not yet committed.
 #[derive(Default, Clone, Copy)]
 pub struct Pending {
     counts: [u64; 5],
 }
 
 impl Pending {
-    /// Note one statement of this kind. Nothing is counted yet.
+    /// Note one statement of this kind.
+    /// Nothing is counted yet.
     pub fn note(&mut self, kind: Kind) {
         self.counts[kind.index()] += 1;
     }
@@ -348,8 +287,8 @@ pub fn line() -> String {
     line
 }
 
-/// The profile switched on (or off) for the life of a test, with the switch
-/// held: it is process-wide, and two tests that set it differently race.
+/// The profile switched on (or off) for the life of a test, with the switch held: it is
+/// process-wide, and two tests that set it differently race.
 #[cfg(test)]
 pub fn profile_guard(on: bool) -> ProfileGuard {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -377,14 +316,8 @@ impl Drop for ProfileGuard {
     }
 }
 
-/// The value of a MySQL system variable/// **A failure the client asked for, and the path it exercises.**
-///
-/// A benchmark has to exercise its rollback path, and it does so by making a
-/// statement fail on purpose: stroppy-rust's MySQL NewOrder rolls back one time
-/// in a hundred by writing a NULL into a NOT NULL column, HammerDB's PostgreSQL
-/// arm raises, and a client that wants a specific error sends `SIGNAL SQLSTATE`.
-/// A no-op that answers OK to all of them turns every such rollback into a
-/// commit -- the counters move, and the client's own error handling is never run.
+/// The value of a MySQL system variable/// A failure the client asked for, and the path
+/// it exercises.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Failure {
     /// `SIGNAL SQLSTATE '<code>'`: the client names the error it wants.
@@ -393,14 +326,13 @@ pub enum Failure {
     Null,
     /// `RAISE`, the PostgreSQL way of failing on purpose.
     Raise,
-    /// A `CALL` of a procedure this server has no rule for. A client that calls
-    /// something we do not know is a client whose expectations we cannot meet,
-    /// and answering OK hides that.
+    /// A `CALL` of a procedure this server has no rule for.
+    /// A client that calls something we do not know is a client whose expectations we
+    /// cannot meet, and answering OK hides that.
     UnknownProcedure,
 }
 
 /// The failure a statement asks for, if it asks for one.
-///
 /// Deliberately mechanical: the shapes are listed here and nowhere else.
 pub fn failure(sql: &str) -> Option<Failure> {
     let trimmed = sql::trim_leading(sql);
@@ -427,7 +359,8 @@ pub fn failure(sql: &str) -> Option<Failure> {
     }
 
     // `RAISE`, as a word anywhere: `select raise(...)`, `raise_exception(...)`,
-    // `raise_sqlstate(...)`. `raise_notice` is a warning and is not one.
+    // `raise_sqlstate(...)`.
+    // `raise_notice` is a warning and is not one.
     if sql::Words::new(trimmed).any(|w| {
         let lower = w.to_ascii_lowercase();
 
@@ -466,13 +399,7 @@ fn writes_null(sql: &str) -> bool {
     sql::Words::new(sql).any(|w| w.eq_ignore_ascii_case("NULL"))
 }
 
-/// **The district sum a TPC-C client reads for NOPM.**
-///
-/// `select sum(d_next_o_id) from district`, in any case and spacing, with an
-/// optional database prefix on the table, and for the `tpcc_district` name a
-/// TPC-C schema may use instead. The words are read, not the punctuation:
-/// `sum ( d_next_o_id )` is the same statement to a scanner that skips
-/// parentheses.
+/// The district sum a TPC-C client reads for NOPM.
 pub fn is_district_sum(sql: &str) -> bool {
     let mut words = sql::Words::new(sql);
 
@@ -490,11 +417,7 @@ pub fn is_district_sum(sql: &str) -> bool {
         }
     }
 
-    // The table, optionally `schema.district` -- the scanner splits on `.`, so
-    // the name is the first or the second word after FROM -- and **nothing
-    // follows it**: a sum over a filtered district is a different question from
-    // the whole schema's, and this server does not answer questions it cannot
-    // read.
+    // The table, optionally `schema
     let is_table = |word: &str| {
         word.eq_ignore_ascii_case("district") || word.eq_ignore_ascii_case("tpcc_district")
     };
@@ -511,19 +434,14 @@ pub fn is_district_sum(sql: &str) -> bool {
     named && words.next().is_none()
 }
 
-/// **The transaction a statement is**, when it is a TPC-C one.
-///
-/// A `CALL` names the procedure (a stored-procedure client), and an `INSERT`
-/// that names the `new_order` table is a NewOrder (a plain-SQL client: it is the
-/// one table only that transaction writes).
+/// The transaction a statement is, when it is a TPC-C one.
 pub fn statement_kind(sql: &str) -> Option<Kind> {
     let mut words = sql::Words::new(sql);
 
     match words.next() {
         Some(word) if word.eq_ignore_ascii_case("CALL") => {
-            // `CALL neword(...)`, and `CALL tpcc.neword(...)` -- a scanner that
-            // splits on `.` gives both, so the first two words after CALL are
-            // tried.
+            // `CALL neword(...)`, and `CALL tpcc.neword(...)` -- a scanner that splits
+            // on `.` gives both, so the first two words after CALL are tried.
             for _ in 0..2 {
                 let word = words.next()?;
                 if let Some(kind) = Kind::from_procedure(word) {
@@ -533,10 +451,8 @@ pub fn statement_kind(sql: &str) -> Option<Kind> {
 
             None
         }
-        // **A PostgreSQL TPC-C client calls a procedure as a function**, in a
-        // SELECT: `select neword(...)`, `select * from neword(...)`. A call is
-        // the name followed by `(`, which is what separates it from a column or
-        // a table that happens to be called `payment`.
+        // A PostgreSQL TPC-C client calls a procedure as a function, in a SELECT:
+        // `select neword(...)`, `select * from neword(...)`.
         Some(word) if word.eq_ignore_ascii_case("SELECT") || word.eq_ignore_ascii_case("WITH") => {
             called_procedure(sql)
         }
@@ -553,8 +469,7 @@ pub fn statement_kind(sql: &str) -> Option<Kind> {
     }
 }
 
-/// The TPC-C procedure a statement CALLS, as `name(` outside quotes and
-/// comments.
+/// The TPC-C procedure a statement CALLS, as `name(` outside quotes and comments.
 fn called_procedure(sql: &str) -> Option<Kind> {
     let bytes = sql.as_bytes();
     let mut i = 0usize;
@@ -584,19 +499,17 @@ fn called_procedure(sql: &str) -> Option<Kind> {
     None
 }
 
-/// **`SHOW GLOBAL STATUS`, and the filter a client gives it.**
-///
-/// HammerDB reads `Com_commit` and `Com_rollback` from it; a `LIKE` filter is
-/// how it asks for one at a time. `None` is not this statement at all, and
-/// `Some(None)` is the unfiltered list.
+/// `SHOW GLOBAL STATUS`, and the filter a client gives it.
+/// HammerDB reads `Com_commit` and `Com_rollback` from it; a `LIKE` filter is how it
+/// asks for one at a time.
 pub fn show_status(sql: &str) -> Option<Option<String>> {
     let mut words = sql::Words::new(sql);
     if !words.next()?.eq_ignore_ascii_case("SHOW") {
         return None;
     }
     let mut next = words.next()?;
-    // `SHOW GLOBAL STATUS` and `SHOW SESSION STATUS` are the same list here:
-    // there is one server and nothing per session to differ.
+    // `SHOW GLOBAL STATUS` and `SHOW SESSION STATUS` are the same list here: there is
+    // one server and nothing per session to differ.
     if next.eq_ignore_ascii_case("GLOBAL") || next.eq_ignore_ascii_case("SESSION") {
         next = words.next()?;
     }
@@ -607,12 +520,11 @@ pub fn show_status(sql: &str) -> Option<Option<String>> {
     Some(sql::quoted_argument(sql, "LIKE").map(str::to_string))
 }
 
-/// The status rows this server reports, in MySQL's own order, with the `LIKE`
-/// filter applied when the client gave one.
+/// The status rows this server reports, in MySQL's own order, with the `LIKE` filter
+/// applied when the client gave one.
 pub fn status_rows(filter: Option<&str>) -> Vec<(&'static str, u64)> {
-    // One test of `group_concat_max_len LIKE 'x'` would let a LIKE pattern that
-    // begins with `Com_` be answered literally; matching with the wildcard rules
-    // is what MySQL does and what a client's own pattern expects.
+    // Wildcards are matched as MySQL matches them; a literal compare would answer
+    // `Com%` with nothing.
     /// A counter: its name and how to read it.
     type Counter = (&'static str, fn() -> u64);
 
@@ -624,14 +536,15 @@ pub fn status_rows(filter: Option<&str>) -> Vec<(&'static str, u64)> {
         .collect()
 }
 
-/// MySQL's `LIKE`: `%` is any run of characters, `_` is one, and everything else
-/// is itself. Case-insensitive, as MySQL's default collation is for these names.
+/// MySQL's `LIKE`: `%` is any run of characters, `_` is one, and everything else is
+/// itself.
+/// Case-insensitive, as MySQL's default collation is for these names.
 fn like(pattern: &str, text: &str) -> bool {
     let pattern: Vec<char> = pattern.to_lowercase().chars().collect();
     let text: Vec<char> = text.to_lowercase().chars().collect();
 
-    // A greedy wildcard match: the classic linear backtracking algorithm, which
-    // is all a two-word pattern needs.
+    // A greedy wildcard match: the classic linear backtracking algorithm, which is all
+    // a two-word pattern needs.
     let (mut p, mut t) = (0usize, 0usize);
     let mut star: Option<(usize, usize)> = None;
     while t < text.len() {
@@ -656,9 +569,8 @@ fn like(pattern: &str, text: &str) -> bool {
     p == pattern.len()
 }
 
-/// **`SELECT @var, ...`**: the OUT parameters a stored-procedure client reads
-/// after its `CALL`.
-///
+/// `SELECT @var, ...`: the OUT parameters a stored-procedure client reads after its
+/// `CALL`.
 /// Only user variables, and only variables: a select of a column is not this.
 pub fn select_vars(sql: &str) -> Option<Vec<String>> {
     let list = sql::select_list(sql)?;
@@ -679,16 +591,16 @@ pub fn select_vars(sql: &str) -> Option<Vec<String>> {
     Some(names)
 }
 
-/// The value every `SELECT @...` answers: a number, so a client that parses it
-/// as one -- an id, a count, an amount -- is not given a string it cannot use.
+/// The value every `SELECT @...` answers: a number, so a client that parses it as one
+/// -- an id, a count, an amount -- is not given a string it cannot use.
 pub const VAR_VALUE: &str = "1";
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// **The district sum is recognised as HammerDB spells it**, with the
-    /// whitespace and case a client varies and the schema prefix it may add.
+    /// The district sum is recognised as HammerDB spells it, with the whitespace and
+    /// case a client varies and the schema prefix it may add.
     #[test]
     fn the_district_sum_is_recognised() {
         for sql in [
@@ -715,8 +627,8 @@ mod tests {
         }
     }
 
-    /// **A CALL is counted by the procedure it names**, in either case and
-    /// under a schema prefix.
+    /// A CALL is counted by the procedure it names, in either case and under a schema
+    /// prefix.
     #[test]
     fn a_call_is_counted_by_its_procedure() {
         for (sql, kind) in [
@@ -736,10 +648,9 @@ mod tests {
         assert_eq!(statement_kind("insert into warehouse values (1)"), None);
     }
 
-    /// **A PostgreSQL TPC-C client calls its procedures as functions**, in a
-    /// SELECT: `select neword(...)`, `select * from neword(...)`, and the same
-    /// statements prepared. Counting only `CALL` meant a PG run's NOPM read zero
-    /// -- the district sum never grew -- while the run itself worked.
+    /// A PostgreSQL TPC-C client calls its procedures as functions, in a SELECT:
+    /// `select neword(...)`, `select * from neword(...)`, and the same statements
+    /// prepared.
     #[test]
     fn a_called_function_is_the_same_transaction() {
         for (sql, kind) in [
@@ -752,15 +663,15 @@ mod tests {
             ("select * from ostat(1, 2)", Kind::OrderStatus),
             ("select * from slev(1, 2, 3)", Kind::StockLevel),
             ("select tpcc.neword(1, 2, 3, 4)", Kind::NewOrder),
-            // Prepared, the statement keeps its text: the count happens when it
-            // runs, not when it is parsed.
+            // Prepared, the statement keeps its text: the count happens when it runs,
+            // not when it is parsed.
             ("select * from neword($1, $2, $3, $4)", Kind::NewOrder),
         ] {
             assert_eq!(statement_kind(sql), Some(kind), "{sql}");
         }
 
-        // A name that is not called is not a transaction: a column called
-        // `payment`, or a table someone named after the procedure.
+        // A name that is not called is not a transaction: a column called `payment`, or
+        // a table someone named after the procedure.
         assert_eq!(statement_kind("select payment from orders"), None);
         assert_eq!(
             statement_kind("select * from orders where payment = 1"),
@@ -769,8 +680,8 @@ mod tests {
         assert_eq!(statement_kind("select count(*) from new_order"), None);
     }
 
-    /// **A plain-SQL NewOrder is an INSERT into the new_order table**, which is
-    /// the one table only that transaction writes.
+    /// A plain-SQL NewOrder is an INSERT into the new_order table, which is the one
+    /// table only that transaction writes.
     #[test]
     fn an_insert_into_new_order_is_a_new_order() {
         for sql in [
@@ -784,7 +695,7 @@ mod tests {
         assert_eq!(statement_kind("insert into orders values (1)"), None);
     }
 
-    /// **`show global status`, and the `LIKE` a client filters it with.**
+    /// `show global status`, and the `LIKE` a client filters it with.
     #[test]
     fn show_global_status_is_recognised_with_its_filter() {
         assert_eq!(show_status("show global status"), Some(None));
@@ -801,8 +712,7 @@ mod tests {
         assert_eq!(show_status("show global variables"), None);
     }
 
-    /// **The filter decides which counters are reported**, with MySQL's wildcard
-    /// rules.
+    /// The filter decides which counters are reported, with MySQL's wildcard rules.
     #[test]
     fn the_status_rows_follow_the_filter() {
         assert_eq!(status_rows(None).len(), 2, "both counters unfiltered");
@@ -824,7 +734,7 @@ mod tests {
         assert!(!like("", "anything"));
     }
 
-    /// **The failures a client asks for are recognised**, and nothing else is.
+    /// The failures a client asks for are recognised, and nothing else is.
     #[test]
     fn an_injected_failure_is_recognised() {
         assert_eq!(
@@ -852,15 +762,15 @@ mod tests {
             Some(Failure::UnknownProcedure)
         );
 
-        // A known procedure is a transaction, not a failure; a NULL in a
-        // SELECT is a value the server answers.
+        // A known procedure is a transaction, not a failure; a NULL in a SELECT is a
+        // value the server answers.
         assert_eq!(failure("call NEWORD(1, 2, 3, 4)"), None);
         assert_eq!(failure("select NULL"), None);
         assert_eq!(failure("insert into new_order values (1, 2, 3)"), None);
     }
 
-    /// **`SELECT @a, @b` answers its variables**, and a select of columns is not
-    /// mistaken for it.
+    /// `SELECT @a, @b` answers its variables, and a select of columns is not mistaken
+    /// for it.
     #[test]
     fn select_variables_are_recognised() {
         assert_eq!(
@@ -877,9 +787,8 @@ mod tests {
         );
     }
 
-    /// **The district sum grows by one per NewOrder**, over the districts the
-    /// schema is said to have. The absolute value is what a client reads twice;
-    /// the difference is what it reports.
+    /// The district sum grows by one per NewOrder, over the districts the schema is
+    /// said to have.
     #[test]
     fn the_district_sum_starts_at_3001_a_district_and_grows_by_new_orders() {
         let before_kind = STATS.new_order.load(Ordering::Relaxed);
@@ -891,16 +800,16 @@ mod tests {
         note(Kind::NewOrder);
         assert_eq!(district_sum(), at_start + 1, "one NewOrder, one more");
 
-        // Another kind of transaction does not move it: only a NewOrder
-        // advances a district's next order id.
+        // Another kind of transaction does not move it: only a NewOrder advances a
+        // district's next order id.
         note(Kind::Payment);
         assert_eq!(district_sum(), at_start + 1);
 
         set_warehouses(DEFAULT_WAREHOUSES);
     }
 
-    /// **The one-number answers are the profile's, and they come from the
-    /// schema size.** Off, none of them is answered at all.
+    /// The one-number answers are the profile's, and they come from the schema size.
+    /// Off, none of them is answered at all.
     #[test]
     fn the_population_answers_need_the_profile() {
         let _profile = profile_guard(false);
@@ -947,7 +856,7 @@ mod tests {
         assert!(!line().contains("[synthetic NOPM]"));
     }
 
-    /// **A transaction is counted at COMMIT, and a rollback counts nothing.**
+    /// A transaction is counted at COMMIT, and a rollback counts nothing.
     /// The note lives with the connection until then.
     #[test]
     fn a_transaction_is_counted_at_commit_not_when_it_runs() {
@@ -974,13 +883,8 @@ mod tests {
         assert_eq!(new_orders(), before + 2, "two NewOrders, one commit");
     }
 
-    /// The counters a client reads are the ones the statements counted, and the
-    /// line on stderr says the same.
-    ///
-    /// The assertions are monotone rather than exact: the counters are
-    /// process-wide and the other tests in this binary count transactions too.
-    /// The exact arithmetic is pinned in `tests/wire.rs`, where each test owns a
-    /// server process.
+    /// The counters a client reads are the ones the statements counted, and the line on
+    /// stderr says the same.
     #[test]
     fn the_counters_are_reported() {
         let commits = com_commit();
