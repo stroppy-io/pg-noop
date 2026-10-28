@@ -45,6 +45,10 @@ struct CliArgs {
     #[arg(long)]
     workers: Option<usize>,
 
+    /// Answer the synthetic TPC-C values (only `tpcc` is a profile)
+    #[arg(long)]
+    profile: Option<String>,
+
     /// Warehouses the TPCC schema is said to have (districts = 10 x this)
     #[arg(long)]
     warehouses: Option<u64>,
@@ -70,6 +74,7 @@ struct FileConfig {
     io: Option<String>,
     warehouses: Option<u64>,
     stats_every: Option<u64>,
+    profile: Option<String>,
 }
 
 /// A number from the environment.
@@ -206,6 +211,11 @@ fn config_path() -> PathBuf {
 pub struct Config {
     pub host: String,
     pub port: u16,
+    /// Whether the synthetic TPC-C answers are on. Off by default: a server that
+    /// answers a district sum without being asked is asserting numbers it has no
+    /// data for, and a client that has not asked for the profile may be one that
+    /// validates rows.
+    pub tpcc_profile: bool,
     /// Warehouses the TPCC schema is said to have: `sum(d_next_o_id)` is 3001
     /// per district and ten districts per warehouse.
     pub warehouses: u64,
@@ -409,6 +419,18 @@ impl Config {
             }
         };
 
+        // Only a profile this server has is accepted, and the answer says which
+        // ones those are: a typo must not silently measure the wrong thing.
+        let profile = cli.profile.or_else(|| env("PROFILE")).or(file.profile);
+        let tpcc_profile = match profile.as_deref().map(str::trim) {
+            None | Some("") | Some("none") => false,
+            Some("tpcc") => true,
+            Some(other) => {
+                eprintln!("dbnoop: unknown --profile {other:?}; expected `tpcc`");
+                std::process::exit(2);
+            }
+        };
+
         Config {
             host: cli
                 .host
@@ -417,6 +439,7 @@ impl Config {
                 .unwrap_or_else(|| "0.0.0.0".to_string()),
             port: given(cli.port, "PORT").or(file.port).unwrap_or(5432),
             mysql_port: given(cli.mysql_port, "MYSQL_PORT").or(file.mysql_port),
+            tpcc_profile,
             warehouses: cli
                 .warehouses
                 .or(warehouses)

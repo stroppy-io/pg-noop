@@ -1535,19 +1535,19 @@ impl Conn {
 /// Returns whether the portal has now been read to its end. Only a plan that
 /// returns rows has an end to reach; the rest are done when they answer.
 fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Run<'_>) -> bool {
-    // **The one statement answered with a number.** A TPC-C client reads the
-    // district sum before and after its window and reports the difference as
-    // NOPM; against a server that answered an empty result set that difference
-    // is zero, and the run it is measuring cannot report a throughput at all.
-    if crate::tpcc::is_district_sum(&plan.sql) {
-        return district_answer(out, run);
+    // **The statements answered with a number are the TPC-C profile's.** A
+    // client reads the district sum before and after its window and reports the
+    // difference as NOPM, and reads `pg_stat_database` for TPM; without the
+    // profile those are empty result sets, because a server that states numbers
+    // it has no data for is manufacturing a measurement.
+    if let Some((name, value)) = crate::tpcc::number_query(&plan.sql) {
+        return number_answer(out, run, name, value);
     }
 
-    // The other TPC-C read: `show global status`, which a client asks for the
-    // commit counters it reports as TPM. PostgreSQL has no such statement, and
-    // answering it is what makes the rules the same on both protocols.
-    if let Some(filter) = crate::tpcc::show_status(&plan.sql) {
-        return status_answer(out, run, filter.as_deref());
+    if crate::tpcc::profile() {
+        if let Some(filter) = crate::tpcc::show_status(&plan.sql) {
+            return status_answer(out, run, filter.as_deref());
+        }
     }
 
     match &plan.kind {
@@ -1627,13 +1627,11 @@ fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Ru
     true
 }
 
-/// The district sum's one column: `sum`, int8, in the format the portal asked
-/// for. Written by hand because it is the only answer whose value is not a
-/// stub.
-fn district_description(formats: &Formats, out: &mut Vec<u8>) {
+/// A one-number answer's column, int8, in the format the portal asked for.
+fn number_description(formats: &Formats, out: &mut Vec<u8>, name: &str) {
     msg(out, b'T', |b| {
         b.extend_from_slice(&1i16.to_be_bytes());
-        cstr(b, "sum");
+        cstr(b, name);
         b.extend_from_slice(&0i32.to_be_bytes()); // table oid: none
         b.extend_from_slice(&0i16.to_be_bytes()); // column number: none
         b.extend_from_slice(&20u32.to_be_bytes()); // int8
@@ -1697,12 +1695,10 @@ fn status_answer(out: &mut Vec<u8>, run: Run<'_>, filter: Option<&str>) -> bool 
     true
 }
 
-/// The TPC-C district sum as one row of one int8 column.
-fn district_answer(out: &mut Vec<u8>, run: Run<'_>) -> bool {
-    let value = crate::tpcc::district_sum();
-
+/// A TPC-C one-number answer: one row, one int8 column.
+fn number_answer(out: &mut Vec<u8>, run: Run<'_>, name: &str, value: u64) -> bool {
     if run.describe {
-        district_description(run.formats, out);
+        number_description(run.formats, out, name);
     }
 
     // A portal already read to its end has nothing more, as for any other
@@ -1955,12 +1951,12 @@ fn row_description(
 ) -> bool {
     // Described as it is answered: one int8 column named `sum`, so a driver that
     // decodes the value in binary reads the type it was told.
-    if crate::tpcc::is_district_sum(&plan.sql) {
-        district_description(formats, out);
+    if let Some((name, _)) = crate::tpcc::number_query(&plan.sql) {
+        number_description(formats, out, name);
 
         return true;
     }
-    if crate::tpcc::show_status(&plan.sql).is_some() {
+    if crate::tpcc::profile() && crate::tpcc::show_status(&plan.sql).is_some() {
         status_description(formats, out);
 
         return true;
@@ -2338,9 +2334,11 @@ mod tests {
     ///
     /// The frames are checked here -- one int8 column named `sum`, one row, its
     /// value the schema's -- and the arithmetic is pinned in `src/tpcc.rs` and
-    /// end to end in `tests/mysql_wire.rs`.
+    /// end to end in `tests/wire.rs`. The answers are the `tpcc` profile's, so the
+    /// test turns the profile on.
     #[test]
     fn the_district_sum_is_answered_with_one_row() {
+        let _profile = crate::tpcc::profile_guard(true);
         let (mut c, v) = (Conn::new(), view());
         let mut out = Vec::new();
         c.advance(&startup_msg(), &mut out, &v);

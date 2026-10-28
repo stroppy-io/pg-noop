@@ -86,8 +86,6 @@ enum Shape {
     Ok,
     /// A result set with no rows and these columns.
     Empty(Vec<String>),
-    /// The TPC-C district sum: one row, one integer (`crate::tpcc`).
-    District,
     /// `SHOW GLOBAL STATUS`, with the `LIKE` filter the client gave it: the
     /// `Com_commit` and `Com_rollback` counters.
     Status(Option<String>),
@@ -95,6 +93,8 @@ enum Shape {
     Vars(Vec<String>),
     /// A failure the client asked for, answered with the error it names.
     Failure(tpcc::Failure),
+    /// A one-number answer the TPC-C profile states: its column name and value.
+    Number(&'static str, u64),
     /// A SELECT whose list is literals and variables: one row of exactly those
     /// values, which is a row the server states rather than invents. The rule is
     /// `crate::sql::constant_select`, the same one PostgreSQL uses.
@@ -140,9 +140,10 @@ impl Answer {
                 .iter()
                 .map(|name| (name.as_str(), Kind::Text))
                 .collect(),
-            Shape::District => vec![("sum(d_next_o_id)", Kind::LongLong)],
+
             Shape::Status(_) => vec![("Variable_name", Kind::Text), ("Value", Kind::Text)],
             Shape::Failure(_) => Vec::new(),
+            Shape::Number(name, _) => vec![(*name, Kind::LongLong)],
             Shape::Constant(items) => items
                 .iter()
                 .map(|c| (c.name.as_str(), constant_kind(c.kind)))
@@ -562,18 +563,17 @@ impl Conn {
                 result::header(out, &mut self.seq, &columns, status, deprecate);
                 result::finish(out, &mut self.seq, status, deprecate);
             }
-            Shape::District => {
+            Shape::Number(name, value) => {
                 let columns = [Column {
-                    name: "sum(d_next_o_id)",
+                    name,
                     kind: Kind::LongLong,
                 }];
-                let value = tpcc::district_sum();
                 result::header(out, &mut self.seq, &columns, status, deprecate);
                 if binary {
                     result::binary_row(
                         out,
                         &mut self.seq,
-                        &[result::Value::LongLong(value as i64)],
+                        &[result::Value::LongLong(*value as i64)],
                     );
                 } else {
                     let text = value.to_string();
@@ -749,10 +749,16 @@ fn classify(sql: &str) -> Answer {
         // handling runs and its rollback is counted -- an OK here turns the
         // rollback into a commit.
         Shape::Failure(failure)
-    } else if let Some(filter) = tpcc::show_status(trimmed) {
-        Shape::Status(filter)
-    } else if tpcc::is_district_sum(trimmed) {
-        Shape::District
+    // **The synthetic answers are the profile's.** The district sum, the
+    // population counts and `show global status`'s values read like a
+    // database's; a server that states them without being asked is
+    // manufacturing a measurement.
+    } else if !tpcc::profile() && tpcc::number_query(trimmed).is_some() {
+        Shape::Empty(select_columns(trimmed))
+    } else if let Some((name, value)) = tpcc::number_query(trimmed) {
+        Shape::Number(name, value)
+    } else if tpcc::profile() && tpcc::show_status(trimmed).is_some() {
+        Shape::Status(tpcc::show_status(trimmed).unwrap_or(None))
     } else if let Some(names) = tpcc::select_vars(trimmed) {
         Shape::Vars(names)
     } else if let Some(items) = sql::constant_select(trimmed) {

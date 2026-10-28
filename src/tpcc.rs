@@ -170,6 +170,93 @@ pub fn district_sum() -> u64 {
     3001 * districts() + new_orders()
 }
 
+/// Whether the synthetic ANSWERS are on, which `--profile tpcc` says.
+///
+/// The counters are always on -- they cost a store -- but the answers that read
+/// like a database's (a district sum, a population count, `pg_stat_database`)
+/// are not: a server that answers them by default is asserting numbers it has no
+/// data for, and a client that has not asked for the profile may be one that
+/// validates rows. With the profile on, the stats line says `synthetic NOPM` so a
+/// figure taken this way can never be mistaken for a measurement.
+static PROFILE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_profile(on: bool) {
+    PROFILE.store(on, Ordering::Relaxed);
+}
+
+pub fn profile() -> bool {
+    PROFILE.load(Ordering::Relaxed)
+}
+
+/// **A one-number answer a TPC-C client reads**, when the profile is on.
+///
+/// Every value derives from `--warehouses`: the schema TPC-C populates is
+/// 100,000 items, ten districts a warehouse holding 3,000 orders each and 900
+/// open new orders each, and a client that reads one of these is reading the
+/// population it expects -- not a measurement.
+pub fn number_query(sql: &str) -> Option<(&'static str, u64)> {
+    if !profile() {
+        return None;
+    }
+
+    let trimmed = sql::trim_leading(sql);
+    let mut words = sql::Words::new(trimmed).map(|w| w.to_ascii_lowercase());
+    let first = words.next()?;
+    if first != "select" {
+        return None;
+    }
+
+    // The aggregate, then the table it is over. The argument is skipped: the
+    // scanner drops punctuation, so `count(*)` is the one word `count`.
+    let aggregate = words.next()?;
+    words.by_ref().find(|w| w == "from")?;
+    // The table is the LAST word before a clause: `from tpcc.district` is the
+    // words `tpcc` and `district`, and the table is the second.
+    let mut table = None;
+    for word in words.by_ref() {
+        if [
+            "where", "group", "order", "limit", "having", "offset", "union", "for",
+        ]
+        .iter()
+        .any(|c| word == *c)
+        {
+            break;
+        }
+        table = Some(word);
+    }
+    let table = table?;
+    let table = table.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+    // A TPC-C schema may prefix its tables: `tpcc_district` is a district.
+    let table = table.strip_prefix("tpcc_").unwrap_or(table);
+
+    let districts = districts();
+    let items = match (aggregate.as_str(), table) {
+        // The NOPM read: 3001 per district at the start, plus one per NewOrder.
+        (a, "district") if a == "sum" && trimmed.to_lowercase().contains("d_next_o_id") => {
+            Some(("sum(d_next_o_id)", district_sum()))
+        }
+        ("max", "warehouse") => Some(("max(w_id)", WAREHOUSES.load(Ordering::Relaxed))),
+        ("max", "district") => Some(("max(d_id)", 10)),
+        ("max", "customer") => Some(("max(c_id)", 3000)),
+        ("max", "orders") | ("max", "oorder") => Some(("max(o_id)", 3000)),
+        // A population count, plus the transactions this process has seen: a
+        // client that counts orders before and after its window reads a
+        // difference, exactly as it does with the district sum.
+        ("count", "orders") | ("count", "oorder") => {
+            Some(("count(*)", 3000 * districts + new_orders()))
+        }
+        ("count", "new_order") => Some(("count(*)", 900 * districts)),
+        ("count", "warehouse") => Some(("count(*)", WAREHOUSES.load(Ordering::Relaxed))),
+        ("count", "district") => Some(("count(*)", districts)),
+        // HammerDB's PostgreSQL TPM: the transactions the server has committed
+        // and rolled back.
+        ("sum", "pg_stat_database") => Some(("sum", com_commit() + com_rollback())),
+        _ => None,
+    };
+
+    items
+}
+
 /// **What one connection has done but not yet committed.**
 ///
 /// A transaction is counted when it COMMITS, not when its statement runs: a
@@ -252,11 +339,45 @@ pub fn line() -> String {
         district_sum(),
         WAREHOUSES.load(Ordering::Relaxed),
     ));
+    if profile() {
+        // A figure taken with the synthetic answers on is not a measurement of a
+        // database, and the line must say so wherever it is read.
+        line.push_str(" [synthetic NOPM]");
+    }
 
     line
 }
 
-/// **A failure the client asked for, and the path it exercises.**
+/// The profile switched on (or off) for the life of a test, with the switch
+/// held: it is process-wide, and two tests that set it differently race.
+#[cfg(test)]
+pub fn profile_guard(on: bool) -> ProfileGuard {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    let held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let before = profile();
+    set_profile(on);
+
+    ProfileGuard {
+        _held: held,
+        before,
+    }
+}
+
+#[cfg(test)]
+pub struct ProfileGuard {
+    _held: std::sync::MutexGuard<'static, ()>,
+    before: bool,
+}
+
+#[cfg(test)]
+impl Drop for ProfileGuard {
+    fn drop(&mut self) {
+        set_profile(self.before);
+    }
+}
+
+/// The value of a MySQL system variable/// **A failure the client asked for, and the path it exercises.**
 ///
 /// A benchmark has to exercise its rollback path, and it does so by making a
 /// statement fail on purpose: stroppy-rust's MySQL NewOrder rolls back one time
@@ -776,6 +897,54 @@ mod tests {
         assert_eq!(district_sum(), at_start + 1);
 
         set_warehouses(DEFAULT_WAREHOUSES);
+    }
+
+    /// **The one-number answers are the profile's, and they come from the
+    /// schema size.** Off, none of them is answered at all.
+    #[test]
+    fn the_population_answers_need_the_profile() {
+        let _profile = profile_guard(false);
+        set_warehouses(10);
+        for sql in [
+            "select sum(d_next_o_id) from district",
+            "select max(w_id) from warehouse",
+            "select count(*) from orders",
+        ] {
+            assert_eq!(number_query(sql), None, "{sql} without the profile");
+        }
+
+        set_profile(true);
+        assert_eq!(
+            number_query("select sum(d_next_o_id) from district"),
+            Some(("sum(d_next_o_id)", 3001 * 100 + new_orders()))
+        );
+        assert_eq!(
+            number_query("select max(w_id) from warehouse"),
+            Some(("max(w_id)", 10))
+        );
+        assert_eq!(
+            number_query("select max(d_id) from district"),
+            Some(("max(d_id)", 10))
+        );
+        assert_eq!(
+            number_query("select count(*) from orders"),
+            Some(("count(*)", 3000 * 100 + new_orders()))
+        );
+        assert_eq!(
+            number_query("select count(*) from new_order"),
+            Some(("count(*)", 900 * 100))
+        );
+        assert_eq!(
+            number_query("select sum(xact_commit+xact_rollback) from pg_stat_database"),
+            Some(("sum", com_commit() + com_rollback()))
+        );
+        assert_eq!(number_query("select 1"), None, "a literal is not a count");
+        assert_eq!(number_query("select a from t"), None);
+
+        // The line says which kind of number it is reporting.
+        assert!(line().contains("[synthetic NOPM]"));
+        set_profile(false);
+        assert!(!line().contains("[synthetic NOPM]"));
     }
 
     /// **A transaction is counted at COMMIT, and a rollback counts nothing.**
