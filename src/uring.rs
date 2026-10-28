@@ -68,23 +68,25 @@ const PBUF_COUNT: u16 = 256;
 
 /// The most buffers a ring can describe. The ring's index is a `u16` mask, and
 /// `next_power_of_two` overflows to zero above half that range -- a
-/// `PGNOOP_PBUF` the operator picked too large used to panic a shard.
+/// `DBNOOP_PBUF` (`PGNOOP_PBUF` is the old name) the operator picked too large
+/// used to panic a shard.
 const PBUF_MAX: u16 = 1 << 15;
 
-/// `PGNOOP_PBUF`, or the default. A value too large for the ring's index is
+/// `DBNOOP_PBUF` -- or `PGNOOP_PBUF`, which is what it was called before the
+/// rename -- or the default. A value too large for the ring's index is
 /// clamped and said so: silently serving a different ring size is a measurement
 /// nobody can reproduce.
 fn pbuf_count_from_env() -> u16 {
-    let Some(value) = std::env::var("PGNOOP_PBUF").ok() else {
+    let Some(value) = crate::config::env("PBUF") else {
         return PBUF_COUNT;
     };
     let Some(asked) = value.trim().parse::<u32>().ok() else {
-        eprintln!("pgnoop: PGNOOP_PBUF={value:?} is not a number of buffers; using {PBUF_COUNT}");
+        eprintln!("dbnoop: PBUF={value:?} is not a number of buffers; using {PBUF_COUNT}");
         return PBUF_COUNT;
     };
     if asked > PBUF_MAX as u32 {
         eprintln!(
-            "pgnoop: PGNOOP_PBUF={asked} is more than the {PBUF_MAX} buffers a ring \
+            "dbnoop: PBUF={asked} is more than the {PBUF_MAX} buffers a ring \
              can address; using {PBUF_MAX}"
         );
         return PBUF_MAX;
@@ -451,7 +453,7 @@ pub fn probe() -> io::Result<()> {
         // No ring at all: the answer `main` needs to serve with epoll instead.
         return Err(io::Error::from_raw_os_error(errno));
     }
-    eprintln!("pgnoop: io_uring {}", p.describe());
+    eprintln!("dbnoop: io_uring {}", p.describe());
     Ok(())
 }
 
@@ -511,7 +513,7 @@ where
     let mut dropped = Vec::new();
     for flag in Flag::ORDER {
         // DEFER_TASKRUN needs SINGLE_ISSUER, which the ladder has already tried
-        // by the time it gets here; PGNOOP_NO_DEFER is the operator asking for
+        // by the time it gets here; DBNOOP_NO_DEFER is the operator asking for
         // the ring without it.
         if flag == Flag::DeferTaskrun && !defer {
             continue;
@@ -553,10 +555,8 @@ where
 /// ring at all records why, so `probe` can report it and `main` can serve with
 /// epoll.
 fn compute_plan() -> Plan {
-    let defer = std::env::var("PGNOOP_NO_DEFER").is_err();
-    let sqpoll = std::env::var("PGNOOP_SQPOLL")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok());
+    let defer = crate::config::env("NO_DEFER").is_none();
+    let sqpoll = crate::config::env("SQPOLL").and_then(|v| v.parse::<u32>().ok());
 
     // The completion queue is sized for four times the connection capacity --
     // `entries` submission slots is the capacity a shard is built for -- so a
@@ -607,7 +607,7 @@ fn compute_plan() -> Plan {
                 let errno = e.raw_os_error().unwrap_or(0);
                 plan.dropped.push(("SQPOLL", errno));
                 eprintln!(
-                    "pgnoop: SQPOLL unavailable ({}); falling back to the plain ring",
+                    "dbnoop: SQPOLL unavailable ({}); falling back to the plain ring",
                     errno_name(errno)
                 );
             }
@@ -622,7 +622,7 @@ fn compute_plan() -> Plan {
             // The ladder said this set was buildable; if it is not now, say so
             // rather than quietly serving on a different ring.
             eprintln!(
-                "pgnoop: io_uring refused the probed setup ({}); using a plain ring",
+                "dbnoop: io_uring refused the probed setup ({}); using a plain ring",
                 errno_name(e.raw_os_error().unwrap_or(0))
             );
             plan.setup = Setup::default();
@@ -655,7 +655,7 @@ fn compute_plan() -> Plan {
                 let errno = e.raw_os_error().unwrap_or(0);
                 plan.pbuf_errno = Some(errno);
                 eprintln!(
-                    "pgnoop: provided buffers unavailable ({}); each connection \
+                    "dbnoop: provided buffers unavailable ({}); each connection \
                      keeps its own receive buffer",
                     errno_name(errno)
                 );
@@ -972,7 +972,7 @@ fn passes(
                 ..setup
             };
             eprintln!(
-                "pgnoop: io_uring ring ran out of memory with CQSIZE ({}); \
+                "dbnoop: io_uring ring ran out of memory with CQSIZE ({}); \
                  shards keep the kernel's own completion queue",
                 errno_name(libc::ENOMEM)
             );
@@ -980,7 +980,7 @@ fn passes(
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!(
-                        "pgnoop: io_uring refused the probed setup ({}); serving on a plain ring",
+                        "dbnoop: io_uring refused the probed setup ({}); serving on a plain ring",
                         errno_name(e.raw_os_error().unwrap_or(0))
                     );
                     build(&Setup::default(), tuning.entries)?
@@ -989,7 +989,7 @@ fn passes(
         }
         Err(e) => {
             eprintln!(
-                "pgnoop: io_uring refused the probed setup ({}); serving on a plain ring",
+                "dbnoop: io_uring refused the probed setup ({}); serving on a plain ring",
                 errno_name(e.raw_os_error().unwrap_or(0))
             );
             build(&Setup::default(), tuning.entries)?
@@ -1004,7 +1004,7 @@ fn passes(
     if plan.ring_fd {
         if let Err(e) = submit.register_ring_fd() {
             eprintln!(
-                "pgnoop: ring fd registration failed ({}); enters keep passing the raw fd",
+                "dbnoop: ring fd registration failed ({}); enters keep passing the raw fd",
                 errno_name(e.raw_os_error().unwrap_or(0))
             );
         }
@@ -1183,7 +1183,7 @@ fn passes(
                                 // taken.
                                 accept_paused_until = Some(Instant::now() + ACCEPT_BACKOFF);
                                 eprintln!(
-                                    "pgnoop: accept failed with errno {err}; \
+                                    "dbnoop: accept failed with errno {err}; \
                                  not re-arming accept for {}ms (other work continues)",
                                     ACCEPT_BACKOFF.as_millis()
                                 );
@@ -1286,7 +1286,7 @@ fn passes(
                                     multishot = false;
                                     slot.private = true;
                                     eprintln!(
-                                        "pgnoop: multishot receive unavailable ({}); \
+                                        "dbnoop: multishot receive unavailable ({}); \
                                      one receive per read instead",
                                         errno_name(-r)
                                     );
@@ -1476,7 +1476,7 @@ fn passes(
                 if let Some(slot) = slots.get_mut(idx).and_then(|s| s.as_mut()) {
                     if slot.session.awaiting_startup() {
                         eprintln!(
-                            "pgnoop: connection did not complete startup within {}ms; closing",
+                            "dbnoop: connection did not complete startup within {}ms; closing",
                             tuning.startup_timeout.map_or(0, |t| t.as_millis())
                         );
                     }
@@ -2119,7 +2119,7 @@ fn register_buffers(
         Ok(b) => Some(b),
         Err(e) => {
             eprintln!(
-                "pgnoop: provided buffers could not be registered ({}); \
+                "dbnoop: provided buffers could not be registered ({}); \
                  each connection keeps its own receive buffer",
                 errno_name(e.raw_os_error().unwrap_or(0))
             );
@@ -2780,7 +2780,7 @@ mod tests {
         assert!(plan.dropped.iter().any(|(name, _)| *name == "COOP_TASKRUN"));
         assert!(
             !plan.granted.contains(&"DEFER_TASKRUN"),
-            "PGNOOP_NO_DEFER was set"
+            "DBNOOP_NO_DEFER was set"
         );
     }
 
@@ -2888,21 +2888,21 @@ mod tests {
         drop(first);
     }
 
-    /// **What `PGNOOP_PBUF` means, including the values an operator types by
+    /// **What `DBNOOP_PBUF` means, including the values an operator types by
     /// accident.** A value over the index's range is clamped rather than
     /// overflowed, one that is not a number keeps the default, and zero buffers
     /// is no ring at all rather than a ring with none.
     #[test]
     fn the_buffer_ring_size_from_the_environment_is_bounded() {
-        std::env::set_var("PGNOOP_PBUF", "40000");
+        std::env::set_var("DBNOOP_PBUF", "40000");
         assert_eq!(pbuf_count_from_env(), PBUF_MAX);
-        std::env::set_var("PGNOOP_PBUF", " 16 ");
+        std::env::set_var("DBNOOP_PBUF", " 16 ");
         assert_eq!(pbuf_count_from_env(), 16);
-        std::env::set_var("PGNOOP_PBUF", "0");
+        std::env::set_var("DBNOOP_PBUF", "0");
         assert_eq!(pbuf_count_from_env(), 1);
-        std::env::set_var("PGNOOP_PBUF", "nonsense");
+        std::env::set_var("DBNOOP_PBUF", "nonsense");
         assert_eq!(pbuf_count_from_env(), PBUF_COUNT);
-        std::env::remove_var("PGNOOP_PBUF");
+        std::env::remove_var("DBNOOP_PBUF");
         assert_eq!(pbuf_count_from_env(), PBUF_COUNT);
     }
 
@@ -2921,7 +2921,7 @@ mod tests {
             (u16::MAX, PBUF_MAX),
         ] {
             let ring = BufRing::alloc(asked).expect("a ring is allocated");
-            assert_eq!(ring.count, expected, "PGNOOP_PBUF={asked}");
+            assert_eq!(ring.count, expected, "DBNOOP_PBUF={asked}");
         }
     }
 

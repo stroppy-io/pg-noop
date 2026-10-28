@@ -288,7 +288,7 @@ fn count_select_columns(sql: &str) -> usize {
 /// decides how rows are counted, which is the difference between counting
 /// tuples, counting lines, and counting lines outside quotes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CopyFormat {
+pub enum CopyFormat {
     Text,
     Csv,
     Binary,
@@ -302,7 +302,7 @@ pub(crate) enum CopyFormat {
 /// depending on which path asked -- a conversation on one and a finished
 /// statement on the other, which desynchronises the stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CopyDirection {
+pub enum CopyDirection {
     /// `COPY ... FROM STDIN`: the client streams rows next. A conversation.
     FromStdin,
     /// `COPY ... TO STDOUT`: the server would stream rows. A blackhole has none.

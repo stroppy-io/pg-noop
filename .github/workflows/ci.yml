@@ -51,12 +51,12 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --locked --release --bin pgnoop
+      - run: cargo build --locked --release --bin dbnoop --bin pgnoop
       - name: Start and connect
         shell: bash
         run: |
           set -euo pipefail
-          ./target/release/pgnoop --host 127.0.0.1 --port 15432 --workers 1 >server.log 2>&1 &
+          ./target/release/dbnoop --host 127.0.0.1 --port 15432 --mysql-port 15433 --workers 1 >server.log 2>&1 &
           server_pid=$!
           trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
 
@@ -65,11 +65,29 @@ jobs:
               cat server.log
               exit 1
             fi
-            if python3 -c 'import socket; socket.create_connection(("127.0.0.1", 15432), 1).close()'; then
+            if python3 -c 'import socket; socket.create_connection(("127.0.0.1", 15432), 1).close()' 2>/dev/null; then
+              # PostgreSQL says nothing until it is spoken to; MySQL greets first,
+              # so the greeting is what proves the second listener is up.
+              python3 -c 'import socket; s = socket.create_connection(("127.0.0.1", 15433), 1); g = s.recv(64); s.close(); assert g and g[4] == 10, "no HandshakeV10 from the MySQL listener"'
               exit 0
             fi
             sleep 0.05
           done
 
           cat server.log
+          exit 1
+      - name: The old binary name still serves
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./target/release/pgnoop --host 127.0.0.1 --port 15434 --workers 1 >pgnoop.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+          for _ in {1..100}; do
+            if python3 -c 'import socket; socket.create_connection(("127.0.0.1", 15434), 1).close()' 2>/dev/null; then
+              exit 0
+            fi
+            sleep 0.05
+          done
+          cat pgnoop.log
           exit 1

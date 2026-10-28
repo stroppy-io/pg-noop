@@ -1,12 +1,24 @@
-mod config;
-mod handler;
-mod mysql;
-mod protocol;
-mod sql;
-mod tpcc;
+//! db-noop: a no-op database server for benchmark clients.
+//!
+//! Two wire protocols -- PostgreSQL and MySQL/MariaDB -- over one shard-per-core
+//! io_uring (or epoll) loop, and an answer for every statement that is valid but
+//! does nothing. The point is to measure a CLIENT: against a real database both
+//! clients make the server do the same work, so a comparison measures the
+//! server; against this one the server does nothing, so it measures them.
+//!
+//! The TPC-C rules in `tpcc` are the one exception, and they are explicit: a
+//! handful of statement shapes answered with the numbers a TPC-C client reads
+//! its throughput from, without which such a run reports zero.
+
+pub mod config;
+pub mod handler;
+pub mod mysql;
+pub mod protocol;
+pub mod sql;
+pub mod tpcc;
 #[cfg(target_os = "linux")]
-mod uring;
-mod wire;
+pub mod uring;
+pub mod wire;
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -177,7 +189,7 @@ fn io_to_serve(requested: Io, probe: std::io::Result<()>) -> Io {
         (Io::Uring, Ok(())) => Io::Uring,
         (Io::Uring, Err(e)) => {
             eprintln!(
-                "pgnoop: io_uring unavailable ({e}); serving with epoll. \
+                "dbnoop: io_uring unavailable ({e}); serving with epoll. \
                  Under Docker this is the default seccomp profile denying \
                  io_uring_setup; --io epoll makes the choice explicit."
             );
@@ -250,7 +262,7 @@ async fn serve(mut socket: TcpStream, codec: Codec) {
                     // log line below.
                     Ok(Ok(_)) | Ok(Err(_)) => return,
                     Err(_elapsed) => {
-                        eprintln!("pgnoop: connection did not complete startup in time; closing");
+                        eprintln!("dbnoop: connection did not complete startup in time; closing");
                         return;
                     }
                 },
@@ -310,7 +322,7 @@ fn run_shard(
         Some(cpu) => {
             let ok = pin_to_cpu(cpu);
             if !ok {
-                eprintln!("pgnoop: shard {id} could not pin to cpu {cpu}; continuing unpinned");
+                eprintln!("dbnoop: shard {id} could not pin to cpu {cpu}; continuing unpinned");
             }
             ok
         }
@@ -331,7 +343,7 @@ fn run_shard(
     #[cfg(target_os = "linux")]
     if io == Io::Uring {
         if let Err(e) = crate::uring::run(listener, codec, 4096) {
-            eprintln!("pgnoop: shard {id} io_uring loop ended: {e}");
+            eprintln!("dbnoop: shard {id} io_uring loop ended: {e}");
             return false;
         }
         return true;
@@ -385,7 +397,7 @@ fn run_shard(
                         libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOBUFS
                     ) {
                         eprintln!(
-                            "pgnoop: shard {id} accept failed: {e}; \
+                            "dbnoop: shard {id} accept failed: {e}; \
                              not accepting for {}ms (open connections continue)",
                             config::ACCEPT_BACKOFF.as_millis()
                         );
@@ -394,7 +406,7 @@ fn run_shard(
                         continue;
                     }
 
-                    eprintln!("pgnoop: shard {id} accept failed: {e}");
+                    eprintln!("dbnoop: shard {id} accept failed: {e}");
                     return false;
                 }
             }
@@ -410,7 +422,7 @@ fn run_shard(
 /// stderr during a measurement is a server in the measurement.
 fn spawn_stats(interval: std::time::Duration) {
     std::thread::Builder::new()
-        .name("pgnoop-stats".to_string())
+        .name("dbnoop-stats".to_string())
         .spawn(move || loop {
             std::thread::sleep(interval);
             eprintln!("{}", crate::tpcc::line());
@@ -418,7 +430,12 @@ fn spawn_stats(interval: std::time::Duration) {
         .expect("spawn the stats thread");
 }
 
-fn main() {
+/// Serve until the process is stopped.
+///
+/// What both binary names run: `dbnoop` is the name, and `pgnoop` is the same
+/// program under the name the scripts written for the PostgreSQL-only server
+/// already use.
+pub fn run() {
     let config = Config::load();
     crate::tpcc::set_warehouses(config.warehouses);
     if config.stats_every > 0 {
@@ -467,14 +484,14 @@ fn main() {
         let candidates = match resolve_bind_addrs(&config.host, port) {
             Ok(a) => a,
             Err(e) => {
-                eprintln!("pgnoop: cannot bind {}:{port}: {e}", config.host);
+                eprintln!("dbnoop: cannot bind {}:{port}: {e}", config.host);
                 std::process::exit(2);
             }
         };
         let (addr, listeners) = match bind_shards(&candidates, shards, 1024) {
             Ok(bound) => bound,
             Err(e) => {
-                eprintln!("pgnoop: cannot bind {}:{port}: {e}", config.host);
+                eprintln!("dbnoop: cannot bind {}:{port}: {e}", config.host);
                 std::process::exit(2);
             }
         };
@@ -490,7 +507,7 @@ fn main() {
             let pinned = pinned_tx.clone();
             threads.push(
                 std::thread::Builder::new()
-                    .name(format!("pgnoop-{}-{id}", protocol.name()))
+                    .name(format!("dbnoop-{}-{id}", protocol.name()))
                     .spawn(move || run_shard(id, listener, cpu, pinned, io, codec))
                     .expect("spawn shard"),
             );
@@ -507,7 +524,7 @@ fn main() {
 
     for (protocol, addr) in &banners {
         eprintln!(
-            "pgnoop {} listening on {addr} ({shards} shards, {}, SO_REUSEPORT, pinned={pinned}/{total})",
+            "dbnoop {} listening on {addr} ({shards} shards, {}, SO_REUSEPORT, pinned={pinned}/{total})",
             protocol.name(),
             io.as_str(),
         );
@@ -518,7 +535,7 @@ fn main() {
     // reproducible if it says which ring produced it.
     #[cfg(target_os = "linux")]
     if io == Io::Uring {
-        eprintln!("pgnoop: io_uring {}", crate::uring::report());
+        eprintln!("dbnoop: io_uring {}", crate::uring::report());
     }
 
     // A server whose every shard failed must not exit 0. Discarding the join
@@ -532,7 +549,7 @@ fn main() {
     }
 
     if served == 0 {
-        eprintln!("pgnoop: no shard served; exiting nonzero");
+        eprintln!("dbnoop: no shard served; exiting nonzero");
         std::process::exit(1);
     }
 

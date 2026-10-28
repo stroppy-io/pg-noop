@@ -3,45 +3,61 @@ use std::path::PathBuf;
 use clap::Parser;
 use serde::Deserialize;
 
+/// An environment variable, under either name this server has had.
+///
+/// `DBNOOP_` is the name, and `PGNOOP_` is what every script and unit file
+/// written before the rename says. Both keep working: an upgrade that silently
+/// changed a port because a variable was spelled differently is exactly the kind
+/// of breakage the second binary name exists to avoid.
+pub fn env(name: &str) -> Option<String> {
+    for prefix in ["DBNOOP_", "PGNOOP_"] {
+        if let Ok(value) = std::env::var(format!("{prefix}{name}")) {
+            return Some(value);
+        }
+    }
+
+    None
+}
+
 #[derive(Parser, Debug)]
 #[command(
-    name = "pgnoop",
-    about = "NoOp PostgreSQL blackhole server for benchmarking"
+    name = "dbnoop",
+    about = "NoOp PostgreSQL and MySQL/MariaDB server for measuring benchmark clients"
 )]
 struct CliArgs {
-    /// Path to JSON config file
-    #[arg(long, env = "PGNOOP_CONFIG", default_value = "./pgnoop.json")]
-    config: PathBuf,
+    /// Path to JSON config file (default ./dbnoop.json, or ./pgnoop.json)
+    #[arg(long)]
+    config: Option<PathBuf>,
 
     /// Bind host
-    #[arg(long, env = "PGNOOP_HOST")]
+    #[arg(long)]
     host: Option<String>,
 
     /// Listen port
-    #[arg(long, env = "PGNOOP_PORT")]
+    #[arg(long)]
     port: Option<u16>,
 
     /// MySQL/MariaDB listen port (the protocol is served only when this is set)
-    #[arg(long, env = "PGNOOP_MYSQL_PORT")]
+    #[arg(long)]
     mysql_port: Option<u16>,
 
     /// Number of shards, one thread each (0 = number of logical CPUs)
-    #[arg(long, env = "PGNOOP_WORKERS")]
+    #[arg(long)]
     workers: Option<usize>,
 
     /// Warehouses the TPCC schema is said to have (districts = 10 x this)
-    #[arg(long, env = "PGNOOP_WAREHOUSES")]
+    #[arg(long)]
     warehouses: Option<u64>,
 
     /// Print the TPCC counters on stderr every N seconds (0 = never)
-    #[arg(long, env = "PGNOOP_STATS_EVERY")]
+    #[arg(long)]
     stats_every: Option<u64>,
 
     /// I/O backend: `uring` or `epoll`. Both are shard-per-core and share the
     /// sans-io codec; they differ only in how bytes are moved. Kept selectable
     /// so the two can be measured against each other on one binary. `uring` is
     /// Linux-only.
-    #[arg(long, env = "PGNOOP_IO")]
+    #[arg(long)]
     io: Option<String>,
 }
 
@@ -54,6 +70,23 @@ struct FileConfig {
     io: Option<String>,
     warehouses: Option<u64>,
     stats_every: Option<u64>,
+}
+
+/// The config file to read when `--config` does not name one.
+///
+/// `./dbnoop.json` is the name; `./pgnoop.json` is read when it is the only one
+/// there, so an existing installation keeps its settings.
+fn config_path() -> PathBuf {
+    let named = PathBuf::from("./dbnoop.json");
+    if named.exists() {
+        return named;
+    }
+    let old = PathBuf::from("./pgnoop.json");
+    if old.exists() {
+        return old;
+    }
+
+    named
 }
 
 pub struct Config {
@@ -117,11 +150,11 @@ impl Io {
             "uring" | "io_uring" | "io-uring" => Io::Uring,
             #[cfg(not(target_os = "linux"))]
             "uring" | "io_uring" | "io-uring" => {
-                eprintln!("pgnoop: io_uring is Linux-only; this build has epoll");
+                eprintln!("dbnoop: io_uring is Linux-only; this build has epoll");
                 std::process::exit(2);
             }
             other => {
-                eprintln!("pgnoop: unknown --io value {other:?}; expected `uring` or `epoll`");
+                eprintln!("dbnoop: unknown --io value {other:?}; expected `uring` or `epoll`");
                 std::process::exit(2);
             }
         }
@@ -153,7 +186,7 @@ pub const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis
 ///
 /// The same 60 s, because the timeout is a property of the protocol's users
 /// rather than of this server: a driver that has not spoken in a minute is not a
-/// driver that is about to. `PGNOOP_STARTUP_TIMEOUT_MS` overrides it, and `0`
+/// driver that is about to. `DBNOOP_STARTUP_TIMEOUT_MS` overrides it, and `0`
 /// disables it for anyone who wants the old behaviour on purpose.
 const STARTUP_TIMEOUT_DEFAULT_MS: u64 = 60_000;
 
@@ -167,13 +200,13 @@ static STARTUP_TIMEOUT: std::sync::OnceLock<Option<std::time::Duration>> =
 /// since exiting is `load`'s decision, not a connection's.
 pub fn startup_timeout() -> Option<std::time::Duration> {
     *STARTUP_TIMEOUT.get_or_init(|| {
-        parse_startup_timeout(std::env::var("PGNOOP_STARTUP_TIMEOUT_MS").ok().as_deref()).unwrap_or(
-            Some(std::time::Duration::from_millis(STARTUP_TIMEOUT_DEFAULT_MS)),
-        )
+        parse_startup_timeout(env("STARTUP_TIMEOUT_MS").as_deref()).unwrap_or(Some(
+            std::time::Duration::from_millis(STARTUP_TIMEOUT_DEFAULT_MS),
+        ))
     })
 }
 
-/// `PGNOOP_STARTUP_TIMEOUT_MS` as the timeout it means. Unset is the default,
+/// `DBNOOP_STARTUP_TIMEOUT_MS` as the timeout it means. Unset is the default,
 /// an exact `0` is disabled, a positive number is itself, and anything else is
 /// an error.
 ///
@@ -192,7 +225,7 @@ fn parse_startup_timeout(value: Option<&str>) -> Result<Option<std::time::Durati
         Ok(0) => Ok(None),
         Ok(ms) => Ok(Some(std::time::Duration::from_millis(ms))),
         Err(_) => Err(format!(
-            "PGNOOP_STARTUP_TIMEOUT_MS={value:?} is not a number of milliseconds; \
+            "STARTUP_TIMEOUT_MS={value:?} is not a number of milliseconds; \
              expected a positive integer, or 0 to disable"
         )),
     }
@@ -204,18 +237,20 @@ impl Config {
 
         // Decided here, once, so a bad value stops the server before it binds
         // rather than being discovered -- or silently ignored -- per connection.
-        let timeout =
-            match parse_startup_timeout(std::env::var("PGNOOP_STARTUP_TIMEOUT_MS").ok().as_deref())
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("pgnoop: {e}");
-                    std::process::exit(2);
-                }
-            };
+        let timeout = match parse_startup_timeout(env("STARTUP_TIMEOUT_MS").as_deref()) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("dbnoop: {e}");
+                std::process::exit(2);
+            }
+        };
         let _ = STARTUP_TIMEOUT.set(timeout);
 
-        let file: FileConfig = std::fs::read_to_string(&cli.config)
+        let path = match cli.config {
+            Some(path) => path,
+            None => env("CONFIG").map(PathBuf::from).unwrap_or_else(config_path),
+        };
+        let file: FileConfig = std::fs::read_to_string(path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
@@ -224,21 +259,39 @@ impl Config {
             .map(|n| n.get())
             .unwrap_or(4);
 
+        // **CLI, then the environment, then the file.** The environment is read
+        // here rather than by clap so that both prefixes can be honoured (see
+        // `env`).
+        let given = |cli: Option<u16>, name: &str| -> Option<u16> {
+            cli.or_else(|| env(name).and_then(|v| v.trim().parse().ok()))
+        };
+
         Config {
             host: cli
                 .host
+                .or_else(|| env("HOST"))
                 .or(file.host)
                 .unwrap_or_else(|| "0.0.0.0".to_string()),
-            port: cli.port.or(file.port).unwrap_or(5432),
-            mysql_port: cli.mysql_port.or(file.mysql_port),
+            port: given(cli.port, "PORT").or(file.port).unwrap_or(5432),
+            mysql_port: given(cli.mysql_port, "MYSQL_PORT").or(file.mysql_port),
             warehouses: cli
                 .warehouses
+                .or_else(|| env("WAREHOUSES").and_then(|v| v.trim().parse().ok()))
                 .or(file.warehouses)
                 .unwrap_or(crate::tpcc::DEFAULT_WAREHOUSES),
-            stats_every: cli.stats_every.or(file.stats_every).unwrap_or(0),
-            workers: cli.workers.or(file.workers).unwrap_or(default_workers),
+            stats_every: cli
+                .stats_every
+                .or_else(|| env("STATS_EVERY").and_then(|v| v.trim().parse().ok()))
+                .or(file.stats_every)
+                .unwrap_or(0),
+            workers: cli
+                .workers
+                .or_else(|| env("WORKERS").and_then(|v| v.trim().parse().ok()))
+                .or(file.workers)
+                .unwrap_or(default_workers),
             io: cli
                 .io
+                .or_else(|| env("IO"))
                 .or(file.io)
                 .map(|s| Io::parse(&s))
                 .unwrap_or_default(),
@@ -252,7 +305,7 @@ mod tests {
 
     /// **A value that does not parse is an error, not "disabled".** The
     /// parse failure became `None`, and `None` is also the explicit
-    /// disabled state, so `PGNOOP_STARTUP_TIMEOUT_MS=60000x` -- a typo --
+    /// disabled state, so `DBNOOP_STARTUP_TIMEOUT_MS=60000x` -- a typo --
     /// silently removed the guard the variable exists to tune.
     #[test]
     fn a_malformed_timeout_is_refused() {
