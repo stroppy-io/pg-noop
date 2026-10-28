@@ -200,7 +200,9 @@ async fn serve(mut socket: TcpStream, codec: Codec) {
                     // measurement it cannot trust.
                     Ok(Ok(_)) => return,
                     Ok(Err(e)) => {
-                        eprintln!("dbnoop: read failed during startup: {e}");
+                        if !a_connection_ending(&e) {
+                            eprintln!("dbnoop: read failed during startup: {e}");
+                        }
 
                         return;
                     }
@@ -213,7 +215,9 @@ async fn serve(mut socket: TcpStream, codec: Codec) {
                     Ok(0) => return,
                     Ok(n) => n,
                     Err(e) => {
-                        eprintln!("dbnoop: read failed: {e}");
+                        if !a_connection_ending(&e) {
+                            eprintln!("dbnoop: read failed: {e}");
+                        }
 
                         return;
                     }
@@ -224,7 +228,9 @@ async fn serve(mut socket: TcpStream, codec: Codec) {
                 Ok(0) => return,
                 Ok(n) => n,
                 Err(e) => {
-                    eprintln!("dbnoop: read failed: {e}");
+                    if !a_connection_ending(&e) {
+                        eprintln!("dbnoop: read failed: {e}");
+                    }
 
                     return;
                 }
@@ -398,6 +404,20 @@ fn ring_serving(reports: &[Report]) -> usize {
         .count()
 }
 
+/// Whether a read error is the client going away, which is how a run ends.
+///
+/// A reset or a broken pipe at the end of a measurement is not a fault, and a log
+/// full of them hides the errors that are.
+fn a_connection_ending(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
 /// Join one shard and say how it ended.
 ///
 /// A panicked shard used to be indistinguishable from one that returned false, so
@@ -420,6 +440,35 @@ enum ShardEnd {
     /// Ended without serving: its listener failed, or it never started.
     Stopped,
     Panicked,
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::a_connection_ending;
+
+    /// **A client going away is not an error to log**: a run ends with resets, and a
+    /// log full of them hides the ones that matter.
+    #[test]
+    fn a_connection_ending_is_not_news() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(a_connection_ending(&std::io::Error::from(kind)), "{kind:?}");
+        }
+        for kind in [
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            assert!(
+                !a_connection_ending(&std::io::Error::from(kind)),
+                "{kind:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -664,7 +713,11 @@ pub fn run() {
     // whatever supervises it.
     let ends: Vec<ShardEnd> = threads
         .into_iter()
-        .map(|t| join_shard(String::from("a shard"), t))
+        .map(|t| {
+            // The name the thread was spawned with, which is the shard's own.
+            let name = t.thread().name().unwrap_or("a shard").to_string();
+            join_shard(name, t)
+        })
         .collect();
     let served = ends.iter().filter(|e| **e == ShardEnd::Served).count();
     let panicked = ends.iter().filter(|e| **e == ShardEnd::Panicked).count();
