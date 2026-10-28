@@ -714,6 +714,13 @@ struct Stats {
     /// receives on one socket would race for the same bytes.
     arms: std::sync::atomic::AtomicUsize,
     elided: std::sync::atomic::AtomicUsize,
+    /// Receives armed as `RecvMulti`: one request the kernel re-issues by
+    /// itself, against one request per read for a one-shot receive.
+    multi_arms: std::sync::atomic::AtomicUsize,
+    /// Receives completed. A shard whose `reads` run far above its
+    /// `multi_arms` is one where the kernel is re-issuing the request, which is
+    /// the whole point of arming it as multishot.
+    reads: std::sync::atomic::AtomicUsize,
 }
 
 /// `run`, with the shard's knobs supplied rather than read from the process.
@@ -827,8 +834,11 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
     // Multishot receive is discovered from the kernel's answer, not from a
     // version number: a kernel that does not know `IORING_RECV_MULTISHOT`
     // answers the first receive with EINVAL, and every receive after that is
-    // a one-shot into a provided buffer instead.
-    let mut multishot = false; // PROBE
+    // a one-shot into a provided buffer instead. It is armed whenever the shard
+    // has a provided-buffer ring for the kernel to refill from: one request then
+    // serves every read on that connection. Without a ring the receive is
+    // one-shot into the connection's own buffer, which has room for one read.
+    let mut multishot = bufs.is_some();
     let mut scratch: Vec<usize> = Vec::new();
 
     arm_accept(&mut ring, listen_fd, &mut accept_armed)?;
@@ -967,6 +977,12 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
                         continue;
                     };
                     slot.recv_armed = more;
+                    #[cfg(test)]
+                    if res > 0 {
+                        if let Some(s) = &tuning.stats {
+                            s.reads.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     if res > 0 {
                         // The connection is reading again, whatever it had to
                         // do last time.
@@ -1440,6 +1456,10 @@ fn arm_recv(
     }
     let e = if from_ring {
         if multishot {
+            #[cfg(test)]
+            if let Some(s) = &ring.stats {
+                s.multi_arms.fetch_add(1, Ordering::Relaxed);
+            }
             opcode::RecvMulti::new(types::Fd(slot.fd), PBUF_GROUP).build()
         } else {
             opcode::Recv::new(types::Fd(slot.fd), std::ptr::null_mut(), 0)
@@ -2483,6 +2503,60 @@ mod tests {
             "the shard's only buffer must be back in the ring"
         );
         assert_eq!(stats.held.load(Ordering::Relaxed), 0);
+    }
+
+    /// **The kernel is asked to re-issue the receive by itself.**
+    ///
+    /// A multishot receive is one request that serves every read on a
+    /// connection; arming it is what `RecvMulti` and its EINVAL fallback exist
+    /// for. It was left off (`let mut multishot = false; // PROBE` in a commit
+    /// about the README), so every receive was a one-shot: one request per
+    /// read, the multishot arm and its fallback unreachable, and the
+    /// provided-buffer ring drained and refilled per read. The counters are the
+    /// evidence -- a shard whose reads run well above its multishot arms is one
+    /// where the kernel kept the request.
+    #[test]
+    fn multishot_receive_serves_many_reads_from_one_arm() {
+        let stats = Arc::new(Stats::default());
+        let tuning = Tuning {
+            entries: 128,
+            pbuf_count: 32,
+            stats: Some(Arc::clone(&stats)),
+            ..Tuning::default()
+        };
+        let Some((addr, _tid, _shard)) = spawn_shard(tuning) else {
+            return;
+        };
+
+        let mut clients = Vec::new();
+        for conn in 0..4 {
+            clients.push(std::thread::spawn(move || {
+                let mut s = TcpStream::connect(addr).expect("connect");
+                s.set_nodelay(true).expect("nodelay");
+                s.set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("read timeout");
+                s.write_all(&startup_message()).expect("startup");
+                read_until_ready(&mut s).expect("handshake reply");
+                for _ in 0..8 {
+                    let frames = ask(&mut s, "select 1").expect("reply");
+                    assert_eq!(frames.len(), 4, "conn {conn}");
+                }
+            }));
+        }
+        for c in clients {
+            c.join().expect("a client must not panic");
+        }
+
+        assert!(
+            stats.multi_arms.load(Ordering::Relaxed) > 0,
+            "no receive was armed as multishot: every read cost its own request"
+        );
+        assert!(
+            stats.reads.load(Ordering::Relaxed) > stats.multi_arms.load(Ordering::Relaxed),
+            "one multishot arm must serve more than one read (reads {}, arms {})",
+            stats.reads.load(Ordering::Relaxed),
+            stats.multi_arms.load(Ordering::Relaxed)
+        );
     }
 
     /// **Many connections, one deliberately small ring.**
