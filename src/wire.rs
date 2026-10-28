@@ -364,6 +364,25 @@ impl Conn {
         }
     }
 
+    /// Answer the error a client injected, and say whether it did.
+    ///
+    /// The failure has to be refused on BOTH paths: through Execute it used to be
+    /// answered OK, so the client's rollback became a commit.
+    fn injected_failure(&mut self, failure: crate::tpcc::Failure, out: &mut Vec<u8>) {
+        let (code, message) = match failure {
+            crate::tpcc::Failure::Signal(code) => (code, "injected failure".to_string()),
+            crate::tpcc::Failure::Null => (
+                "23502".to_string(),
+                "null value in a column that is not null".to_string(),
+            ),
+            crate::tpcc::Failure::Raise => ("P0001".to_string(), "raise_exception".to_string()),
+            crate::tpcc::Failure::UnknownProcedure => {
+                ("42883".to_string(), "function does not exist".to_string())
+            }
+        };
+        self.error(out, &code, &message);
+    }
+
     /// Note what a statement does to the counters.
     fn note_statement(&mut self, sql: &str) {
         let Some(kind) = crate::tpcc::statement_kind(sql) else {
@@ -803,26 +822,8 @@ impl Conn {
                     return Some(());
                 }
 
-                // A failure the client asked for is an error, so its own error handling
-                // and its rollback run -- and a rollback counts nothing.
-                // An OK here made every injected rollback a commit.
                 if let Some(failure) = crate::tpcc::failure(sql) {
-                    let (code, message) = match failure {
-                        crate::tpcc::Failure::Signal(code) => {
-                            (code, "injected failure".to_string())
-                        }
-                        crate::tpcc::Failure::Null => (
-                            "23502".to_string(),
-                            "null value in a column that is not null".to_string(),
-                        ),
-                        crate::tpcc::Failure::Raise => {
-                            ("P0001".to_string(), "raise_exception".to_string())
-                        }
-                        crate::tpcc::Failure::UnknownProcedure => {
-                            ("42883".to_string(), "function does not exist".to_string())
-                        }
-                    };
-                    self.error(out, &code, &message);
+                    self.injected_failure(failure, out);
                     self.ready(out);
 
                     return Some(());
@@ -1116,6 +1117,20 @@ impl Conn {
                 let max_rows = i32::from_be_bytes(body.get(after..after + 4)?.try_into().ok()?);
                 exhausted(body, after + 4)?;
                 let failed = self.failed();
+
+                // **The injected failure is refused here too**, or a NULL written
+                // through the extended protocol answers OK. Detected before the
+                // mutable borrow, because the error path needs `self`.
+                let injected = self
+                    .portals
+                    .get(name)
+                    .and_then(|p| crate::tpcc::failure(&p.statement.plan.sql));
+                if let Some(failure) = injected {
+                    self.injected_failure(failure, out);
+                    self.phase = Phase::AwaitingSync;
+
+                    return Some(());
+                }
 
                 // No clone: `answer` is a free function precisely so the plan can stay
                 // borrowed out of `self`.
@@ -2816,6 +2831,57 @@ mod tests {
             "and the Sync after it is still answered, so the stream is in sync"
         );
         assert!(framed < input.len());
+    }
+
+    /// **An injected failure is an error through Parse/Bind/Execute too.**
+    ///
+    /// The check lived on the simple-query path only, so a NULL written through
+    /// the extended protocol answered OK and the rollback the client sends next
+    /// counted nothing -- the failure its 1% injection is for, answered as
+    /// success.
+    #[test]
+    fn an_injected_failure_is_refused_through_execute() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'P', |b| {
+                cstr(b, "ins");
+                cstr(b, "insert into new_order values (1, NULL, 3)");
+                b.extend_from_slice(&0i16.to_be_bytes());
+            }),
+            &mut out,
+            &v,
+        );
+        assert_eq!(out[0], b'1', "Parse is answered first: {out:?}");
+
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'B', |b| {
+                cstr(b, "");
+                cstr(b, "ins");
+                b.extend_from_slice(&0i16.to_be_bytes());
+                b.extend_from_slice(&0i16.to_be_bytes());
+                b.extend_from_slice(&0i16.to_be_bytes());
+            }),
+            &mut out,
+            &v,
+        );
+        c.advance(
+            &tagged(b'E', |b| {
+                cstr(b, "");
+                b.extend_from_slice(&0i32.to_be_bytes());
+            }),
+            &mut out,
+            &v,
+        );
+        c.advance(&tagged(b'S', |_| {}), &mut out, &v);
+
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            out.contains(&b'E'),
+            "Execute must answer the error, not an OK: {text}"
+        );
+        assert!(text.contains("23502"), "{text}");
     }
 
     /// An error in an extended-protocol message discards everything until Sync.
