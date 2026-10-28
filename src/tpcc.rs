@@ -318,8 +318,10 @@ impl Drop for ProfileGuard {
     }
 }
 
-/// The value of a MySQL system variable/// A failure the client asked for, and the path
-/// it exercises.
+/// A failure the client asked for, and the path it exercises.
+///
+/// A benchmark makes a statement fail on purpose to exercise its rollback; an OK
+/// would turn that rollback into a commit.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Failure {
     /// `SIGNAL SQLSTATE '<code>'`: the client names the error it wants.
