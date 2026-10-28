@@ -1,5 +1,7 @@
 mod config;
 mod handler;
+mod mysql;
+mod protocol;
 #[cfg(target_os = "linux")]
 mod uring;
 mod wire;
@@ -8,14 +10,12 @@ mod wire;
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use config::{Config, Io};
-use handler::{CatalogView, NoopHandler};
-use wire::Conn;
+use protocol::{Codec, Protocol};
 
 /// Pin the calling thread to one CPU, so a shard stays where its data is.
 ///
@@ -211,11 +211,20 @@ fn shard_listener(addr: SocketAddr, backlog: i32) -> std::io::Result<std::net::T
 /// per read no matter how many protocol messages arrived in it. A client that
 /// pipelines Bind/Execute/Sync -- pgx does, and so does `saturate --depth N` --
 /// gets one reply write instead of the three pgwire was making.
-async fn serve(mut socket: TcpStream, catalog: CatalogView) {
-    let mut conn = Conn::new();
+async fn serve(mut socket: TcpStream, codec: Codec) {
+    let mut conn = codec.session();
     let mut pending: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut out: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut chunk = vec![0u8; 64 * 1024];
+
+    // **MySQL speaks first.** Its client waits for the greeting before writing
+    // anything, so a shard that read first would wait for a client that is
+    // waiting for it. PostgreSQL has no such packet and writes nothing here.
+    if let Some(prelude) = codec.prelude() {
+        if socket.write_all(prelude).await.is_err() {
+            return;
+        }
+    }
 
     // The deadline is on the *connection*, not on each read: it is the startup
     // handshake that has to finish, and a client that dribbles its startup
@@ -260,13 +269,13 @@ async fn serve(mut socket: TcpStream, catalog: CatalogView) {
         // The common case is a whole batch in one read with nothing left over,
         // so the copy into `pending` is avoided when there is nothing pending.
         if pending.is_empty() {
-            let used = conn.advance(&chunk[..n], &mut out, &catalog);
+            let used = codec.advance(&mut conn, &chunk[..n], &mut out);
             if used < n {
                 pending.extend_from_slice(&chunk[used..n]);
             }
         } else {
             pending.extend_from_slice(&chunk[..n]);
-            let used = conn.advance(&pending, &mut out, &catalog);
+            let used = codec.advance(&mut conn, &pending, &mut out);
             pending.drain(..used);
         }
 
@@ -292,7 +301,7 @@ fn run_shard(
     cpu: Option<usize>,
     pinned: std::sync::mpsc::Sender<bool>,
     io: Io,
-    catalog: CatalogView,
+    codec: Codec,
 ) -> bool {
     let did_pin = match cpu {
         #[cfg(target_os = "linux")]
@@ -319,7 +328,7 @@ fn run_shard(
     // tokio because that is what tokio is for.
     #[cfg(target_os = "linux")]
     if io == Io::Uring {
-        if let Err(e) = crate::uring::run(listener, catalog, 4096) {
+        if let Err(e) = crate::uring::run(listener, codec, 4096) {
             eprintln!("pgnoop: shard {id} io_uring loop ended: {e}");
             return false;
         }
@@ -345,11 +354,11 @@ fn run_shard(
                     // measures their latency.
                     let _ = socket.set_nodelay(true);
 
-                    let catalog = catalog.clone();
+                    let codec = codec.clone();
                     // spawn, not spawn_blocking: stays on THIS runtime, hence
                     // this thread, hence this core.
                     tokio::spawn(async move {
-                        serve(socket, catalog).await;
+                        serve(socket, codec).await;
                     });
                 }
                 Err(e) => {
@@ -407,69 +416,80 @@ fn main() {
         config.workers
     };
 
-    // Resolve, then bind every shard's listener, before any shard runs: a
-    // name's addresses are tried in order until one takes all of them, and a
-    // failure is a startup error rather than a thread that quietly exits.
-    let candidates = match resolve_bind_addrs(&config.host, config.port) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("pgnoop: cannot bind {}:{}: {e}", config.host, config.port);
-            std::process::exit(2);
-        }
-    };
-    let (addr, listeners) = match bind_shards(&candidates, shards, 1024) {
-        Ok(bound) => bound,
-        Err(e) => {
-            eprintln!("pgnoop: cannot bind {}:{}: {e}", config.host, config.port);
-            std::process::exit(2);
-        }
-    };
-
-    // Pinning only makes sense while shards fit on distinct CPUs, and the
-    // CPUs are the ones the affinity mask allows -- not 0..shards. Where the
-    // platform cannot pin the list is empty and no shard tries.
+    // **One worker set per listener.** `--workers` is shards per protocol, so a
+    // server with both ports open has twice as many threads; pinning lays them
+    // out on the affinity mask in order and is skipped entirely when they do not
+    // fit on distinct CPUs, because two shards on one core is worse than two the
+    // scheduler may move.
+    let mut sockets = vec![(Protocol::Postgres, config.port)];
+    if let Some(port) = config.mysql_port {
+        sockets.push((Protocol::Mysql, port));
+    }
     let allowed = allowed_cpus();
-    let cpus: Vec<Option<usize>> = if shards <= allowed.len() {
-        (0..shards).map(|id| cpu_for_shard(&allowed, id)).collect()
+    let total = shards * sockets.len();
+    let cpus: Vec<Option<usize>> = if total <= allowed.len() {
+        (0..total).map(|id| cpu_for_shard(&allowed, id)).collect()
     } else {
-        vec![None; shards]
+        vec![None; total]
     };
 
-    // One handler, shared by every shard. This is NOT full share-nothing and the
-    // reason is correctness: DDL arriving on a connection the kernel put on
-    // shard 3 must be visible to a metadata SELECT on shard 17, so the schema
-    // catalog has to be common. It is off the hot path -- an ordinary SELECT
-    // returns from parse_metadata_select before the lock is reached -- so what
-    // remains shared per query is the Arc refcount, not the catalog.
-    let catalog = CatalogView(Arc::new(NoopHandler::new()));
-
+    // Resolve, then bind every shard's listener, before any shard runs: a name's
+    // addresses are tried in order until one takes all of them, and a failure is
+    // a startup error rather than a thread that quietly exits.
     let (pinned_tx, pinned_rx) = std::sync::mpsc::channel();
-    let mut threads = Vec::with_capacity(shards);
-    for ((id, listener), cpu) in listeners.into_iter().enumerate().zip(cpus) {
-        let catalog = catalog.clone();
-        let pinned = pinned_tx.clone();
-        threads.push(
-            std::thread::Builder::new()
-                .name(format!("pgnoop-shard-{id}"))
-                .spawn(move || run_shard(id, listener, cpu, pinned, io, catalog))
-                .expect("spawn shard"),
-        );
+    let mut threads = Vec::with_capacity(total);
+    let mut banners = Vec::with_capacity(sockets.len());
+    let mut next_cpu = 0usize;
+
+    for (protocol, port) in sockets {
+        let candidates = match resolve_bind_addrs(&config.host, port) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("pgnoop: cannot bind {}:{port}: {e}", config.host);
+                std::process::exit(2);
+            }
+        };
+        let (addr, listeners) = match bind_shards(&candidates, shards, 1024) {
+            Ok(bound) => bound,
+            Err(e) => {
+                eprintln!("pgnoop: cannot bind {}:{port}: {e}", config.host);
+                std::process::exit(2);
+            }
+        };
+        banners.push((protocol, addr));
+
+        for (id, listener) in listeners.into_iter().enumerate() {
+            // One codec per listener, cloned into its shards: the PostgreSQL
+            // catalog is shared by them all, and the MySQL codec holds nothing
+            // to share.
+            let codec = Codec::new(protocol);
+            let cpu = cpus[next_cpu];
+            next_cpu += 1;
+            let pinned = pinned_tx.clone();
+            threads.push(
+                std::thread::Builder::new()
+                    .name(format!("pgnoop-{}-{id}", protocol.name()))
+                    .spawn(move || run_shard(id, listener, cpu, pinned, io, codec))
+                    .expect("spawn shard"),
+            );
+        }
     }
     drop(pinned_tx);
 
     // Every shard reports its pin before it serves, so the banner states what
-    // happened -- `pinned=31/32` is a fact, `pinned=true` was a plan. One
-    // report per shard; a shard that died before reporting counts as unpinned.
-    let pinned = (0..shards)
+    // happened -- `pinned=31/32` is a fact, `pinned=true` was a plan. One report
+    // per shard; a shard that died before reporting counts as unpinned.
+    let pinned = (0..total)
         .filter(|_| pinned_rx.recv().unwrap_or(false))
         .count();
 
-    eprintln!(
-        "pgnoop listening on {addr} ({} shards, {}, SO_REUSEPORT, pinned={pinned}/{})",
-        shards,
-        io.as_str(),
-        shards
-    );
+    for (protocol, addr) in &banners {
+        eprintln!(
+            "pgnoop {} listening on {addr} ({shards} shards, {}, SO_REUSEPORT, pinned={pinned}/{total})",
+            protocol.name(),
+            io.as_str(),
+        );
+    }
 
     // What the ring actually granted. Reported here as well as at startup
     // because this is the line a run's log keeps, and a measurement is only
