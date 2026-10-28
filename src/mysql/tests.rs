@@ -1040,3 +1040,85 @@ fn a_prepared_district_sum_answers_a_binary_longe_long() {
         "{sum} is not a district sum"
     );
 }
+
+/// **A routine definition is one statement, whatever semicolons its body holds.**
+///
+/// A client that sends `CREATE PROCEDURE … BEGIN … ; … END` in a
+/// multi-statement query (which is how every driver sends it: no DELIMITER) got
+/// one answer per line of the body -- "Commands out of sync" to the client -- and
+/// the `BEGIN` piece was classified as a transaction, so `in_trans` stayed set
+/// for good and every later autocommit CALL stopped counting a commit.
+#[test]
+fn a_routine_body_is_one_statement() {
+    let mut c = connected(CAPS);
+
+    // Before: nothing is open.
+    let packets = round_trip(&mut c, &query("select 1"));
+    assert_eq!(result_set(&packets).2, AUTOCOMMIT, "no transaction yet");
+
+    let create = "create procedure neword(in w int) begin \
+                  insert into new_order values (w); \
+                  if w > 0 then select 1; end if; \
+                  begin select 2; end; \
+                  end";
+    let packets = round_trip(&mut c, &query(&format!("{create}; select 3")));
+
+    // Two statements, two answers: the definition's OK and the select's row.
+    assert_eq!(packets.len(), 1 + 4, "{packets:?}");
+    let status = ok_status(&packets[0]);
+    assert_eq!(
+        status & MORE_RESULTS_EXISTS,
+        MORE_RESULTS_EXISTS,
+        "one answer follows"
+    );
+    assert_eq!(
+        status & IN_TRANS,
+        0,
+        "**no transaction**: the body's BEGIN is not a statement"
+    );
+    assert_eq!(result_set(&packets[1..]).1, 1, "the select's row");
+
+    // And the session is not stuck in a transaction: a CALL answers with no
+    // transaction open, which is what makes it a commit of its own. The counter
+    // it then moves is process-wide and other tests in this binary count too, so
+    // the arithmetic is pinned in tests/wire.rs, where each test owns a server.
+    let packets = round_trip(&mut c, &query("call PAYMENT(1, 2, 3)"));
+    assert_eq!(
+        ok_status(&packets[0]) & IN_TRANS,
+        0,
+        "an autocommit CALL is not inside a transaction"
+    );
+}
+
+/// A statement that is only a routine definition answers one OK packet, and a
+/// trigger and a function are the same shape.
+#[test]
+fn every_kind_of_routine_is_one_statement() {
+    for sql in [
+        "create function f() returns int begin return 1; end",
+        "create trigger t before insert on x for each row begin set @a = 1; end",
+        "create event e on schedule every 1 day do begin select 1; end",
+        "create definer = root function g() returns int begin return 2; end",
+    ] {
+        let mut c = connected(CAPS);
+        let packets = round_trip(&mut c, &query(sql));
+        assert_eq!(packets.len(), 1, "{sql}: {packets:?}");
+        assert_eq!(ok_status(&packets[0]), AUTOCOMMIT, "{sql}");
+    }
+}
+
+/// A semicolon that is not in a routine body still splits, and a CASE
+/// expression's `END` does not close a body it never opened.
+#[test]
+fn a_plain_query_still_splits_and_a_case_expression_closes_nothing() {
+    let mut c = connected(CAPS);
+    let packets = round_trip(&mut c, &query("select 1; select 2"));
+    assert_eq!(packets.len(), 8, "two one-row result sets: {packets:?}");
+
+    let mut c = connected(CAPS);
+    let packets = round_trip(
+        &mut c,
+        &query("create procedure p() begin set @x = case when 1 then 2 end; end; select 4"),
+    );
+    assert_eq!(packets.len(), 5, "the definition and one row: {packets:?}");
+}

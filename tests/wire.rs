@@ -913,3 +913,46 @@ fn a_prepared_select_answers_a_binary_row() {
     let terminator = client.read();
     assert_eq!(terminator.body[0], 0xfe);
 }
+
+/// **A stored routine's body does not leave the session in a transaction.**
+///
+/// The body's own `BEGIN` was split out as a statement, so `in_trans` stayed set
+/// for the rest of the session and every later autocommit CALL stopped counting
+/// a commit -- a TPC-C run's TPM read zero from an otherwise working server.
+#[test]
+fn a_routine_body_leaves_no_transaction_behind() {
+    let server = server();
+    let mut client = Client::connect(server.mysql);
+
+    let create = "create procedure neword(in w int) begin \
+                  insert into new_order values (w); \
+                  if w > 0 then select 1; end if; \
+                  end";
+    let answer = client.query(&format!("{create}; select 1"));
+    assert_eq!(
+        answer.len(),
+        1 + 4,
+        "the definition, then the select: {answer:?}"
+    );
+    assert_eq!(
+        answer[0].status() & IN_TRANS,
+        0,
+        "the body's BEGIN is not a transaction"
+    );
+
+    // The next statement is still autocommit, and an explicit transaction still
+    // works.
+    client.query("call PAYMENT(1, 2, 3)");
+    assert_eq!(counter(&mut client, "Com_commit"), 1, "the CALL committed");
+
+    client.query("begin");
+    let answer = client.query("select 1");
+    let terminator = answer.last().expect("an answer");
+    assert_ne!(
+        terminator.status() & IN_TRANS,
+        0,
+        "a real BEGIN does open one"
+    );
+    client.query("commit");
+    assert_eq!(counter(&mut client, "Com_commit"), 2);
+}

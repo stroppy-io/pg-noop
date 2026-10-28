@@ -51,8 +51,94 @@ fn split_on(text: &str, delimiter: u8, parens: bool) -> Vec<&str> {
 
 /// Split a multi-statement query on top-level `;`, keeping empty segments: which
 /// of them answer is the caller's rule.
+///
+/// **A stored routine's body is one statement.** `CREATE PROCEDURE … BEGIN … ;
+/// … END` is how every driver sends one -- there is no DELIMITER on the wire --
+/// and splitting it at the body's semicolons answers each line of the body as a
+/// statement: the client sees "Commands out of sync", and the `BEGIN` piece
+/// arrives as a transaction of its own. A `BEGIN … END` body is therefore
+/// counted, and its semicolons do not split.
+///
+/// `END IF`, `END LOOP`, `END WHILE` and `END REPEAT` close forms that opened
+/// nothing here, so they do not decrement; `BEGIN` and `CASE` do -- a `CASE`
+/// expression inside a body closes with an `END` of its own, and counting it is
+/// what keeps that `END` from ending the routine.
 pub fn split_statements(sql: &str) -> Vec<&str> {
-    split_on(sql, b';', false)
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    // The statements's words so far: what says whether it is a routine at all.
+    let mut words = 0usize;
+    let mut routine = false;
+    let mut routine_named = false;
+    // Some(depth) while inside a BEGIN…END body.
+    let mut body: Option<usize> = None;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => i = skip_quoted(bytes, i),
+            b'-' | b'#' | b'/' => match skip_comment(bytes, i) {
+                Some(next) => i = next,
+                None => i += 1,
+            },
+            c if is_word_byte(c) => {
+                let end = word_end(bytes, i).unwrap_or(bytes.len());
+                let word = &sql[i..end];
+                i = end;
+                words += 1;
+
+                if body.is_none() {
+                    // `CREATE [DEFINER = …] PROCEDURE|FUNCTION|TRIGGER|EVENT`,
+                    // and the few words in between, before the body starts.
+                    if words == 1 {
+                        routine = word.eq_ignore_ascii_case("CREATE");
+                    } else if routine && !routine_named && words <= 8 {
+                        routine_named = ["PROCEDURE", "FUNCTION", "TRIGGER", "EVENT"]
+                            .iter()
+                            .any(|kind| word.eq_ignore_ascii_case(kind));
+                    }
+                    if routine_named && word.eq_ignore_ascii_case("BEGIN") {
+                        body = Some(1);
+                    }
+                } else if word.eq_ignore_ascii_case("BEGIN") || word.eq_ignore_ascii_case("CASE") {
+                    // A block opens with BEGIN, and a CASE -- expression or
+                    // statement -- closes with an END of its own.
+                    *body.as_mut().expect("in a body") += 1;
+                } else if word.eq_ignore_ascii_case("END") {
+                    let next = skip_space(bytes, i);
+                    // `END IF`, `END LOOP`, `END WHILE` and `END REPEAT` close
+                    // forms that opened nothing here.
+                    let closes_nothing = word_end(bytes, next).is_some_and(|end| {
+                        ["IF", "LOOP", "WHILE", "REPEAT"]
+                            .iter()
+                            .any(|kind| sql[next..end].eq_ignore_ascii_case(kind))
+                    });
+                    if !closes_nothing {
+                        let depth = body.as_mut().expect("in a body");
+                        *depth -= 1;
+                        if *depth == 0 {
+                            body = None;
+                        }
+                    }
+                }
+            }
+            b';' if body.is_none() => {
+                out.push(&sql[start..i]);
+                i += 1;
+                start = i;
+                words = 0;
+                routine = false;
+                routine_named = false;
+            }
+            _ => i += 1,
+        }
+    }
+    if start < bytes.len() {
+        out.push(&sql[start..]);
+    }
+
+    out
 }
 
 /// Split on top-level commas.
