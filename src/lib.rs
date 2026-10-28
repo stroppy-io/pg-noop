@@ -2,16 +2,16 @@
 //! It answers the PostgreSQL and MySQL wire protocols with valid, empty
 //! responses, so a benchmark measures the client and not the database.
 
-pub mod catalog;
-pub mod config;
-pub mod mysql;
-pub mod plan;
-pub mod protocol;
-pub mod sql;
-pub mod tpcc;
+pub(crate) mod catalog;
+pub(crate) mod config;
+pub(crate) mod mysql;
+pub(crate) mod plan;
+pub(crate) mod protocol;
+pub(crate) mod sql;
+pub(crate) mod tpcc;
 #[cfg(target_os = "linux")]
-pub mod uring;
-pub mod wire;
+pub(crate) mod uring;
+pub(crate) mod wire;
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;

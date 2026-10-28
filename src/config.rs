@@ -267,14 +267,6 @@ impl Io {
             }
         }
     }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            #[cfg(target_os = "linux")]
-            Io::Uring => "io_uring",
-            Io::Epoll => "epoll",
-        }
-    }
 }
 
 /// How long a paused accept stays paused after `EMFILE`/`ENFILE`/`ENOMEM`/ `ENOBUFS`.

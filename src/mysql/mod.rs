@@ -14,7 +14,7 @@ use result::{Column, Kind};
 use crate::sql;
 use crate::tpcc;
 
-pub use handshake::{greeting, SERVER_VERSION};
+pub use handshake::greeting;
 
 // Server status flags, by their names in `include/mysql_com.h`.
 // A client reads them: `IN_TRANS` is how a pool knows a transaction is open, and
