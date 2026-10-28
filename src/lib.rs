@@ -447,6 +447,42 @@ mod join_tests {
     }
 }
 
+/// What the banner says about one protocol: the shards that reported themselves
+/// serving, the ones on the ring, and the ones that pinned.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+struct Banner {
+    serving: usize,
+    ring: usize,
+    pinned: usize,
+}
+
+impl Banner {
+    fn of(protocol: Protocol, reports: &[Report]) -> Self {
+        let mut banner = Banner::default();
+
+        for report in reports {
+            match report {
+                Report::Pinned {
+                    protocol: p,
+                    pinned: true,
+                } if *p == protocol => banner.pinned += 1,
+                Report::Serving {
+                    protocol: p,
+                    backend,
+                } if *p == protocol => {
+                    banner.serving += 1;
+                    if *backend == Io::Uring {
+                        banner.ring += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        banner
+    }
+}
+
 /// The TPCC counters, on stderr every `interval` and once when the server stops.
 fn spawn_stats(interval: std::time::Duration) {
     std::thread::Builder::new()
@@ -583,34 +619,16 @@ pub fn run() {
     }
 
     for (protocol, addr) in &banners {
-        let pinned = reports
-            .iter()
-            .filter(|r| {
-                matches!(
-                    r,
-                    Report::Pinned { protocol: p, pinned: true } if *p == *protocol
-                )
-            })
-            .count();
-        let serving = reports
-            .iter()
-            .filter(|r| matches!(r, Report::Serving { protocol: p, .. } if *p == *protocol))
-            .count();
-        let ring = reports
-            .iter()
-            .filter(|r| {
-                matches!(
-                    r,
-                    Report::Serving { protocol: p, backend: Io::Uring } if *p == *protocol
-                )
-            })
-            .count();
+        let counts = Banner::of(*protocol, &reports);
 
         eprintln!(
             "dbnoop {} listening on {addr} ({shards} shards, SO_REUSEPORT, \
-             serving {serving}/{shards} (io_uring {ring}, epoll {}), pinned={pinned}/{shards})",
+             serving {}/{shards} (io_uring {}, epoll {}), pinned={}/{shards})",
             protocol.name(),
-            serving - ring,
+            counts.serving,
+            counts.ring,
+            counts.serving - counts.ring,
+            counts.pinned,
         );
     }
 
@@ -660,6 +678,66 @@ pub fn run() {
 
     // The last word on what was counted, whichever way the shards ended.
     eprintln!("{}", crate::tpcc::line());
+}
+
+#[cfg(test)]
+mod banner_tests {
+    use super::{Banner, Io, Protocol, Report};
+
+    /// **The banner counts each protocol's shards by what they reported**, not by
+    /// what was planned: a shard on epoll is not a shard on the ring.
+    #[test]
+    fn the_banner_counts_by_report() {
+        let reports = vec![
+            Report::Pinned {
+                protocol: Protocol::Postgres,
+                pinned: true,
+            },
+            Report::Serving {
+                protocol: Protocol::Postgres,
+                backend: Io::Uring,
+            },
+            Report::Pinned {
+                protocol: Protocol::Postgres,
+                pinned: false,
+            },
+            Report::Serving {
+                protocol: Protocol::Postgres,
+                backend: Io::Epoll,
+            },
+            Report::Pinned {
+                protocol: Protocol::Mysql,
+                pinned: true,
+            },
+            Report::Serving {
+                protocol: Protocol::Mysql,
+                backend: Io::Epoll,
+            },
+        ];
+
+        let pg = Banner::of(Protocol::Postgres, &reports);
+        assert_eq!(
+            pg,
+            Banner {
+                serving: 2,
+                ring: 1,
+                pinned: 1
+            }
+        );
+
+        let my = Banner::of(Protocol::Mysql, &reports);
+        assert_eq!(
+            my,
+            Banner {
+                serving: 1,
+                ring: 0,
+                pinned: 1
+            }
+        );
+
+        // A shard that never reported is counted by nothing.
+        assert_eq!(Banner::of(Protocol::Mysql, &reports[..4]).serving, 0);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
