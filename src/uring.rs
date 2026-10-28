@@ -1001,7 +1001,7 @@ impl Shard {
         };
         let mut ioring = match ring_for_shard(&setup, tuning.entries, ring_refused(&tuning)) {
             Ok(r) => r,
-            // A self that cannot have a ring must not die.
+            // A shard that cannot have a ring must not die.
             // Memory for rings is charged to the user, so a process with more shards than
             // its budget allows has shards that cannot have one.
             Err(e) => {
@@ -1086,7 +1086,7 @@ impl Shard {
         arm_accept(&mut ring, listen_fd, &mut accept_armed)?;
 
         loop {
-            // A test asks the self to stop so that its ring goes back to the process;
+            // A test asks the shard to stop so that its ring goes back to the process;
             // nothing in the server sets this.
             #[cfg(test)]
             if let Some(stop) = &tuning.stop {
@@ -1096,7 +1096,7 @@ impl Shard {
             }
 
             // Wait for a completion, or for the earliest deadline.
-            // Two obligations of this self are invisible to a completion: a paused accept,
+            // Two obligations of this shard are invisible to a completion: a paused accept,
             // and a connection that has not completed startup.
             #[cfg(test)]
             let tick = tuning
@@ -1185,7 +1185,7 @@ impl Shard {
                             } else {
                                 let err = -res;
                                 if accept_should_pause(err) {
-                                    // Back off the ACCEPT, not the self.
+                                    // Back off the ACCEPT, not the shard.
                                     accept_paused_until = Some(Instant::now() + ACCEPT_BACKOFF);
                                     eprintln!(
                                         "dbnoop: accept failed with errno {err}; \
@@ -1411,7 +1411,7 @@ impl Shard {
 
                 // Connections still in startup whose deadline has passed, walked as the
                 // list of connections that are in startup rather than as every slot on the
-                // self.
+                // shard.
                 let now = Instant::now();
                 let mut next: Option<Instant> = None;
                 scratch.clear();
@@ -1530,7 +1530,7 @@ fn wait_for_work(submit: &io_uring::Submitter<'_>, deadline: Option<Instant>) ->
     }
 }
 
-/// What a failed ring operation means for the self.
+/// What a failed ring operation means for the shard.
 #[derive(Debug, PartialEq, Eq)]
 enum Retry {
     /// The kernel was interrupted before it could do anything.
@@ -1808,7 +1808,7 @@ fn reap(
 }
 
 /// The shard's provided-buffer ring: one registered array of descriptors and one block
-/// of buffers, shared by every connection on the self.
+/// of buffers, shared by every connection on the shard.
 struct BufRing {
     /// The descriptor ring, page aligned as the interface requires, and the buffers it
     /// describes.
@@ -2712,7 +2712,7 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// A buffer ring the kernel refuses is not a dead self.
+    /// A buffer ring the kernel refuses is not a dead shard.
     #[test]
     fn a_refused_buffer_ring_falls_back_to_per_connection_buffers() {
         let ring = build(&Setup::default(), 64).expect("a plain ring builds");
@@ -3414,7 +3414,7 @@ mod tests {
         );
 
         // Another connection is served normally while the first is parked: the park is
-        // per-connection, not per-self.
+        // per-connection, not per-shard.
         let mut polite = TcpStream::connect(addr).expect("connect");
         polite.set_nodelay(true).expect("nodelay");
         polite

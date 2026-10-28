@@ -112,7 +112,8 @@ pub fn feed(
     pending.drain(..used);
 }
 
-/// Which wire protocol a listener speaks.
+/// What a shard tells the process about itself, for the startup banner: its pin
+/// before it serves, and the backend it actually got.
 pub enum Report {
     Pinned { protocol: Protocol, pinned: bool },
     Serving { protocol: Protocol, backend: Io },

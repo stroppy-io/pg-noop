@@ -387,23 +387,6 @@ fn serve_epoll(
     })
 }
 
-/// How many shards are serving on the ring, from their own reports.
-#[cfg(target_os = "linux")]
-fn ring_serving(reports: &[Report]) -> usize {
-    reports
-        .iter()
-        .filter(|r| {
-            matches!(
-                r,
-                Report::Serving {
-                    backend: Io::Uring,
-                    ..
-                }
-            )
-        })
-        .count()
-}
-
 /// Whether a read error is the client going away, which is how a run ends.
 ///
 /// A reset or a broken pipe at the end of a measurement is not a fault, and a log
@@ -418,10 +401,8 @@ fn a_connection_ending(e: &std::io::Error) -> bool {
     )
 }
 
-/// Join one shard and say how it ended.
-///
-/// A panicked shard used to be indistinguishable from one that returned false, so
-/// a process with live shards and one panic exited 0 and said nothing.
+/// Join one shard and say how it ended: a panic is not a shard that stopped, and
+/// the process exits nonzero because of it.
 fn join_shard(name: String, handle: std::thread::JoinHandle<bool>) -> ShardEnd {
     match handle.join() {
         Ok(true) => ShardEnd::Served,
@@ -697,15 +678,21 @@ pub fn run() {
     // What the ring actually granted, and how it was paid for.
     // Reported here as well as at startup because this is the line a run's log keeps,
     // and a measurement is only reproducible if it says which ring produced it.
+    // What the ring actually granted, and how it was paid for.
     #[cfg(target_os = "linux")]
-    if ring_serving(&reports) > 0 {
-        eprintln!(
-            "dbnoop: io_uring {}; {} shard(s) on the ring with {} buffer(s) each, \
-             the rest on epoll",
-            crate::uring::report(),
-            ring_serving(&reports),
-            plan.buffers,
-        );
+    {
+        let ring: usize = banners
+            .iter()
+            .map(|(protocol, _)| Banner::of(*protocol, &reports).ring)
+            .sum();
+        if ring > 0 {
+            eprintln!(
+                "dbnoop: io_uring {}; {ring} shard(s) on the ring with {} buffer(s) each, \
+                 the rest on epoll",
+                crate::uring::report(),
+                plan.buffers,
+            );
+        }
     }
 
     // A server whose every shard failed must not exit 0.
