@@ -423,10 +423,15 @@ fn a_prepared_statement_survives_being_executed_twice() {
     let columns = u16::from_le_bytes([prepare.body[5], prepare.body[6]]);
     let params = u16::from_le_bytes([prepare.body[7], prepare.body[8]]);
     assert_eq!((columns, params), (1, 1));
-    // The parameter definition and the column definition follow.
-    let _ = client.read();
-    let _ = client.read();
-    let _ = client.read();
+    // **One definition per parameter, then one per column -- and no count
+    // packet in front of them.** Reading one packet too many would leave the
+    // stream one answer behind for the rest of the test.
+    for expected in ["?", "d_next_o_id"] {
+        let definition = client.read();
+        assert_eq!(definition.body[0], 3, "a definition: {:?}", definition.body);
+        let text = String::from_utf8_lossy(&definition.body).to_string();
+        assert!(text.contains(expected), "{expected} missing from {text:?}");
+    }
 
     for _ in 0..2 {
         let mut body = Vec::new();
