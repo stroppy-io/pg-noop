@@ -861,7 +861,55 @@ struct Stats {
 /// an environment variable would be sharing one decision with every other test
 /// in the binary. The loop itself takes it as an argument, and `run` is what
 /// reads the configured one.
+/// Every knob `run` reads from the process, plus the loop's own state, is
+/// gathered into `passes`, and everything the ring points into is OWNED BY THE
+/// CALLER.
+///
+/// That ownership is the whole point. A receive in flight writes into a
+/// provided buffer or into a slot's own buffer, and a send reads a slot's
+/// `send`; freeing any of them while the ring can still complete an operation is
+/// the kernel writing into freed memory. Closing the ring -- which is what
+/// dropping it does -- cancels whatever is still in flight, so it must happen
+/// first. Declared here and passed in, the buffers are dropped AFTER the ring
+/// has gone; declared inside `passes` -- which is where they used to be -- they
+/// were dropped before it, and only a ring with DEFER_TASKRUN kept that from
+/// being visible.
 fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io::Result<()> {
+    // Slot 0 is reserved for the accept operation so an index is never
+    // ambiguous.
+    let mut slots: Vec<Option<Slot>> = vec![None];
+    let mut free_slots: Vec<usize> = Vec::new();
+    let mut spare: Vec<Spare> = Vec::new();
+    let mut bufs: Option<BufRing> = None;
+
+    passes(
+        listener,
+        catalog,
+        tuning,
+        &mut slots,
+        &mut free_slots,
+        &mut spare,
+        &mut bufs,
+    )?;
+
+    // The ring is closed and nothing of its own is in flight: every descriptor
+    // the shard still holds is closed here. A shard that stops used to leave one
+    // open per connection that was still connected.
+    close_all(&mut slots);
+
+    Ok(())
+}
+
+/// One shard's event loop, until the listener fails or a test asks it to stop.
+fn passes(
+    listener: TcpListener,
+    catalog: CatalogView,
+    tuning: Tuning,
+    slots: &mut Vec<Option<Slot>>,
+    free_slots: &mut Vec<usize>,
+    spare: &mut Vec<Spare>,
+    bufs: &mut Option<BufRing>,
+) -> io::Result<()> {
     let plan = plan();
     let setup = Setup {
         cqsize: plan.setup.cqsize && CQSIZE.load(Ordering::Relaxed),
@@ -919,7 +967,7 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
         }
     }
 
-    let mut bufs = match plan.pbuf {
+    *bufs = match plan.pbuf {
         Some(_granted_incremental) => Some(BufRing::register(
             &submit,
             tuning.pbuf_count,
@@ -942,11 +990,6 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
     };
 
     let listen_fd = listener.as_raw_fd();
-
-    // Slot 0 is reserved for the accept operation so an index is never ambiguous.
-    let mut slots: Vec<Option<Slot>> = vec![None];
-    let mut free_slots: Vec<usize> = Vec::new();
-    let mut spare: Vec<Spare> = Vec::new();
 
     // Accept: one multishot request, re-armed only when the kernel says it is
     // no longer holding it (`F_MORE` clear), and not at all while paused.
@@ -1063,7 +1106,7 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
                                 startup.push(idx);
                                 earliest_startup = Some(earliest_startup.map_or(at, |e| e.min(at)));
                             }
-                            arm_recv(&mut ring, &mut slots, bufs.as_ref(), idx, multishot)?;
+                            arm_recv(&mut ring, slots, bufs.as_ref(), idx, multishot)?;
                         } else {
                             let err = -res;
                             if accept_should_pause(err) {
@@ -1195,15 +1238,11 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
 
                             match next {
                                 Next::Arm => {
-                                    arm_recv(&mut ring, &mut slots, bufs.as_ref(), idx, multishot)?
+                                    arm_recv(&mut ring, slots, bufs.as_ref(), idx, multishot)?
                                 }
-                                Next::Close => begin_close(
-                                    &mut slots,
-                                    &mut free_slots,
-                                    &mut spare,
-                                    bufs.as_mut(),
-                                    idx,
-                                ),
+                                Next::Close => {
+                                    begin_close(slots, free_slots, spare, bufs.as_mut(), idx)
+                                }
                                 _ => {}
                             }
                             continue;
@@ -1255,18 +1294,12 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
 
                         let next = next_for(slot);
                         match next {
-                            Next::Send => submit_send(&mut ring, &mut slots, idx)?,
-                            Next::Close => begin_close(
-                                &mut slots,
-                                &mut free_slots,
-                                &mut spare,
-                                bufs.as_mut(),
-                                idx,
-                            ),
-                            Next::Arm => {
-                                arm_recv(&mut ring, &mut slots, bufs.as_ref(), idx, multishot)?
+                            Next::Send => submit_send(&mut ring, slots, idx)?,
+                            Next::Close => {
+                                begin_close(slots, free_slots, spare, bufs.as_mut(), idx)
                             }
-                            Next::Park => park_recv(&mut ring, &mut slots, idx)?,
+                            Next::Arm => arm_recv(&mut ring, slots, bufs.as_ref(), idx, multishot)?,
+                            Next::Park => park_recv(&mut ring, slots, idx)?,
                             Next::Idle => {}
                         }
                     }
@@ -1296,18 +1329,12 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
                             }
                         };
                         match next {
-                            Next::Send => submit_send(&mut ring, &mut slots, idx)?,
-                            Next::Close => begin_close(
-                                &mut slots,
-                                &mut free_slots,
-                                &mut spare,
-                                bufs.as_mut(),
-                                idx,
-                            ),
-                            Next::Arm => {
-                                arm_recv(&mut ring, &mut slots, bufs.as_ref(), idx, multishot)?
+                            Next::Send => submit_send(&mut ring, slots, idx)?,
+                            Next::Close => {
+                                begin_close(slots, free_slots, spare, bufs.as_mut(), idx)
                             }
-                            Next::Park => park_recv(&mut ring, &mut slots, idx)?,
+                            Next::Arm => arm_recv(&mut ring, slots, bufs.as_ref(), idx, multishot)?,
+                            Next::Park => park_recv(&mut ring, slots, idx)?,
                             Next::Idle => {}
                         }
                     }
@@ -1327,18 +1354,12 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
                             next_for(slot)
                         };
                         match next {
-                            Next::Send => submit_send(&mut ring, &mut slots, idx)?,
-                            Next::Close => begin_close(
-                                &mut slots,
-                                &mut free_slots,
-                                &mut spare,
-                                bufs.as_mut(),
-                                idx,
-                            ),
-                            Next::Arm => {
-                                arm_recv(&mut ring, &mut slots, bufs.as_ref(), idx, multishot)?
+                            Next::Send => submit_send(&mut ring, slots, idx)?,
+                            Next::Close => {
+                                begin_close(slots, free_slots, spare, bufs.as_mut(), idx)
                             }
-                            Next::Park => park_recv(&mut ring, &mut slots, idx)?,
+                            Next::Arm => arm_recv(&mut ring, slots, bufs.as_ref(), idx, multishot)?,
+                            Next::Park => park_recv(&mut ring, slots, idx)?,
                             Next::Idle => {}
                         }
                     }
@@ -1405,7 +1426,7 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
                 // not be freed, and shutting the socket down is what makes that
                 // receive return 0, so the ordinary path reaps it -- and gives
                 // its buffer back on the way.
-                begin_close(&mut slots, &mut free_slots, &mut spare, bufs.as_mut(), idx);
+                begin_close(slots, free_slots, spare, bufs.as_mut(), idx);
             }
             std::mem::swap(&mut startup, &mut scratch);
             earliest_startup = next;
@@ -1415,6 +1436,19 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
         // the ones that arrived while it was working. Only now may they be
         // dropped.
         ring.finish();
+    }
+}
+
+/// Close every descriptor a stopped shard still holds.
+///
+/// The ring has been closed by now, so nothing this shard submitted can name a
+/// socket any more; a slot still in the table is a connection that was open when
+/// the shard stopped, and its descriptor is ours to close.
+fn close_all(slots: &mut [Option<Slot>]) {
+    for slot in slots.iter_mut().flatten() {
+        // SAFETY: the ring that could still have named this fd is closed, and
+        // the slot is dropped immediately after.
+        unsafe { libc::close(slot.fd) };
     }
 }
 
@@ -2656,6 +2690,98 @@ mod tests {
         let frames = ask(&mut s, "select 1").expect("reply");
         assert_eq!(frames.len(), 4);
         assert_eq!(columns(&frames[0].1), 1);
+    }
+
+    /// Set in the child process of `a_stopped_shard_closes_its_descriptors`,
+    /// which is this same test binary re-entered with one test selected.
+    const FD_CHILD: &str = "PGNOOP_URING_FD_CHILD";
+
+    /// This process's open descriptors, as `/proc` counts them.
+    fn open_fds() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .map(|d| d.count())
+            .unwrap_or(0)
+    }
+
+    /// **A stopped shard gives its descriptors back.**
+    ///
+    /// Two things were wrong when a shard stopped with connections still open.
+    /// The slot table was dropped without closing its sockets -- one leaked
+    /// descriptor per connection, for as long as the process lived, which a
+    /// supervisor restarting shards turns into a process that runs out of them.
+    /// And the ring was dropped AFTER the memory it points at, so a receive the
+    /// kernel still had could write into freed memory; closing the ring
+    /// first is what cancels it.
+    ///
+    /// Runs in its own process: the descriptor count of a test binary running a
+    /// dozen shards at once says nothing about one of them.
+    #[test]
+    fn a_stopped_shard_closes_its_descriptors() {
+        if std::env::var_os(FD_CHILD).is_some() {
+            fd_scenario();
+            return;
+        }
+
+        let exe = std::env::current_exe().expect("the test binary's path");
+        let child = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "uring::tests::a_stopped_shard_closes_its_descriptors",
+                "--nocapture",
+            ])
+            .env(FD_CHILD, "1")
+            .output()
+            .expect("run the child test process");
+
+        assert!(
+            child.status.success(),
+            "the teardown scenario failed in its own process\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr),
+        );
+    }
+
+    /// The body of `a_stopped_shard_closes_its_descriptors`, in a process where
+    /// the descriptor count means something.
+    fn fd_scenario() {
+        let baseline = open_fds();
+        let Some((addr, _tid, shard)) = spawn_shard(Tuning::default()) else {
+            return;
+        };
+
+        // Four connections that are mid-frame when the shard stops: a receive
+        // is in flight, so neither the socket nor the buffer may be freed
+        // before the ring is closed.
+        let mut clients = Vec::new();
+        for _ in 0..4 {
+            let mut s = TcpStream::connect(addr).expect("connect");
+            s.set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("read timeout");
+            s.write_all(&startup_message()).expect("startup");
+            read_until_ready(&mut s).expect("handshake reply");
+            let q = query_message("select 1");
+            s.write_all(&q[..3]).expect("half a query");
+            clients.push(s);
+        }
+
+        let running = open_fds();
+        // The listener, the ring, and one socket per connection.
+        assert!(
+            running >= baseline + 2 + clients.len(),
+            "the shard's own descriptors must be open while it runs: {running} \
+             against a baseline of {baseline}"
+        );
+
+        drop(shard);
+
+        let stopped = open_fds();
+        assert!(
+            stopped <= baseline + clients.len(),
+            "a stopped shard left {} descriptor(s) open: {stopped} against a \
+             baseline of {baseline} and {} client socket(s)",
+            stopped.saturating_sub(baseline + clients.len()),
+            clients.len()
+        );
     }
 
     /// **A pass processes every completion it was given, including the ones
