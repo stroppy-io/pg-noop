@@ -2059,16 +2059,6 @@ mod tests {
     /// this same test binary re-entered with one test selected.
     const EMFILE_CHILD: &str = "PGNOOP_URING_EMFILE_CHILD";
 
-    fn startup_message() -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(&196_608u32.to_be_bytes()); // protocol 3.0
-        body.extend_from_slice(b"user\0test\0\0");
-
-        let mut msg = ((body.len() + 4) as u32).to_be_bytes().to_vec();
-        msg.extend_from_slice(&body);
-        msg
-    }
-
     /// One simple-protocol query, framed.
     fn query_message(sql: &str) -> Vec<u8> {
         let mut body = sql.as_bytes().to_vec();
@@ -2247,7 +2237,10 @@ mod tests {
             // The handshake goes out ONCE: a startup message sent again after the first
             // is a malformed query frame, and the codec would close the connection the
             // shard is supposed to be busy with.
-            if stream.write_all(&startup_message()).is_err() {
+            if stream
+                .write_all(&crate::protocol::startup_message())
+                .is_err()
+            {
                 return;
             }
 
@@ -2282,7 +2275,7 @@ mod tests {
     fn round_trip(addr: SocketAddr) -> std::io::Result<usize> {
         let mut stream = TcpStream::connect(addr)?;
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        stream.write_all(&startup_message())?;
+        stream.write_all(&crate::protocol::startup_message())?;
         stream.write_all(&select_1())?;
 
         let mut buf = [0u8; 256];
@@ -2659,7 +2652,8 @@ mod tests {
         s.set_nodelay(true).expect("nodelay");
         s.set_read_timeout(Some(Duration::from_secs(5)))
             .expect("read timeout");
-        s.write_all(&startup_message()).expect("startup");
+        s.write_all(&crate::protocol::startup_message())
+            .expect("startup");
         read_until_ready(&mut s).expect("handshake reply");
 
         // The halves must arrive in separate receives, and that is what is waited for
@@ -2827,7 +2821,8 @@ mod tests {
             let mut s = TcpStream::connect(addr).expect("connect");
             s.set_read_timeout(Some(Duration::from_secs(10)))
                 .expect("read timeout");
-            s.write_all(&startup_message()).expect("startup");
+            s.write_all(&crate::protocol::startup_message())
+                .expect("startup");
             read_until_ready(&mut s).expect("handshake reply");
             let q = query_message("select 1");
             s.write_all(&q[..3]).expect("half a query");
@@ -3134,7 +3129,8 @@ mod tests {
                 s.set_nodelay(true).expect("nodelay");
                 s.set_read_timeout(Some(Duration::from_secs(10)))
                     .expect("read timeout");
-                s.write_all(&startup_message()).expect("startup");
+                s.write_all(&crate::protocol::startup_message())
+                    .expect("startup");
                 read_until_ready(&mut s).expect("handshake reply");
 
                 let mut batch = Vec::new();
@@ -3202,7 +3198,8 @@ mod tests {
         s.set_nodelay(true).expect("nodelay");
         s.set_read_timeout(Some(Duration::from_secs(10)))
             .expect("read timeout");
-        s.write_all(&startup_message()).expect("startup");
+        s.write_all(&crate::protocol::startup_message())
+            .expect("startup");
         read_until_ready(&mut s).expect("handshake reply");
 
         // The answer's width identifies the query, so answers that arrive in the wrong
@@ -3249,7 +3246,8 @@ mod tests {
         s.set_nodelay(true).expect("nodelay");
         s.set_read_timeout(Some(Duration::from_secs(10)))
             .expect("read timeout");
-        s.write_all(&startup_message()).expect("startup");
+        s.write_all(&crate::protocol::startup_message())
+            .expect("startup");
         read_until_ready(&mut s).expect("handshake reply");
 
         // A comment four buffers long: the statement is still `select 1`, and the
@@ -3298,7 +3296,8 @@ mod tests {
                 s.set_nodelay(true).expect("nodelay");
                 s.set_read_timeout(Some(Duration::from_secs(10)))
                     .expect("read timeout");
-                s.write_all(&startup_message()).expect("startup");
+                s.write_all(&crate::protocol::startup_message())
+                    .expect("startup");
                 read_until_ready(&mut s).expect("handshake reply");
                 for _ in 0..8 {
                     let frames = ask(&mut s, "select 1").expect("reply");
@@ -3363,7 +3362,8 @@ mod tests {
         for _ in 0..16 {
             batch.extend_from_slice(&query);
         }
-        s.write_all(&startup_message()).expect("startup");
+        s.write_all(&crate::protocol::startup_message())
+            .expect("startup");
 
         // Write until the shard stops reading from this connection.
         // A write that times out is retried: the pipeline is full for the moment, and
@@ -3420,7 +3420,9 @@ mod tests {
         polite
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("read timeout");
-        polite.write_all(&startup_message()).expect("startup");
+        polite
+            .write_all(&crate::protocol::startup_message())
+            .expect("startup");
         read_until_ready(&mut polite).expect("handshake reply");
         for _ in 0..16 {
             let frames = ask(&mut polite, "select 1").expect("reply");
@@ -3483,7 +3485,8 @@ mod tests {
                     .expect("read timeout");
                 s.set_write_timeout(Some(Duration::from_secs(30)))
                     .expect("write timeout");
-                s.write_all(&startup_message()).expect("startup");
+                s.write_all(&crate::protocol::startup_message())
+                    .expect("startup");
                 read_until_ready(&mut s).expect("handshake reply");
 
                 for seq in 0..QUERIES {
