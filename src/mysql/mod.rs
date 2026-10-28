@@ -57,6 +57,14 @@ const MAX_COMMAND: usize = 32 * 1024 * 1024;
 /// should be able to use it: a 200-byte expression is not a name.
 const MAX_COLUMN_NAME: usize = 64;
 
+/// How a result set's rows are encoded: the text protocol's or a prepared
+/// statement's.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowFmt {
+    Text,
+    Binary,
+}
+
 /// What a statement answers.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Shape {
@@ -459,7 +467,8 @@ impl Conn {
         for (i, statement) in statements.iter().enumerate() {
             let answer = classify(statement);
             self.apply(&answer);
-            self.answer(&answer, out, i + 1 < total, false);
+            let status = self.status(i + 1 < total);
+            self.answer(&answer, out, status, RowFmt::Text);
         }
     }
 
@@ -479,8 +488,8 @@ impl Conn {
     }
 
     /// Write one statement's answer.
-    fn answer(&mut self, answer: &Answer, out: &mut Vec<u8>, more: bool, binary: bool) {
-        let status = self.status(more);
+    fn answer(&mut self, answer: &Answer, out: &mut Vec<u8>, status: u16, rows: RowFmt) {
+        let binary = rows == RowFmt::Binary;
         let deprecate = self.deprecate_eof();
 
         match &answer.shape {
@@ -647,7 +656,8 @@ impl Conn {
         };
 
         self.apply(&answer);
-        self.answer(&answer, out, false, true);
+        let status = self.status(false);
+        self.answer(&answer, out, status, RowFmt::Binary);
     }
 }
 
