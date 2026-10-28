@@ -72,6 +72,22 @@ struct FileConfig {
     stats_every: Option<u64>,
 }
 
+/// A number from the environment.
+///
+/// **A typo is not a default.** `DBNOOP_PORT=5432x` fell through to `None`, and
+/// `None` means the default port: a server the operator aimed at one port bound
+/// another, silently -- the same failure `parse_startup_timeout` exists to
+/// prevent, and the same answer to it.
+fn parse_env<T: std::str::FromStr>(name: &str, value: Option<String>) -> Result<Option<T>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.trim().parse::<T>() {
+        Ok(v) => Ok(Some(v)),
+        Err(_) => Err(format!("{name}={value:?} is not a number")),
+    }
+}
+
 /// The config file to read when `--config` does not name one.
 ///
 /// `./dbnoop.json` is the name; `./pgnoop.json` is read when it is the only one
@@ -261,9 +277,38 @@ impl Config {
 
         // **CLI, then the environment, then the file.** The environment is read
         // here rather than by clap so that both prefixes can be honoured (see
-        // `env`).
-        let given = |cli: Option<u16>, name: &str| -> Option<u16> {
-            cli.or_else(|| env(name).and_then(|v| v.trim().parse().ok()))
+        // `env`), and a value that is not a number stops the server before it
+        // binds.
+        let number = |name: &str| -> Option<u16> {
+            match parse_env::<u16>(name, env(name)) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("dbnoop: {e}");
+                    std::process::exit(2);
+                }
+            }
+        };
+        let given = |cli: Option<u16>, name: &str| -> Option<u16> { cli.or_else(|| number(name)) };
+        let workers = match parse_env::<usize>("WORKERS", env("WORKERS")) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("dbnoop: {e}");
+                std::process::exit(2);
+            }
+        };
+        let warehouses = match parse_env::<u64>("WAREHOUSES", env("WAREHOUSES")) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("dbnoop: {e}");
+                std::process::exit(2);
+            }
+        };
+        let stats_every = match parse_env::<u64>("STATS_EVERY", env("STATS_EVERY")) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("dbnoop: {e}");
+                std::process::exit(2);
+            }
         };
 
         Config {
@@ -276,17 +321,17 @@ impl Config {
             mysql_port: given(cli.mysql_port, "MYSQL_PORT").or(file.mysql_port),
             warehouses: cli
                 .warehouses
-                .or_else(|| env("WAREHOUSES").and_then(|v| v.trim().parse().ok()))
+                .or(warehouses)
                 .or(file.warehouses)
                 .unwrap_or(crate::tpcc::DEFAULT_WAREHOUSES),
             stats_every: cli
                 .stats_every
-                .or_else(|| env("STATS_EVERY").and_then(|v| v.trim().parse().ok()))
+                .or(stats_every)
                 .or(file.stats_every)
                 .unwrap_or(0),
             workers: cli
                 .workers
-                .or_else(|| env("WORKERS").and_then(|v| v.trim().parse().ok()))
+                .or(workers)
                 .or(file.workers)
                 .unwrap_or(default_workers),
             io: cli
@@ -302,6 +347,33 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A number from the environment that is not a number is an error.**
+    /// `DBNOOP_PORT=5432x` was dropped, and a dropped port is the default port:
+    /// the server bound somewhere the operator did not ask for and nothing said
+    /// so.
+    #[test]
+    fn a_malformed_environment_number_is_refused() {
+        for bad in ["5432x", "", " ", "-1", "1.5", "0x10"] {
+            assert!(
+                parse_env::<u16>("PORT", Some(bad.to_string())).is_err(),
+                "{bad:?} must be refused, not dropped"
+            );
+        }
+        for bad in ["4x", "many"] {
+            assert!(parse_env::<usize>("WORKERS", Some(bad.to_string())).is_err());
+        }
+
+        assert_eq!(
+            parse_env::<u16>("PORT", None),
+            Ok(None),
+            "unset is the default"
+        );
+        assert_eq!(
+            parse_env::<u16>("PORT", Some(" 5433 ".to_string())),
+            Ok(Some(5433))
+        );
+    }
 
     /// **A value that does not parse is an error, not "disabled".** The
     /// parse failure became `None`, and `None` is also the explicit
