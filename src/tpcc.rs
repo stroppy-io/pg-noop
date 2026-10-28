@@ -229,16 +229,6 @@ impl Pending {
     pub fn discard(&mut self) {
         self.counts = [0; 5];
     }
-
-    /// Whether anything is noted.
-    pub fn is_empty(&self) -> bool {
-        self.counts.iter().all(|n| *n == 0)
-    }
-}
-
-/// Count one TPC-C transaction of this kind, as committed.
-pub fn note(kind: Kind) {
-    kind.counter().fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn note_commit() {
@@ -411,41 +401,6 @@ fn writes_null(sql: &str) -> bool {
     sql::Words::new(sql).any(|w| w.eq_ignore_ascii_case("NULL"))
 }
 
-/// The district sum a TPC-C client reads for NOPM.
-pub fn is_district_sum(sql: &str) -> bool {
-    let mut words = sql::Words::new(sql);
-
-    let Some(select) = words.next() else {
-        return false;
-    };
-    if !select.eq_ignore_ascii_case("SELECT") {
-        return false;
-    }
-    // `sum(d_next_o_id)`: the aggregate and its argument, as words.
-    for expected in ["SUM", "D_NEXT_O_ID", "FROM"] {
-        match words.next() {
-            Some(word) if word.eq_ignore_ascii_case(expected) => {}
-            _ => return false,
-        }
-    }
-
-    // The table, optionally `schema
-    let is_table = |word: &str| {
-        word.eq_ignore_ascii_case("district") || word.eq_ignore_ascii_case("tpcc_district")
-    };
-    let Some(first) = words.next() else {
-        return false;
-    };
-    let named = if is_table(first) {
-        true
-    } else {
-        // A schema prefix, then the table.
-        words.next().is_some_and(is_table)
-    };
-
-    named && words.next().is_none()
-}
-
 /// The transaction a statement is, when it is a TPC-C one.
 pub fn statement_kind(sql: &str) -> Option<Kind> {
     let mut words = sql::Words::new(sql);
@@ -614,30 +569,6 @@ mod tests {
     /// The district sum is recognised as HammerDB spells it, with the whitespace and
     /// case a client varies and the schema prefix it may add.
     #[test]
-    fn the_district_sum_is_recognised() {
-        for sql in [
-            "select sum(d_next_o_id) from district",
-            "SELECT sum(d_next_o_id) FROM district",
-            "select sum ( d_next_o_id ) from district",
-            "select sum(d_next_o_id) from tpcc_district",
-            "select sum(d_next_o_id) from tpcc.district",
-            "  select\n  sum(d_next_o_id)\n  from\n  district  ",
-            "select sum(d_next_o_id) from district;",
-        ] {
-            assert!(is_district_sum(sql), "{sql:?} is the district sum");
-        }
-
-        for sql in [
-            "select sum(d_next_o_id), count(*) from district",
-            "select d_next_o_id from district",
-            "select sum(d_next_o_id) from warehouse",
-            "select sum(d_next_o_id) from district where d_id = 1",
-            "update district set d_next_o_id = d_next_o_id + 1",
-            "insert into district values (1, 2, 3)",
-        ] {
-            assert!(!is_district_sum(sql), "{sql:?} is not the district sum");
-        }
-    }
 
     /// A CALL is counted by the procedure it names, in either case and under a schema
     /// prefix.
@@ -809,12 +740,16 @@ mod tests {
         let at_start = district_sum();
         assert_eq!(at_start, 3001 * 30 + before_kind, "3001 per district");
 
-        note(Kind::NewOrder);
+        let mut pending = Pending::default();
+        pending.note(Kind::NewOrder);
+        pending.commit();
         assert_eq!(district_sum(), at_start + 1, "one NewOrder, one more");
 
         // Another kind of transaction does not move it: only a NewOrder advances a
         // district's next order id.
-        note(Kind::Payment);
+        let mut pending = Pending::default();
+        pending.note(Kind::Payment);
+        pending.commit();
         assert_eq!(district_sum(), at_start + 1);
 
         set_warehouses(DEFAULT_WAREHOUSES);
@@ -876,10 +811,8 @@ mod tests {
 
         pending.note(Kind::NewOrder);
         assert_eq!(new_orders(), before, "nothing is counted until it commits");
-        assert!(!pending.is_empty());
 
         pending.discard();
-        assert!(pending.is_empty(), "a rollback drops the note");
         pending.commit();
         assert_eq!(
             new_orders(),
@@ -902,7 +835,9 @@ mod tests {
         let payments = STATS.payment.load(Ordering::Relaxed);
         note_commit();
         note_rollback();
-        note(Kind::Payment);
+        let mut pending = Pending::default();
+        pending.note(Kind::Payment);
+        pending.commit();
 
         assert!(com_commit() > commits, "a commit is counted");
         assert!(com_rollback() > 0);
