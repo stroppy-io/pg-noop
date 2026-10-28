@@ -659,9 +659,52 @@ struct Ring<'a> {
     cq: cqueue::CompletionQueue<'a>,
     /// This pass's completions, reused. A `Vec` of completions allocated per
     /// wait pass is one allocation per batch of work the shard does.
-    done: Vec<Done>,
+    pass: Pass,
     #[cfg(test)]
     stats: Option<std::sync::Arc<Stats>>,
+}
+
+/// The completions one pass of the loop is responsible for.
+///
+/// Drained at the start of the pass and cleared at the END of it -- never at the
+/// start. `push` submits, and a submit can make the kernel hand completions over
+/// at once (EBUSY on a full completion ring, drained here): those belong to the
+/// pass that is running. Cleared at the start instead, they were dropped by the
+/// next pass -- a provided buffer never given back to the ring, and a connection
+/// whose receive was never re-armed, so it hung.
+#[derive(Default)]
+struct Pass {
+    done: Vec<Done>,
+    /// How many of `done` this pass has handed out.
+    next: usize,
+}
+
+impl Pass {
+    /// Take everything the kernel has completed so far.
+    fn drain(&mut self, cq: &mut cqueue::CompletionQueue<'_>) {
+        drain_completions(cq, &mut self.done);
+    }
+
+    /// The next completion of this pass, including one that arrived while the
+    /// pass was working.
+    fn next(&mut self) -> Option<Done> {
+        let d = self.done.get(self.next).copied()?;
+        self.next += 1;
+
+        Some(d)
+    }
+
+    /// The pass is over: everything it was given has been handed out.
+    fn finish(&mut self) {
+        debug_assert_eq!(
+            self.next,
+            self.done.len(),
+            "a pass ended with {} completions unprocessed",
+            self.done.len() - self.next
+        );
+        self.done.clear();
+        self.next = 0;
+    }
 }
 
 impl Ring<'_> {
@@ -697,13 +740,18 @@ impl Ring<'_> {
         let this = &mut *self;
         retry_with(
             || this.submit.submit().map(drop),
-            || drain_completions(&mut this.cq, &mut this.done),
+            || this.pass.drain(&mut this.cq),
         )
     }
 
-    /// Move everything the kernel has completed into `done`.
+    /// Move everything the kernel has completed into this pass.
     fn drain(&mut self) {
-        drain_completions(&mut self.cq, &mut self.done);
+        self.pass.drain(&mut self.cq);
+    }
+
+    /// This pass is over: everything it was given has been processed.
+    fn finish(&mut self) {
+        self.pass.finish();
     }
 
     /// Wait for one completion, or until `deadline`.
@@ -885,7 +933,10 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
         submit,
         sq,
         cq,
-        done: Vec::with_capacity(1024),
+        pass: Pass {
+            done: Vec::with_capacity(1024),
+            next: 0,
+        },
         #[cfg(test)]
         stats: tuning.stats.clone(),
     };
@@ -972,179 +1023,239 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
         // however the wait returned.
         let expired = deadline.is_some_and(|at| Instant::now() >= at);
 
-        ring.done.clear();
         ring.drain();
 
-        // By index, not by iterator: pushing an entry can make the kernel's
-        // completer answer at once (EBUSY, drained into `done`), and those
-        // completions belong to this pass.
-        let mut i = 0;
-        while i < ring.done.len() {
-            let Done { data, res, flags } = ring.done[i];
-            i += 1;
-            let (idx, op) = untag(data);
+        // By hand, not by iterator: a submission made while the pass is working
+        // can make the kernel answer at once (EBUSY, drained into the pass), and
+        // those completions belong to this pass. `Pass::finish` is what says the
+        // pass saw every one of them -- it asserts it.
+        let mut expiry_done = !expired;
+        loop {
+            while let Some(Done { data, res, flags }) = ring.pass.next() {
+                let (idx, op) = untag(data);
 
-            match op {
-                OP_ACCEPT => {
-                    accept_armed = cqueue::more(flags);
+                match op {
+                    OP_ACCEPT => {
+                        accept_armed = cqueue::more(flags);
 
-                    if res >= 0 {
-                        let fd = res as RawFd;
-                        // Nagle off: replies are tens of bytes and latency is
-                        // what a benchmark reads.
-                        set_nodelay(fd);
+                        if res >= 0 {
+                            let fd = res as RawFd;
+                            // Nagle off: replies are tens of bytes and latency is
+                            // what a benchmark reads.
+                            set_nodelay(fd);
 
-                        let admitted = tuning.startup_timeout.map(|t| Instant::now() + t);
-                        let recycled = spare.pop().unwrap_or_default();
-                        let idx = match free_slots.pop() {
-                            Some(i) => {
-                                slots[i] = Some(Slot::new(fd, admitted, recycled));
-                                i
+                            let admitted = tuning.startup_timeout.map(|t| Instant::now() + t);
+                            let recycled = spare.pop().unwrap_or_default();
+                            let idx = match free_slots.pop() {
+                                Some(i) => {
+                                    slots[i] = Some(Slot::new(fd, admitted, recycled));
+                                    i
+                                }
+                                None => {
+                                    slots.push(Some(Slot::new(fd, admitted, recycled)));
+                                    slots.len() - 1
+                                }
+                            };
+                            // Only a connection with a deadline belongs in the list
+                            // the expiry pass walks; without one it is an entry the
+                            // pass would drop for nothing.
+                            if let Some(at) = admitted {
+                                startup.push(idx);
+                                earliest_startup = Some(earliest_startup.map_or(at, |e| e.min(at)));
                             }
-                            None => {
-                                slots.push(Some(Slot::new(fd, admitted, recycled)));
-                                slots.len() - 1
-                            }
-                        };
-                        // Only a connection with a deadline belongs in the list
-                        // the expiry pass walks; without one it is an entry the
-                        // pass would drop for nothing.
-                        if let Some(at) = admitted {
-                            startup.push(idx);
-                            earliest_startup = Some(earliest_startup.map_or(at, |e| e.min(at)));
-                        }
-                        arm_recv(&mut ring, &mut slots, bufs.as_ref(), idx, multishot)?;
-                    } else {
-                        let err = -res;
-                        if accept_should_pause(err) {
-                            // **Back off the ACCEPT, not the shard.** A run of
-                            // accept failures is what fd exhaustion is; parking
-                            // the accept for a moment keeps the connections
-                            // already open served, which is exactly the work
-                            // that should continue while new ones cannot be
-                            // taken.
-                            accept_paused_until = Some(Instant::now() + ACCEPT_BACKOFF);
-                            eprintln!(
-                                "pgnoop: accept failed with errno {err}; \
+                            arm_recv(&mut ring, &mut slots, bufs.as_ref(), idx, multishot)?;
+                        } else {
+                            let err = -res;
+                            if accept_should_pause(err) {
+                                // **Back off the ACCEPT, not the shard.** A run of
+                                // accept failures is what fd exhaustion is; parking
+                                // the accept for a moment keeps the connections
+                                // already open served, which is exactly the work
+                                // that should continue while new ones cannot be
+                                // taken.
+                                accept_paused_until = Some(Instant::now() + ACCEPT_BACKOFF);
+                                eprintln!(
+                                    "pgnoop: accept failed with errno {err}; \
                                  not re-arming accept for {}ms (other work continues)",
-                                ACCEPT_BACKOFF.as_millis()
-                            );
-                        } else if err == libc::EBADF || err == libc::EINVAL {
-                            return Err(io::Error::from_raw_os_error(err));
+                                    ACCEPT_BACKOFF.as_millis()
+                                );
+                            } else if err == libc::EBADF || err == libc::EINVAL {
+                                return Err(io::Error::from_raw_os_error(err));
+                            }
+                        }
+
+                        // Only re-arm when the kernel is not still holding the
+                        // request and the pause has expired. While paused, no
+                        // accept is in flight and the loop keeps serving whatever
+                        // is already connected.
+                        let paused = accept_paused_until.is_some_and(|t| Instant::now() < t);
+                        if !accept_armed && !paused {
+                            accept_paused_until = None;
+                            arm_accept(&mut ring, listen_fd, &mut accept_armed)?;
                         }
                     }
 
-                    // Only re-arm when the kernel is not still holding the
-                    // request and the pause has expired. While paused, no
-                    // accept is in flight and the loop keeps serving whatever
-                    // is already connected.
-                    let paused = accept_paused_until.is_some_and(|t| Instant::now() < t);
-                    if !accept_armed && !paused {
-                        accept_paused_until = None;
-                        arm_accept(&mut ring, listen_fd, &mut accept_armed)?;
-                    }
-                }
+                    OP_RECV => {
+                        let more = cqueue::more(flags);
+                        let bid = cqueue::buffer_select(flags);
 
-                OP_RECV => {
-                    let more = cqueue::more(flags);
-                    let bid = cqueue::buffer_select(flags);
+                        // **The buffer is the shard's, not the connection's.** If
+                        // the slot is already gone the completion is still ours to
+                        // clean up: a buffer that is not given back shrinks the ring
+                        // for every other connection on the shard.
+                        let Some(slot) = slots.get_mut(idx).and_then(|s| s.as_mut()) else {
+                            if let (Some(bid), Some(b)) = (bid, bufs.as_mut()) {
+                                b.put(bid);
+                            }
+                            continue;
+                        };
+                        slot.recv_armed = more;
+                        #[cfg(test)]
+                        if res > 0 {
+                            if let Some(s) = &tuning.stats {
+                                s.reads.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        if res > 0 {
+                            // The connection is reading again, whatever it had to
+                            // do last time.
+                            slot.private = false;
+                        }
 
-                    // **The buffer is the shard's, not the connection's.** If
-                    // the slot is already gone the completion is still ours to
-                    // clean up: a buffer that is not given back shrinks the ring
-                    // for every other connection on the shard.
-                    let Some(slot) = slots.get_mut(idx).and_then(|s| s.as_mut()) else {
+                        // Where the bytes are, and which buffer must go back.
+                        let mut release: Option<u16> = None;
+                        let mut src: *const u8 = std::ptr::null();
+                        let mut n = 0usize;
+
                         if let (Some(bid), Some(b)) = (bid, bufs.as_mut()) {
-                            b.put(bid);
+                            // A one-shot descriptor is the whole of one read: the
+                            // bytes start at the buffer and the buffer goes back as
+                            // soon as the codec has seen them.
+                            b.take(bid);
+                            src = b.ptr(bid);
+                            n = res.max(0) as usize;
+                            release = Some(bid);
+                        } else if bid.is_none() && res > 0 {
+                            // No provided-buffer ring, or none left to give: the
+                            // receive went into this connection's own buffer.
+                            src = slot.recv.as_ptr();
+                            n = res as usize;
                         }
-                        continue;
-                    };
-                    slot.recv_armed = more;
-                    #[cfg(test)]
-                    if res > 0 {
-                        if let Some(s) = &tuning.stats {
-                            s.reads.fetch_add(1, Ordering::Relaxed);
+
+                        if res <= 0 {
+                            // An error can still carry a buffer.
+                            if let (Some(bid), Some(b)) = (release, bufs.as_mut()) {
+                                b.put(bid);
+                            }
+
+                            let next = match res {
+                                // ENOBUFS: every buffer in the ring was taken when
+                                // the data arrived. The bytes are still in the
+                                // socket, so this connection is not dead -- it reads
+                                // the next one into a buffer of its own.
+                                r if r == -libc::ENOBUFS => {
+                                    #[cfg(test)]
+                                    if let Some(s) = &tuning.stats {
+                                        s.enobufs.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    slot.private = true;
+                                    Next::Arm
+                                }
+                                // Cancelled: by a park of ours, whose own
+                                // completion is what resumes the read side, or by a
+                                // slot on its way out.
+                                r if r == -libc::ECANCELED => {
+                                    if slot.parked || slot.closing {
+                                        Next::Idle
+                                    } else {
+                                        Next::Arm
+                                    }
+                                }
+                                // A kernel that does not know multishot receive (or
+                                // a provided buffer selected by the kernel) says so
+                                // here, once. Every receive after this one is a
+                                // one-shot instead, and the shard says so rather
+                                // than silently running a different loop.
+                                r if (r == -libc::EINVAL || r == -libc::EOPNOTSUPP)
+                                    && multishot =>
+                                {
+                                    multishot = false;
+                                    slot.private = true;
+                                    eprintln!(
+                                        "pgnoop: multishot receive unavailable ({}); \
+                                     one receive per read instead",
+                                        errno_name(-r)
+                                    );
+                                    Next::Arm
+                                }
+                                // Zero is the peer closing; any other error is the
+                                // connection ending. Both close it.
+                                _ => Next::Close,
+                            };
+
+                            match next {
+                                Next::Arm => {
+                                    arm_recv(&mut ring, &mut slots, bufs.as_ref(), idx, multishot)?
+                                }
+                                Next::Close => begin_close(
+                                    &mut slots,
+                                    &mut free_slots,
+                                    &mut spare,
+                                    bufs.as_mut(),
+                                    idx,
+                                ),
+                                _ => {}
+                            }
+                            continue;
                         }
-                    }
-                    if res > 0 {
-                        // The connection is reading again, whatever it had to
-                        // do last time.
-                        slot.private = false;
-                    }
 
-                    // Where the bytes are, and which buffer must go back.
-                    let mut release: Option<u16> = None;
-                    let mut src: *const u8 = std::ptr::null();
-                    let mut n = 0usize;
+                        // The reply goes into `send` unless the kernel is still
+                        // reading `send`, in which case it goes into `staged`: a
+                        // multishot receive delivers while a send is outstanding.
+                        if slot.send.capacity() == 0 {
+                            slot.send.reserve(8 * 1024);
+                        }
+                        let out = if slot.sending {
+                            &mut slot.staged
+                        } else {
+                            &mut slot.send
+                        };
 
-                    if let (Some(bid), Some(b)) = (bid, bufs.as_mut()) {
-                        // A one-shot descriptor is the whole of one read: the
-                        // bytes start at the buffer and the buffer goes back as
-                        // soon as the codec has seen them.
-                        b.take(bid);
-                        src = b.ptr(bid);
-                        n = res.max(0) as usize;
-                        release = Some(bid);
-                    } else if bid.is_none() && res > 0 {
-                        // No provided-buffer ring, or none left to give: the
-                        // receive went into this connection's own buffer.
-                        src = slot.recv.as_ptr();
-                        n = res as usize;
-                    }
+                        // SAFETY: `src` points into a provided buffer this thread
+                        // just took out of the ring, or into the slot's own receive
+                        // buffer, and `n` is the byte count the kernel wrote there.
+                        let bytes = unsafe { std::slice::from_raw_parts(src, n) };
 
-                    if res <= 0 {
-                        // An error can still carry a buffer.
+                        if slot.pending.is_empty() {
+                            let used = slot.conn.advance(bytes, out, &catalog);
+                            if used < n {
+                                slot.pending.extend_from_slice(&bytes[used..n]);
+                            }
+                        } else {
+                            slot.pending.extend_from_slice(bytes);
+                            let used = slot.conn.advance(&slot.pending, out, &catalog);
+                            slot.pending.drain(..used);
+                        }
+
+                        // Only now: the codec has read what the buffer held.
                         if let (Some(bid), Some(b)) = (release, bufs.as_mut()) {
                             b.put(bid);
                         }
 
-                        let next = match res {
-                            // ENOBUFS: every buffer in the ring was taken when
-                            // the data arrived. The bytes are still in the
-                            // socket, so this connection is not dead -- it reads
-                            // the next one into a buffer of its own.
-                            r if r == -libc::ENOBUFS => {
-                                #[cfg(test)]
-                                if let Some(s) = &tuning.stats {
-                                    s.enobufs.fetch_add(1, Ordering::Relaxed);
-                                }
-                                slot.private = true;
-                                Next::Arm
-                            }
-                            // Cancelled: by a park of ours, whose own
-                            // completion is what resumes the read side, or by a
-                            // slot on its way out.
-                            r if r == -libc::ECANCELED => {
-                                if slot.parked || slot.closing {
-                                    Next::Idle
-                                } else {
-                                    Next::Arm
-                                }
-                            }
-                            // A kernel that does not know multishot receive (or
-                            // a provided buffer selected by the kernel) says so
-                            // here, once. Every receive after this one is a
-                            // one-shot instead, and the shard says so rather
-                            // than silently running a different loop.
-                            r if (r == -libc::EINVAL || r == -libc::EOPNOTSUPP) && multishot => {
-                                multishot = false;
-                                slot.private = true;
-                                eprintln!(
-                                    "pgnoop: multishot receive unavailable ({}); \
-                                     one receive per read instead",
-                                    errno_name(-r)
-                                );
-                                Next::Arm
-                            }
-                            // Zero is the peer closing; any other error is the
-                            // connection ending. Both close it.
-                            _ => Next::Close,
-                        };
+                        // Startup completed: this connection is no longer the one
+                        // the startup deadline is about.
+                        if !slot.conn.awaiting_startup() {
+                            slot.startup_deadline = None;
+                        }
 
+                        #[cfg(test)]
+                        if let Some(s) = &tuning.stats {
+                            s.staged_high.fetch_max(slot.queued(), Ordering::Relaxed);
+                        }
+
+                        let next = next_for(slot);
                         match next {
-                            Next::Arm => {
-                                arm_recv(&mut ring, &mut slots, bufs.as_ref(), idx, multishot)?
-                            }
+                            Next::Send => submit_send(&mut ring, &mut slots, idx)?,
                             Next::Close => begin_close(
                                 &mut slots,
                                 &mut free_slots,
@@ -1152,143 +1263,100 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
                                 bufs.as_mut(),
                                 idx,
                             ),
-                            _ => {}
-                        }
-                        continue;
-                    }
-
-                    // The reply goes into `send` unless the kernel is still
-                    // reading `send`, in which case it goes into `staged`: a
-                    // multishot receive delivers while a send is outstanding.
-                    if slot.send.capacity() == 0 {
-                        slot.send.reserve(8 * 1024);
-                    }
-                    let out = if slot.sending {
-                        &mut slot.staged
-                    } else {
-                        &mut slot.send
-                    };
-
-                    // SAFETY: `src` points into a provided buffer this thread
-                    // just took out of the ring, or into the slot's own receive
-                    // buffer, and `n` is the byte count the kernel wrote there.
-                    let bytes = unsafe { std::slice::from_raw_parts(src, n) };
-
-                    if slot.pending.is_empty() {
-                        let used = slot.conn.advance(bytes, out, &catalog);
-                        if used < n {
-                            slot.pending.extend_from_slice(&bytes[used..n]);
-                        }
-                    } else {
-                        slot.pending.extend_from_slice(bytes);
-                        let used = slot.conn.advance(&slot.pending, out, &catalog);
-                        slot.pending.drain(..used);
-                    }
-
-                    // Only now: the codec has read what the buffer held.
-                    if let (Some(bid), Some(b)) = (release, bufs.as_mut()) {
-                        b.put(bid);
-                    }
-
-                    // Startup completed: this connection is no longer the one
-                    // the startup deadline is about.
-                    if !slot.conn.awaiting_startup() {
-                        slot.startup_deadline = None;
-                    }
-
-                    #[cfg(test)]
-                    if let Some(s) = &tuning.stats {
-                        s.staged_high.fetch_max(slot.queued(), Ordering::Relaxed);
-                    }
-
-                    let next = next_for(slot);
-                    match next {
-                        Next::Send => submit_send(&mut ring, &mut slots, idx)?,
-                        Next::Close => {
-                            begin_close(&mut slots, &mut free_slots, &mut spare, bufs.as_mut(), idx)
-                        }
-                        Next::Arm => {
-                            arm_recv(&mut ring, &mut slots, bufs.as_ref(), idx, multishot)?
-                        }
-                        Next::Park => park_recv(&mut ring, &mut slots, idx)?,
-                        Next::Idle => {}
-                    }
-                }
-
-                OP_SEND => {
-                    let next = {
-                        let Some(slot) = slots.get_mut(idx).and_then(|s| s.as_mut()) else {
-                            continue;
-                        };
-                        slot.sending = false;
-
-                        if res <= 0 {
-                            Next::Close
-                        } else {
-                            slot.sent += res as usize;
-
-                            if slot.sent < slot.send.len() {
-                                // A short write is normal under pressure;
-                                // finish it.
-                                Next::Send
-                            } else {
-                                slot.send.clear();
-                                slot.sent = 0;
-
-                                next_for(slot)
+                            Next::Arm => {
+                                arm_recv(&mut ring, &mut slots, bufs.as_ref(), idx, multishot)?
                             }
+                            Next::Park => park_recv(&mut ring, &mut slots, idx)?,
+                            Next::Idle => {}
                         }
-                    };
-                    match next {
-                        Next::Send => submit_send(&mut ring, &mut slots, idx)?,
-                        Next::Close => {
-                            begin_close(&mut slots, &mut free_slots, &mut spare, bufs.as_mut(), idx)
-                        }
-                        Next::Arm => {
-                            arm_recv(&mut ring, &mut slots, bufs.as_ref(), idx, multishot)?
-                        }
-                        Next::Park => park_recv(&mut ring, &mut slots, idx)?,
-                        Next::Idle => {}
                     }
-                }
 
-                OP_CANCEL => {
-                    let next = {
-                        let Some(slot) = slots.get_mut(idx).and_then(|s| s.as_mut()) else {
-                            continue;
+                    OP_SEND => {
+                        let next = {
+                            let Some(slot) = slots.get_mut(idx).and_then(|s| s.as_mut()) else {
+                                continue;
+                            };
+                            slot.sending = false;
+
+                            if res <= 0 {
+                                Next::Close
+                            } else {
+                                slot.sent += res as usize;
+
+                                if slot.sent < slot.send.len() {
+                                    // A short write is normal under pressure;
+                                    // finish it.
+                                    Next::Send
+                                } else {
+                                    slot.send.clear();
+                                    slot.sent = 0;
+
+                                    next_for(slot)
+                                }
+                            }
                         };
-                        // The target is gone, but only a cancel that SUCCEEDED
-                        // says so: `-ENOENT` (or any other answer) means the
-                        // receive had already completed, and its completion in
-                        // this pass has the truth about `recv_armed`.
-                        if res == 0 {
-                            slot.recv_armed = false;
+                        match next {
+                            Next::Send => submit_send(&mut ring, &mut slots, idx)?,
+                            Next::Close => begin_close(
+                                &mut slots,
+                                &mut free_slots,
+                                &mut spare,
+                                bufs.as_mut(),
+                                idx,
+                            ),
+                            Next::Arm => {
+                                arm_recv(&mut ring, &mut slots, bufs.as_ref(), idx, multishot)?
+                            }
+                            Next::Park => park_recv(&mut ring, &mut slots, idx)?,
+                            Next::Idle => {}
                         }
-                        next_for(slot)
-                    };
-                    match next {
-                        Next::Send => submit_send(&mut ring, &mut slots, idx)?,
-                        Next::Close => {
-                            begin_close(&mut slots, &mut free_slots, &mut spare, bufs.as_mut(), idx)
-                        }
-                        Next::Arm => {
-                            arm_recv(&mut ring, &mut slots, bufs.as_ref(), idx, multishot)?
-                        }
-                        Next::Park => park_recv(&mut ring, &mut slots, idx)?,
-                        Next::Idle => {}
                     }
-                }
 
-                _ => {
-                    // Nothing else is ever submitted with a tag of its own.
+                    OP_CANCEL => {
+                        let next = {
+                            let Some(slot) = slots.get_mut(idx).and_then(|s| s.as_mut()) else {
+                                continue;
+                            };
+                            // The target is gone, but only a cancel that SUCCEEDED
+                            // says so: `-ENOENT` (or any other answer) means the
+                            // receive had already completed, and its completion in
+                            // this pass has the truth about `recv_armed`.
+                            if res == 0 {
+                                slot.recv_armed = false;
+                            }
+                            next_for(slot)
+                        };
+                        match next {
+                            Next::Send => submit_send(&mut ring, &mut slots, idx)?,
+                            Next::Close => begin_close(
+                                &mut slots,
+                                &mut free_slots,
+                                &mut spare,
+                                bufs.as_mut(),
+                                idx,
+                            ),
+                            Next::Arm => {
+                                arm_recv(&mut ring, &mut slots, bufs.as_ref(), idx, multishot)?
+                            }
+                            Next::Park => park_recv(&mut ring, &mut slots, idx)?,
+                            Next::Idle => {}
+                        }
+                    }
+
+                    _ => {
+                        // Nothing else is ever submitted with a tag of its own.
+                    }
                 }
             }
-        }
 
-        // **The deadlines, once the wait has come back.** Only reached when at
-        // least one was pending; with none, `expired` is false and this is a
-        // branch on a bool.
-        if expired {
+            // **The deadlines, once per pass, after the completions it began
+            // with.** Only reached when at least one was pending; with none,
+            // `expired` is false and this pass is over.
+            if expiry_done {
+                break;
+            }
+            expiry_done = true;
+
             // A paused accept whose backoff has passed resumes here. Checked
             // against the clock rather than assumed: the wait can also have been
             // bounded by another deadline and returned early.
@@ -1342,10 +1410,15 @@ fn run_until(listener: TcpListener, catalog: CatalogView, tuning: Tuning) -> io:
             std::mem::swap(&mut startup, &mut scratch);
             earliest_startup = next;
         }
+
+        // Every completion this pass was given has been processed -- including
+        // the ones that arrived while it was working. Only now may they be
+        // dropped.
+        ring.finish();
     }
 }
 
-/// Move every completion the kernel has posted into `done`.
+/// Move every completion the kernel has posted into this pass's buffer.
 fn drain_completions(cq: &mut cqueue::CompletionQueue<'_>, done: &mut Vec<Done>) {
     cq.sync();
     for cqe in &mut *cq {
@@ -2583,6 +2656,54 @@ mod tests {
         let frames = ask(&mut s, "select 1").expect("reply");
         assert_eq!(frames.len(), 4);
         assert_eq!(columns(&frames[0].1), 1);
+    }
+
+    /// **A pass processes every completion it was given, including the ones
+    /// that arrive while it is working.**
+    ///
+    /// `ring.done` used to be cleared at the START of a pass. A submission made
+    /// during a pass -- `arm_accept` in the deadline block, or any `push` that
+    /// finds the submission queue full -- can make the kernel answer at once
+    /// with EBUSY, and those completions were drained into the very buffer the
+    /// next pass then emptied unprocessed. A lost receive completion is a
+    /// provided buffer never returned to the ring and a connection that is
+    /// never read from again: it hangs, with nothing in the log.
+    ///
+    /// The pass is what owns them now: it hands out what it has, sees what
+    /// arrives, and is cleared only when it says it is finished -- which
+    /// `finish` asserts.
+    #[test]
+    fn a_pass_processes_the_completions_that_arrive_while_it_works() {
+        let mut pass = Pass::default();
+        pass.done.push(Done {
+            data: 1,
+            res: 0,
+            flags: 0,
+        });
+        pass.done.push(Done {
+            data: 2,
+            res: 0,
+            flags: 0,
+        });
+
+        assert_eq!(pass.next().map(|d| d.data), Some(1));
+        // The kernel answers a submission made while the pass was working.
+        pass.done.push(Done {
+            data: 3,
+            res: 0,
+            flags: 0,
+        });
+        assert_eq!(pass.next().map(|d| d.data), Some(2));
+        assert_eq!(
+            pass.next().map(|d| d.data),
+            Some(3),
+            "a completion that arrived during the pass belongs to it"
+        );
+        assert_eq!(pass.next().map(|d| d.data), None);
+
+        // And only now is the buffer emptied, for the next pass.
+        pass.finish();
+        assert_eq!(pass.next().map(|d| d.data), None);
     }
 
     /// **One buffer, two connections, no starvation.**
