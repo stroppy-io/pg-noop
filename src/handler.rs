@@ -1,42 +1,16 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::{Arc, OnceLock, RwLock};
-
-use async_trait::async_trait;
-use futures::stream;
-use futures::Sink;
-use pgwire::api::auth::noop::NoopStartupHandler;
-use pgwire::api::copy::CopyHandler;
-use pgwire::api::portal::{Format, Portal};
-use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
-use pgwire::api::results::{
-    CopyResponse, DescribePortalResponse, DescribeResponse, DescribeStatementResponse, FieldFormat,
-    FieldInfo, QueryResponse, Response, Tag,
-};
-use pgwire::api::stmt::{QueryParser, StoredStatement};
-use pgwire::api::{ClientInfo, Type};
-use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
-use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
-use pgwire::messages::PgWireBackendMessage;
+use std::sync::{Arc, RwLock};
 
 pub struct NoopHandler {
     catalog: RwLock<SchemaCatalog>,
-    /// One parser for the life of the server.
-    parser: Arc<PlanParser>,
 }
 
 impl NoopHandler {
     pub fn new() -> Self {
         Self {
             catalog: RwLock::new(SchemaCatalog::default()),
-            parser: Arc::new(PlanParser),
         }
-    }
-
-    fn fields_for_metadata_select(&self, sql: &str) -> Option<Arc<Vec<FieldInfo>>> {
-        let (table_name, selected_columns) = parse_metadata_select(sql)?;
-
-        self.fields_for_parsed_select(&table_name, &selected_columns)
     }
 
     /// The catalog half, split out so a plan prepared once can reuse it without
@@ -45,7 +19,7 @@ impl NoopHandler {
         &self,
         table_name: &[String],
         selected_columns: &[SelectColumn],
-    ) -> Option<Arc<Vec<FieldInfo>>> {
+    ) -> Option<Arc<Vec<(String, u32)>>> {
         let catalog = self.catalog.read().expect("schema catalog poisoned");
 
         catalog.fields_for_select(table_name, selected_columns)
@@ -85,7 +59,7 @@ struct TableSchema {
 struct ColumnInfo {
     name: String,
     normalized_name: String,
-    typ: Type,
+    oid: u32,
 }
 
 impl SchemaCatalog {
@@ -111,48 +85,35 @@ impl SchemaCatalog {
         &self,
         table_name: &[String],
         selected_columns: &[SelectColumn],
-    ) -> Option<Arc<Vec<FieldInfo>>> {
+    ) -> Option<Arc<Vec<(String, u32)>>> {
         let table = self.lookup_table(table_name)?;
-        let fields: Vec<FieldInfo> = if selected_columns.len() == 1 && selected_columns[0].is_star {
-            table
-                .columns
-                .iter()
-                .map(|column| {
-                    FieldInfo::new(
-                        column.name.clone(),
-                        None,
-                        None,
-                        column.typ.clone(),
-                        FieldFormat::Text,
-                    )
-                })
-                .collect()
-        } else {
-            selected_columns
-                .iter()
-                .map(|selected| {
-                    let selected_name = selected
-                        .name
-                        .as_deref()
-                        .expect("non-star select column has a name");
-                    let column = table
-                        .columns
-                        .iter()
-                        .find(|column| column.normalized_name == normalize_ident(selected_name));
-                    FieldInfo::new(
-                        column
-                            .map(|column| column.name.clone())
-                            .unwrap_or_else(|| selected_name.to_string()),
-                        None,
-                        None,
-                        column
-                            .map(|column| column.typ.clone())
-                            .unwrap_or(Type::TEXT),
-                        FieldFormat::Text,
-                    )
-                })
-                .collect()
-        };
+        let fields: Vec<(String, u32)> =
+            if selected_columns.len() == 1 && selected_columns[0].is_star {
+                table
+                    .columns
+                    .iter()
+                    .map(|column| (column.name.clone(), column.oid))
+                    .collect()
+            } else {
+                selected_columns
+                    .iter()
+                    .map(|selected| {
+                        let selected_name = selected
+                            .name
+                            .as_deref()
+                            .expect("non-star select column has a name");
+                        let column = table.columns.iter().find(|column| {
+                            column.normalized_name == normalize_ident(selected_name)
+                        });
+                        (
+                            column
+                                .map(|column| column.name.clone())
+                                .unwrap_or_else(|| selected_name.to_string()),
+                            column.map(|column| column.oid).unwrap_or(25),
+                        )
+                    })
+                    .collect()
+            };
 
         Some(Arc::new(fields))
     }
@@ -168,43 +129,12 @@ impl SchemaCatalog {
 }
 
 // Accept all connections without authentication.
-impl NoopStartupHandler for NoopHandler {}
-
 /// Builds N FieldInfo entries typed as INT8 (text format).
 fn starts_with_keyword(sql: &str, kw: &str) -> bool {
     let bytes = sql.trim_start().as_bytes();
     let kw_bytes = kw.as_bytes();
 
     bytes.len() >= kw_bytes.len() && bytes[..kw_bytes.len()].eq_ignore_ascii_case(kw_bytes)
-}
-
-/// The leading alphabetic keyword of `sql`, as a slice into it -- no allocation.
-/// Matching the first word in place answers the same questions, and is strictly more
-/// precise: `starts_with` also accepted "SELECTED" as a SELECT.
-/// Pre-built stub field vectors for the column counts a benchmark actually produces.
-/// `stub_fields` allocated an Arc, a Vec and a String per column on every SELECT that
-/// was not a metadata select -- which is every `select 1`.
-static STUB_FIELD_CACHE: OnceLock<Vec<Arc<Vec<FieldInfo>>>> = OnceLock::new();
-
-const STUB_FIELD_CACHE_MAX: usize = 16;
-
-fn stub_fields(n: usize) -> Arc<Vec<FieldInfo>> {
-    let cache = STUB_FIELD_CACHE
-        .get_or_init(|| (0..=STUB_FIELD_CACHE_MAX).map(build_stub_fields).collect());
-
-    match cache.get(n) {
-        Some(fields) => Arc::clone(fields),
-        // Wider than anything cached: build it, as before.
-        None => build_stub_fields(n),
-    }
-}
-
-fn build_stub_fields(n: usize) -> Arc<Vec<FieldInfo>> {
-    Arc::new(
-        (0..n)
-            .map(|_| FieldInfo::new("?column?".into(), None, None, Type::INT8, FieldFormat::Text))
-            .collect(),
-    )
 }
 
 /// Counts SELECT columns at paren-depth 0 between SELECT and FROM.
@@ -573,7 +503,7 @@ fn parse_column_def(def: &str) -> Option<ColumnInfo> {
     Some(ColumnInfo {
         normalized_name: normalize_ident(&ident.name),
         name: ident.name,
-        typ: map_sql_type(type_sql),
+        oid: map_sql_oid(type_sql),
     })
 }
 
@@ -626,7 +556,7 @@ pub(crate) fn parameter_types(sql: &str, declared: &[u32]) -> Result<Vec<u32>, P
         .map(|i| match declared.get(i) {
             Some(&oid) if oid != 0 => oid,
             _ => cast_on_placeholder(sql, &found, i + 1)
-                .map(|t| map_sql_type(t).oid())
+                .map(map_sql_oid)
                 .unwrap_or(0),
         })
         .collect())
@@ -731,32 +661,33 @@ fn cast_on_placeholder<'a>(sql: &'a str, found: &[(usize, usize)], n: usize) -> 
     None
 }
 
-fn map_sql_type(type_sql: &str) -> Type {
+/// The type oid for a column's declared type.
+fn map_sql_oid(type_sql: &str) -> u32 {
     let words = type_words(type_sql, 4);
     let first = words.first().map(String::as_str).unwrap_or("");
     let second = words.get(1).map(String::as_str).unwrap_or("");
 
     match first {
-        "INTEGER" | "INT" | "INT4" => Type::INT4,
-        "BIGINT" | "INT8" => Type::INT8,
-        "SMALLINT" | "INT2" => Type::INT2,
-        "CHAR" => Type::BPCHAR,
-        "CHARACTER" if second == "VARYING" => Type::VARCHAR,
-        "CHARACTER" => Type::BPCHAR,
-        "VARCHAR" => Type::VARCHAR,
-        "TEXT" => Type::TEXT,
-        "DECIMAL" | "NUMERIC" => Type::NUMERIC,
-        "DATE" => Type::DATE,
-        "TIMESTAMP" => Type::TIMESTAMP,
-        "BOOLEAN" | "BOOL" => Type::BOOL,
-        "REAL" | "FLOAT4" => Type::FLOAT4,
-        "DOUBLE" | "FLOAT8" => Type::FLOAT8,
-        "TIMESTAMPTZ" => Type::TIMESTAMPTZ,
-        "UUID" => Type::UUID,
-        "BYTEA" => Type::BYTEA,
-        "JSON" => Type::JSON,
-        "JSONB" => Type::JSONB,
-        _ => Type::TEXT,
+        "INTEGER" | "INT" | "INT4" => 23,
+        "BIGINT" | "INT8" => 20,
+        "SMALLINT" | "INT2" => 21,
+        "CHAR" => 1042,
+        "CHARACTER" if second == "VARYING" => 1043,
+        "CHARACTER" => 1042,
+        "VARCHAR" => 1043,
+        "TEXT" => 25,
+        "DECIMAL" | "NUMERIC" => 1700,
+        "DATE" => 1082,
+        "TIMESTAMP" => 1114,
+        "BOOLEAN" | "BOOL" => 16,
+        "REAL" | "FLOAT4" => 700,
+        "DOUBLE" | "FLOAT8" => 701,
+        "TIMESTAMPTZ" => 1184,
+        "UUID" => 2950,
+        "BYTEA" => 17,
+        "JSON" => 114,
+        "JSONB" => 3802,
+        _ => 25,
     }
 }
 
@@ -1111,35 +1042,6 @@ fn table_lookup_keys(table_name: &[String]) -> Vec<String> {
     table_keys(table_name)
 }
 
-/// Builds a single DataRow with `n` columns, each containing int64(1).
-/// Mirrors the stroppy noop driver's one-row stub: using 1 rather than 0 prevents
-/// workload guards like `if (nameCount === 0) throw` from tripping.
-fn constant_fields(items: &[crate::sql::Constant]) -> Arc<Vec<FieldInfo>> {
-    Arc::new(
-        items
-            .iter()
-            .map(|item| {
-                let oid = match item.kind {
-                    crate::sql::ConstantKind::Integer => 20, // int8
-                    crate::sql::ConstantKind::Text => 25,    // text
-                };
-
-                FieldInfo::new(
-                    item.name.clone(),
-                    None,
-                    None,
-                    Type::from_oid(oid).unwrap_or(Type::INT8),
-                    FieldFormat::Text,
-                )
-            })
-            .collect(),
-    )
-}
-
-fn empty_query(fields: &Arc<Vec<FieldInfo>>) -> QueryResponse {
-    QueryResponse::new(Arc::clone(fields), stream::empty())
-}
-
 /// The schema, as the sans-io codec is allowed to see it.
 /// Two methods, both of which the codec needs and neither of which involves a socket.
 #[derive(Clone)]
@@ -1160,13 +1062,11 @@ impl CatalogView {
         table: &[String],
         columns: &[SelectColumn],
     ) -> Option<Vec<(String, u32)>> {
-        let fields = self.0.fields_for_parsed_select(table, columns)?;
-
         Some(
-            fields
-                .iter()
-                .map(|f| (f.name().to_string(), f.datatype().oid()))
-                .collect(),
+            self.0
+                .fields_for_parsed_select(table, columns)?
+                .as_ref()
+                .clone(),
         )
     }
 }
@@ -1272,304 +1172,6 @@ impl PreparedPlan {
             kind,
         }
     }
-
-    /// The fields a Describe should report, resolved now rather than at Parse so a
-    /// table created since preparation is still seen.
-    fn describe_fields(&self, handler: &NoopHandler) -> Option<Arc<Vec<FieldInfo>>> {
-        match &self.kind {
-            PlanKind::SelectMeta { table, columns } => Some(
-                handler
-                    .fields_for_parsed_select(table, columns)
-                    .unwrap_or_else(|| stub_fields(columns.len().max(1))),
-            ),
-            PlanKind::SelectStub { columns } => Some(stub_fields(*columns)),
-            PlanKind::Constant(items) => Some(constant_fields(items)),
-            _ => None,
-        }
-    }
-}
-
-/// Our parser: does the text work once, at Parse.
-pub struct PlanParser;
-
-#[async_trait]
-impl QueryParser for PlanParser {
-    type Statement = PreparedPlan;
-
-    async fn parse_sql<C>(
-        &self,
-        _client: &C,
-        sql: &str,
-        _types: &[Option<Type>],
-    ) -> PgWireResult<Self::Statement>
-    where
-        C: ClientInfo + Unpin + Send + Sync,
-    {
-        Ok(PreparedPlan::build(sql))
-    }
-
-    /// A blackhole resolves no parameter types: it never looks at the values, and
-    /// claiming a type it did not derive would be a lie the client acts on.
-    fn get_parameter_types(&self, _stmt: &Self::Statement) -> PgWireResult<Vec<Type>> {
-        Ok(vec![])
-    }
-
-    /// The result schema IS known at Parse for a stub select, but not for one naming a
-    /// table -- that needs the catalog, which the parser does not hold.
-    fn get_result_schema(
-        &self,
-        _stmt: &Self::Statement,
-        _column_format: Option<&Format>,
-    ) -> PgWireResult<Vec<FieldInfo>> {
-        Ok(vec![])
-    }
-}
-
-/// Execute a prepared plan.
-/// No text scanning except for DDL and COPY.
-fn respond_to_plan(handler: &NoopHandler, plan: &PreparedPlan) -> Response {
-    match &plan.kind {
-        PlanKind::SelectMeta { table, columns } => {
-            // A table the catalog has not seen gets stub fields and no rows: a row is
-            // not something this server can state for a table.
-            let fields = handler
-                .fields_for_parsed_select(table, columns)
-                .unwrap_or_else(|| stub_fields(columns.len().max(1)));
-
-            Response::Query(empty_query(&fields))
-        }
-        PlanKind::SelectStub { columns } => Response::Query(empty_query(&stub_fields(*columns))),
-        PlanKind::Constant(items) => Response::Query(empty_query(&constant_fields(items))),
-        // Nothing was written, so nothing is reported written.
-        PlanKind::Insert => Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(0)),
-        PlanKind::Update => Response::Execution(Tag::new("UPDATE").with_rows(0)),
-        PlanKind::Delete => Response::Execution(Tag::new("DELETE").with_rows(0)),
-        PlanKind::Begin => Response::TransactionStart(Tag::new("BEGIN")),
-        PlanKind::Commit => Response::TransactionEnd(Tag::new("COMMIT")),
-        PlanKind::Rollback => Response::TransactionEnd(Tag::new("ROLLBACK")),
-        // The catalog is mutated here, not at Parse: a prepared DDL statement that is
-        // never executed must not change the schema.
-        PlanKind::Ddl => {
-            handler.apply_schema_change(&plan.sql);
-            classify_extended(handler, &plan.sql)
-        }
-        PlanKind::Copy {
-            direction,
-            columns,
-            format,
-        } => match direction {
-            CopyDirection::FromStdin => Response::CopyIn(CopyResponse::new(
-                i8::from(*format == CopyFormat::Binary),
-                *columns,
-                stream::empty::<PgWireResult<CopyData>>(),
-            )),
-            CopyDirection::ToStdout => Response::CopyOut(CopyResponse::new(
-                0,
-                0,
-                stream::empty::<PgWireResult<CopyData>>(),
-            )),
-            CopyDirection::FromFile => Response::Execution(Tag::new("COPY").with_rows(0)),
-        },
-        PlanKind::Empty | PlanKind::FromText => classify_extended(handler, &plan.sql),
-    }
-}
-
-fn classify_simple(handler: &NoopHandler, sql: &str) -> Vec<Response> {
-    handler.apply_schema_change(sql);
-
-    let head = crate::sql::first_word(sql);
-    if head.eq_ignore_ascii_case("SELECT")
-        || head.eq_ignore_ascii_case("WITH")
-        || head.eq_ignore_ascii_case("TABLE")
-        || head.eq_ignore_ascii_case("VALUES")
-    {
-        if let Some(fields) = handler.fields_for_metadata_select(sql) {
-            vec![Response::Query(empty_query(&fields))]
-        } else {
-            let n = count_select_columns(sql);
-            let fields = stub_fields(n);
-            vec![Response::Query(empty_query(&fields))]
-        }
-    } else if head.eq_ignore_ascii_case("INSERT") {
-        vec![Response::Execution(
-            Tag::new("INSERT").with_oid(0).with_rows(0),
-        )]
-    } else if head.eq_ignore_ascii_case("UPDATE") {
-        vec![Response::Execution(Tag::new("UPDATE").with_rows(0))]
-    } else if head.eq_ignore_ascii_case("DELETE") {
-        vec![Response::Execution(Tag::new("DELETE").with_rows(0))]
-    } else if head.eq_ignore_ascii_case("BEGIN") {
-        vec![Response::TransactionStart(Tag::new("BEGIN"))]
-    } else if head.eq_ignore_ascii_case("COMMIT") {
-        vec![Response::TransactionEnd(Tag::new("COMMIT"))]
-    } else if head.eq_ignore_ascii_case("ROLLBACK") {
-        vec![Response::TransactionEnd(Tag::new("ROLLBACK"))]
-    } else if head.eq_ignore_ascii_case("COPY") {
-        // The direction comes from the shared matcher, not from a literal spelling:
-        // `FROM STDIN` with a tab or three spaces is the same statement, and answering
-        // it as `CopyOut` desynchronised the stream.
-        vector_for_copy(sql)
-    } else {
-        vec![Response::Execution(Tag::new("OK"))]
-    }
-}
-
-/// The pgwire-handler replies for a COPY, by direction.
-/// Used by the handler path; the codec path builds its own bytes from the same
-/// direction.
-fn vector_for_copy(sql: &str) -> Vec<Response> {
-    let columns = count_copy_columns(sql);
-    let binary = copy_format(sql) == CopyFormat::Binary;
-
-    match copy_direction(sql) {
-        Some(CopyDirection::FromStdin) => vec![Response::CopyIn(CopyResponse::new(
-            i8::from(binary),
-            columns,
-            stream::empty::<PgWireResult<CopyData>>(),
-        ))],
-        // `TO STDOUT` streams rows out; a blackhole streams none.
-        Some(CopyDirection::ToStdout) => vec![Response::CopyOut(CopyResponse::new(
-            0,
-            0,
-            stream::empty::<PgWireResult<CopyData>>(),
-        ))],
-        // `FROM '/path'`: the server reads a file and copied nothing from it.
-        Some(CopyDirection::FromFile) => {
-            vec![Response::Execution(Tag::new("COPY").with_rows(0))]
-        }
-        None => vec![Response::Execution(Tag::new("OK"))],
-    }
-}
-
-fn classify_extended(handler: &NoopHandler, sql: &str) -> Response {
-    handler.apply_schema_change(sql);
-
-    let head = crate::sql::first_word(sql);
-    if head.eq_ignore_ascii_case("SELECT")
-        || head.eq_ignore_ascii_case("WITH")
-        || head.eq_ignore_ascii_case("TABLE")
-        || head.eq_ignore_ascii_case("VALUES")
-    {
-        if let Some(fields) = handler.fields_for_metadata_select(sql) {
-            Response::Query(empty_query(&fields))
-        } else {
-            let n = count_select_columns(sql);
-            let fields = stub_fields(n);
-            Response::Query(empty_query(&fields))
-        }
-    } else if head.eq_ignore_ascii_case("INSERT") {
-        Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(0))
-    } else if head.eq_ignore_ascii_case("UPDATE") {
-        Response::Execution(Tag::new("UPDATE").with_rows(0))
-    } else if head.eq_ignore_ascii_case("DELETE") {
-        Response::Execution(Tag::new("DELETE").with_rows(0))
-    } else if head.eq_ignore_ascii_case("BEGIN") {
-        Response::TransactionStart(Tag::new("BEGIN"))
-    } else if head.eq_ignore_ascii_case("COMMIT") {
-        Response::TransactionEnd(Tag::new("COMMIT"))
-    } else if head.eq_ignore_ascii_case("ROLLBACK") {
-        Response::TransactionEnd(Tag::new("ROLLBACK"))
-    } else {
-        Response::Execution(Tag::new("OK"))
-    }
-}
-
-#[async_trait]
-impl SimpleQueryHandler for NoopHandler {
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
-    where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
-        C::Error: Debug,
-        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-    {
-        Ok(classify_simple(self, query))
-    }
-}
-
-#[async_trait]
-impl ExtendedQueryHandler for NoopHandler {
-    type Statement = PreparedPlan;
-    type QueryParser = PlanParser;
-
-    fn query_parser(&self) -> Arc<Self::QueryParser> {
-        Arc::clone(&self.parser)
-    }
-
-    async fn do_query<C>(
-        &self,
-        _client: &mut C,
-        portal: &Portal<Self::Statement>,
-        _max_rows: usize,
-    ) -> PgWireResult<Response>
-    where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
-        C::Error: Debug,
-        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-    {
-        Ok(respond_to_plan(self, &portal.statement.statement))
-    }
-
-    async fn do_describe_statement<C>(
-        &self,
-        _client: &mut C,
-        stmt: &StoredStatement<Self::Statement>,
-    ) -> PgWireResult<DescribeStatementResponse>
-    where
-        C: ClientInfo + Unpin + Send + Sync,
-    {
-        match stmt.statement.describe_fields(self) {
-            Some(fields) => Ok(DescribeStatementResponse::new(vec![], fields.to_vec())),
-            None => Ok(DescribeStatementResponse::no_data()),
-        }
-    }
-
-    async fn do_describe_portal<C>(
-        &self,
-        _client: &mut C,
-        portal: &Portal<Self::Statement>,
-    ) -> PgWireResult<DescribePortalResponse>
-    where
-        C: ClientInfo + Unpin + Send + Sync,
-    {
-        match portal.statement.statement.describe_fields(self) {
-            Some(fields) => Ok(DescribePortalResponse::new(fields.to_vec())),
-            None => Ok(DescribePortalResponse::no_data()),
-        }
-    }
-}
-
-#[async_trait]
-impl CopyHandler for NoopHandler {
-    async fn on_copy_data<C>(&self, _client: &mut C, _data: CopyData) -> PgWireResult<()>
-    where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
-        C::Error: Debug,
-        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-    {
-        Ok(())
-    }
-
-    async fn on_copy_done<C>(&self, _client: &mut C, _done: CopyDone) -> PgWireResult<()>
-    where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
-        C::Error: Debug,
-        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-    {
-        Ok(())
-    }
-
-    async fn on_copy_fail<C>(&self, _client: &mut C, fail: CopyFail) -> PgWireError
-    where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
-        C::Error: Debug,
-        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-    {
-        PgWireError::UserError(Box::new(ErrorInfo::new(
-            "ERROR".to_owned(),
-            "XX000".to_owned(),
-            format!("COPY failed: {}", fail.message),
-        )))
-    }
 }
 
 #[cfg(test)]
@@ -1594,12 +1196,12 @@ mod tests {
         .expect("create table parses");
 
         assert_eq!(columns.len(), 6);
-        assert_eq!(columns[0].typ, Type::INT4);
-        assert_eq!(columns[1].typ, Type::BPCHAR);
-        assert_eq!(columns[2].typ, Type::VARCHAR);
-        assert_eq!(columns[3].typ, Type::NUMERIC);
-        assert_eq!(columns[4].typ, Type::TIMESTAMP);
-        assert_eq!(columns[5].typ, Type::BOOL);
+        assert_eq!(columns[0].oid, 23);
+        assert_eq!(columns[1].oid, 1042);
+        assert_eq!(columns[2].oid, 1043);
+        assert_eq!(columns[3].oid, 1700);
+        assert_eq!(columns[4].oid, 1114);
+        assert_eq!(columns[5].oid, 16);
     }
 
     #[test]
