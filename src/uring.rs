@@ -1405,14 +1405,7 @@ fn passes(
                             let Some(slot) = slots.get_mut(idx).and_then(|s| s.as_mut()) else {
                                 continue;
                             };
-                            // The target is gone, but only a cancel that SUCCEEDED
-                            // says so: `-ENOENT` (or any other answer) means the
-                            // receive had already completed, and its completion in
-                            // this pass has the truth about `recv_armed`.
-                            if res == 0 {
-                                slot.recv_armed = false;
-                            }
-                            next_for(slot)
+                            after_cancel_request(slot, res)
                         };
                         match next {
                             Next::Send => submit_send(&mut ring, slots, idx)?,
@@ -1641,6 +1634,20 @@ fn set_nodelay(fd: RawFd) {
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
     }
+}
+
+/// What the CANCEL REQUEST's own completion does to the slot it cancelled:
+/// nothing to `recv_armed`, and then the usual decision.
+///
+/// The receive that was cancelled reports its own end with `F_MORE` clear, and
+/// that completion is the only thing that may say a receive is gone. Clearing it
+/// here races the terminal completion: whichever arrives second then finds no
+/// receive in flight and arms another one on a socket that already has one.
+fn after_cancel_request(slot: &mut Slot, _res: i32) -> Next {
+    // Nothing about the receive changes here, whatever the cancel answered:
+    // `0` means this cancel took it, and the cancelled request's own completion
+    // -- which always comes -- is what says so.
+    next_for(slot)
 }
 
 /// What a receive that was cancelled does to its connection.
@@ -3022,6 +3029,46 @@ mod tests {
             stopped.saturating_sub(baseline + clients.len()),
             clients.len()
         );
+    }
+
+    /// **A parked receive is armed again once, not twice.**
+    ///
+    /// Cancelling a receive produces two completions -- the cancelled receive's
+    /// own (`-ECANCELED`, `F_MORE` clear) and the cancel request's (`0`) -- and
+    /// they may arrive in either order. Only the receive's own completion says
+    /// that no receive is in flight; if the cancel request's says it too, the
+    /// second of the two arms a receive while the first is still there, and two
+    /// receives on one socket race for its bytes.
+    #[test]
+    fn a_parked_receive_is_armed_again_once() {
+        let codec = Codec::new(crate::protocol::Protocol::Postgres);
+        let mut slot = Slot::new(-1, None, Spare::default(), &codec);
+
+        // Parked, with more reply held than the water mark and a write in
+        // flight, and the receive still in the kernel's hands.
+        slot.recv_armed = true;
+        slot.parked = true;
+        slot.sending = true;
+        slot.send = vec![0u8; STAGED_HIGH_WATER + 1];
+
+        // The cancel request's completion: the receive is unchanged.
+        assert_eq!(after_cancel_request(&mut slot, 0), Next::Idle);
+        assert!(
+            slot.recv_armed,
+            "the cancel request's completion must not say the receive is gone"
+        );
+
+        // The receive's own, late, terminal completion: now it is gone, and the
+        // read side may be armed again.
+        slot.recv_armed = false;
+        // The write has drained, so the connection is no longer parked.
+        slot.sending = false;
+        slot.send.clear();
+        assert_eq!(next_for(&mut slot), Next::Arm, "exactly one arm");
+
+        // Armed is armed: a second decision does not arm another.
+        slot.recv_armed = true;
+        assert_eq!(next_for(&mut slot), Next::Idle);
     }
 
     /// **A pass processes every completion it was given, including the ones
