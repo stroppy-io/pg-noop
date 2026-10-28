@@ -794,11 +794,9 @@ fn the_district_sum_is_answered_on_the_postgres_port() {
     pg.query("commit");
     let answer = pg.query("show global status like 'Com_commit'");
     assert_eq!(answer[0].0, b'T', "a result set");
-    let row = String::from_utf8_lossy(&answer[1].1).to_string();
-    assert!(
-        row.contains("Com_commit") && row.ends_with("1"),
-        "the commit counter: {row:?}"
-    );
+    let values = pg_values(&answer[1].1);
+    assert_eq!(values[0], "Com_commit", "the counter's name");
+    assert!(values[1].parse::<u64>().is_ok(), "and a number: {values:?}");
 }
 
 /// A minimal PostgreSQL client: enough to send a simple query and read its
