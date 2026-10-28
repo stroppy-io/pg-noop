@@ -1455,7 +1455,7 @@ fn number_description(formats: &Formats, out: &mut Vec<u8>, name: &str) {
 }
 
 /// The two columns of a status answer: `Variable_name` and `Value`, both text.
-fn status_description(formats: &Formats, out: &mut Vec<u8>) {
+fn status_description(out: &mut Vec<u8>) {
     msg(out, b'T', |b| {
         b.extend_from_slice(&2i16.to_be_bytes());
         for name in ["Variable_name", "Value"] {
@@ -1467,16 +1467,13 @@ fn status_description(formats: &Formats, out: &mut Vec<u8>) {
             b.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
             b.extend_from_slice(&0i16.to_be_bytes()); // text format
         }
-        // The formats are per column: whatever the portal asked for is honoured above
-        // only for text columns, which have no binary form of their own.
-        let _ = formats;
     });
 }
 
 /// The TPC-C commit counters as a result set of two text columns.
 fn status_answer(out: &mut Vec<u8>, run: Run<'_>, filter: Option<&str>) -> bool {
     if run.describe {
-        status_description(run.formats, out);
+        status_description(out);
     }
 
     if run.consumed {
@@ -1761,7 +1758,7 @@ fn row_description(
         return true;
     }
     if crate::tpcc::profile() && crate::tpcc::show_status(&plan.sql).is_some() {
-        status_description(formats, out);
+        status_description(out);
 
         return true;
     }
