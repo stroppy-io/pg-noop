@@ -61,7 +61,7 @@ jobs:
         run: |
           set -euo pipefail
           ./target/release/dbnoop --host 127.0.0.1 --port 15432 --mysql-port 13306 \
-            --workers 2 --warehouses 10 >server.log 2>&1 &
+            --workers 2 --warehouses 10 --profile tpcc >server.log 2>&1 &
           echo $! > server.pid
           for _ in {1..200}; do
             # PostgreSQL says nothing until spoken to; MySQL greets first, so the
