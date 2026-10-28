@@ -387,8 +387,8 @@ impl Conn {
 
     /// Answer the error a client injected, and say whether it did.
     ///
-    /// The failure has to be refused on BOTH paths: through Execute it used to be
-    /// answered OK, so the client's rollback became a commit.
+    /// Both paths refuse it: a failure answered OK turns the client's rollback into a
+    /// commit.
     fn injected_failure(&mut self, failure: crate::tpcc::Failure, out: &mut Vec<u8>) {
         let (code, message) = match failure {
             crate::tpcc::Failure::Signal(code) => (code, "injected failure".to_string()),
@@ -1405,14 +1405,12 @@ impl Conn {
     }
 }
 
-/// The rows and the completion tag for one plan.
-/// A FREE function, not a method: it never needed `self`, and being a method is what
-/// forced a deep clone of the plan at every Execute.
-/// Answer one execution, and say whether the portal has rows left to send.
+/// The rows and the completion tag for one plan, and whether the portal has rows
+/// left to send: a single-row answer suspended by `max_rows` has none, and the next
+/// Execute answers `SELECT 0`, as PostgreSQL does.
 ///
-/// A single-row answer suspended by `max_rows` has none: the row went out with the
-/// `PortalSuspended`, so the next Execute short of closing the portal answers
-/// `SELECT 0`, which is what PostgreSQL does too.
+/// A free function, not a method: it never needed `self`, and a method forced a deep
+/// clone of the plan at every Execute.
 fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Run<'_>) -> bool {
     // The statements answered with a number are the TPC-C profile's.
     if let Some((name, value)) = crate::tpcc::number_query(&plan.sql, Dialect::Postgres) {

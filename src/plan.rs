@@ -181,9 +181,8 @@ pub(crate) fn copy_format(sql: &str) -> CopyFormat {
     CopyFormat::Text
 }
 
-/// The comma-separated pieces of an option list, ignoring commas inside quotes and
-/// nested parentheses.
-/// Walks a SQL statement and yields one word at a time.
+/// Walks a SQL statement and yields one word at a time: a quoted string, a
+/// parenthesised group or a bare word.
 struct SqlWords<'a> {
     rest: &'a str,
 }
@@ -238,7 +237,6 @@ impl<'a> SqlWords<'a> {
 /// between the table name and the direction keyword.
 pub(crate) fn count_copy_columns(sql: &str) -> usize {
     // One string, walked once.
-    // Two bugs lived here.
     let mut words = SqlWords::new(sql);
 
     if !words.next_is("COPY") {
@@ -267,8 +265,7 @@ pub(crate) fn count_copy_columns(sql: &str) -> usize {
     }
 }
 
-/// Commas that separate items, not commas inside a nested group or a quoted name.
-
+/// One column of a select list: `*`, or a name that may be quoted or qualified.
 #[derive(Debug, Clone)]
 pub struct SelectColumn {
     pub(crate) name: Option<String>,
