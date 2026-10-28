@@ -205,16 +205,27 @@ pub fn number_query(sql: &str) -> Option<(&'static str, u64)> {
 #[derive(Default, Clone, Copy)]
 pub struct Pending {
     counts: [u64; 5],
+    open: bool,
 }
 
 impl Pending {
-    /// Note one statement of this kind.
-    /// Nothing is counted yet.
-    pub fn note(&mut self, kind: Kind) {
+    /// **A counted statement ran.** It is counted when the transaction commits, and a
+    /// statement outside a transaction is a transaction of its own, so it commits
+    /// here -- the rule both protocols follow, and the reason a client that never
+    /// says BEGIN still moves the counter a TPM check reads.
+    pub fn statement(&mut self, kind: Kind) {
         self.counts[kind.index()] += 1;
+        if !self.open {
+            self.commit();
+        }
     }
 
-    /// Commit: the noted transactions are counted, and the commit is one more.
+    /// A transaction opened: its statements are counted at its end, not before.
+    pub fn begin(&mut self) {
+        self.open = true;
+    }
+
+    /// Committed: the noted transactions are counted, and the commit with them.
     pub fn commit(&mut self) {
         for kind in Kind::ALL {
             let n = std::mem::take(&mut self.counts[kind.index()]);
@@ -223,11 +234,19 @@ impl Pending {
             }
         }
         note_commit();
+        self.open = false;
     }
 
-    /// Roll back: the noted transactions never happened.
-    pub fn discard(&mut self) {
+    /// Rolled back: the noted transactions never happened, and the rollback is counted.
+    pub fn rollback(&mut self) {
         self.counts = [0; 5];
+        note_rollback();
+        self.open = false;
+    }
+
+    /// Whether a transaction is open.
+    pub fn in_transaction(&self) -> bool {
+        self.open
     }
 }
 
@@ -740,16 +759,12 @@ mod tests {
         let at_start = district_sum();
         assert_eq!(at_start, 3001 * 30 + before_kind, "3001 per district");
 
-        let mut pending = Pending::default();
-        pending.note(Kind::NewOrder);
-        pending.commit();
+        Pending::default().statement(Kind::NewOrder);
         assert_eq!(district_sum(), at_start + 1, "one NewOrder, one more");
 
         // Another kind of transaction does not move it: only a NewOrder advances a
         // district's next order id.
-        let mut pending = Pending::default();
-        pending.note(Kind::Payment);
-        pending.commit();
+        Pending::default().statement(Kind::Payment);
         assert_eq!(district_sum(), at_start + 1);
 
         set_warehouses(DEFAULT_WAREHOUSES);
@@ -809,22 +824,26 @@ mod tests {
         let before = new_orders();
         let mut pending = Pending::default();
 
-        pending.note(Kind::NewOrder);
+        // **In a transaction, nothing is counted until it commits.**
+        pending.begin();
+        pending.statement(Kind::NewOrder);
         assert_eq!(new_orders(), before, "nothing is counted until it commits");
+        assert!(pending.in_transaction());
 
-        pending.discard();
-        pending.commit();
-        assert_eq!(
-            new_orders(),
-            before,
-            "and commits what is left, which is nothing",
-        );
+        pending.rollback();
+        assert_eq!(new_orders(), before, "a rollback counts nothing");
+        assert!(!pending.in_transaction());
 
-        let mut pending = Pending::default();
-        pending.note(Kind::NewOrder);
-        pending.note(Kind::NewOrder);
+        pending.begin();
+        pending.statement(Kind::NewOrder);
+        pending.statement(Kind::NewOrder);
         pending.commit();
         assert_eq!(new_orders(), before + 2, "two NewOrders, one commit");
+
+        // **Autocommit is a transaction per statement**, on both protocols.
+        let before = new_orders();
+        pending.statement(Kind::NewOrder);
+        assert_eq!(new_orders(), before + 1, "a statement outside one commits");
     }
 
     /// The counters a client reads are the ones the statements counted, and the line on
@@ -835,9 +854,7 @@ mod tests {
         let payments = STATS.payment.load(Ordering::Relaxed);
         note_commit();
         note_rollback();
-        let mut pending = Pending::default();
-        pending.note(Kind::Payment);
-        pending.commit();
+        Pending::default().statement(Kind::Payment);
 
         assert!(com_commit() > commits, "a commit is counted");
         assert!(com_rollback() > 0);

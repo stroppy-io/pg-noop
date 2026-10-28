@@ -342,15 +342,14 @@ impl Conn {
     fn note_transaction(&mut self, kind: &PlanKind, failed: bool) {
         match kind {
             PlanKind::Begin if self.tx_status == TxStatus::Idle => {
-                self.tx_status = TxStatus::InTransaction
+                self.tx_status = TxStatus::InTransaction;
+                self.pending.begin();
             }
             PlanKind::Commit if failed => {
                 // Committing a failed transaction rolls it back, and the tag says so:
-                // its statements never happened, and the counter says the same thing
-                // the tag does.
+                // its statements never happened, and the rollback is counted.
                 self.tx_status = TxStatus::Idle;
-                self.pending.discard();
-                crate::tpcc::note_rollback();
+                self.pending.rollback();
             }
             PlanKind::Commit => {
                 self.tx_status = TxStatus::Idle;
@@ -358,8 +357,7 @@ impl Conn {
             }
             PlanKind::Rollback => {
                 self.tx_status = TxStatus::Idle;
-                self.pending.discard();
-                crate::tpcc::note_rollback();
+                self.pending.rollback();
             }
             _ => {}
         }
@@ -389,14 +387,9 @@ impl Conn {
         let Some(kind) = crate::tpcc::statement_kind(sql) else {
             return;
         };
-        self.pending.note(kind);
-
-        // Autocommit: a counted statement outside a transaction is one transaction of
-        // its own, and commits when it is answered -- the same rule MySQL follows, so a
-        // client that never says BEGIN still moves the commit counter a TPM check reads
-        if self.tx_status == TxStatus::Idle {
-            self.pending.commit();
-        }
+        // `Pending` owns the rule, including autocommit: a statement outside a
+        // transaction commits as it is answered.
+        self.pending.statement(kind);
     }
 
     /// Whether the session is in a failed transaction, where everything but COMMIT and

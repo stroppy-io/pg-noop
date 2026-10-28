@@ -162,8 +162,6 @@ pub struct Conn {
     /// Ids are not reused: a client that closed one and executes it again gets "unknown
     /// statement" rather than another statement's answer.
     next_stmt: u32,
-    /// `SERVER_STATUS_IN_TRANS`: a transaction is open.
-    in_trans: bool,
     /// What this connection has done in the open transaction, counted when it commits
     /// and dropped if it rolls back.
     pending: tpcc::Pending,
@@ -184,7 +182,6 @@ impl Conn {
             partial: Vec::new(),
             stmts: HashMap::new(),
             next_stmt: 1,
-            in_trans: false,
             pending: tpcc::Pending::default(),
         }
     }
@@ -202,7 +199,7 @@ impl Conn {
     /// The status flags every answer carries.
     fn status(&self, more: bool) -> u16 {
         let mut status = AUTOCOMMIT;
-        if self.in_trans {
+        if self.pending.in_transaction() {
             status |= IN_TRANS;
         }
         if more {
@@ -349,8 +346,7 @@ impl Conn {
             // A connection that changes user or is reset starts over: no open
             // transaction, no prepared statements.
             cmd::CHANGE_USER | cmd::RESET_CONNECTION => {
-                self.in_trans = false;
-                self.pending.discard();
+                self.pending.rollback();
                 self.stmts.clear();
                 let status = self.status(false);
                 result::ok(out, &mut self.seq, 0, 0, status);
@@ -472,27 +468,13 @@ impl Conn {
     fn apply(&mut self, answer: &Answer) {
         match answer.tx {
             Tx::None => {}
-            Tx::Begin => self.in_trans = true,
-            Tx::Commit => {
-                self.in_trans = false;
-                // Counted here, not when the statement ran: a NewOrder that is rolled
-                // back raises no district's next order id, and counting it when it ran
-                // inflated NOPM by every failed transaction.
-                self.pending.commit();
-            }
-            Tx::Rollback => {
-                self.in_trans = false;
-                self.pending.discard();
-                tpcc::note_rollback();
-            }
+            Tx::Begin => self.pending.begin(),
+            Tx::Commit => self.pending.commit(),
+            Tx::Rollback => self.pending.rollback(),
         }
 
         if let Some(kind) = answer.kind {
-            self.pending.note(kind);
-            // Autocommit is a transaction per statement.
-            if !self.in_trans {
-                self.pending.commit();
-            }
+            self.pending.statement(kind);
         }
     }
 
