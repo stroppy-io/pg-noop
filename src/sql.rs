@@ -1,6 +1,9 @@
 //! The little SQL this server reads: the first word, the select list, the
 //! statement boundaries and the placeholders. Nothing here interprets a value.
 
+/// What the MySQL handshake calls itself, which `@@version` answers.
+pub const SERVER_VERSION: &str = "8.0.0-db-noop";
+
 /// A comma- or semicolon-level split, with the delimiters left out.
 fn split_on(text: &str, delimiter: u8, parens: bool) -> Vec<&str> {
     let bytes = text.as_bytes();
@@ -19,7 +22,7 @@ fn split_on(text: &str, delimiter: u8, parens: bool) -> Vec<&str> {
                 depth = depth.saturating_sub(1);
                 i += 1;
             }
-            b'\'' | b'"' | b'`' => i = skip_quoted(bytes, i),
+            b'\'' | b'"' | b'`' | b'$' => i = skip_literal(bytes, i),
             b'-' | b'#' | b'/' => match skip_comment(bytes, i) {
                 Some(next) => i = next,
                 None => i += 1,
@@ -56,7 +59,7 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
 
     while i < bytes.len() {
         match bytes[i] {
-            b'\'' | b'"' | b'`' => i = skip_quoted(bytes, i),
+            b'\'' | b'"' | b'`' | b'$' => i = skip_literal(bytes, i),
             b'-' | b'#' | b'/' => match skip_comment(bytes, i) {
                 Some(next) => i = next,
                 None => i += 1,
@@ -133,7 +136,7 @@ pub fn count_placeholders(sql: &str) -> u16 {
 
     while i < bytes.len() {
         match bytes[i] {
-            b'\'' | b'"' | b'`' => i = skip_quoted(bytes, i),
+            b'\'' | b'"' | b'`' | b'$' => i = skip_literal(bytes, i),
             b'-' | b'#' | b'/' => match skip_comment(bytes, i) {
                 Some(next) => i = next,
                 None => i += 1,
@@ -167,7 +170,7 @@ pub fn find_keyword(sql: &str, from: usize, keyword: &str) -> Option<usize> {
                 depth = depth.saturating_sub(1);
                 i += 1;
             }
-            b'\'' | b'"' | b'`' => i = skip_quoted(bytes, i),
+            b'\'' | b'"' | b'`' | b'$' => i = skip_literal(bytes, i),
             b'-' | b'#' | b'/' => match skip_comment(bytes, i) {
                 Some(next) => i = next,
                 None => i += 1,
@@ -346,7 +349,7 @@ fn strip_trailing_comment(item: &str) -> &str {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'\'' | b'"' | b'`' => i = skip_quoted(bytes, i),
+            b'\'' | b'"' | b'`' | b'$' => i = skip_literal(bytes, i),
             b'-' | b'#' | b'/' => match skip_comment(bytes, i) {
                 Some(_) => return &item[..i],
                 None => i += 1,
@@ -397,7 +400,7 @@ fn variable(name: &str) -> Option<(String, ConstantKind)> {
     let number = |value: &str| Some((value.to_string(), ConstantKind::Integer));
 
     match name.to_ascii_lowercase().as_str() {
-        "version" => text(crate::mysql::SERVER_VERSION),
+        "version" => text(SERVER_VERSION),
         "version_comment" => text("db-noop: a no-op server for measuring clients"),
         "max_allowed_packet" => number("16777216"),
         "autocommit" => number("1"),
@@ -425,6 +428,139 @@ fn variable(name: &str) -> Option<(String, ConstantKind)> {
         "have_query_cache" => text("NO"),
         _ => number("1"),
     }
+}
+
+/// Skip a literal or a quoted identifier, returning the offset after it.
+///
+/// `$tag$ ... $tag$` is PostgreSQL's other literal, and its body may hold
+/// anything, semicolons included.
+pub fn skip_literal(bytes: &[u8], i: usize) -> usize {
+    match bytes.get(i) {
+        Some(b'\'' | b'"' | b'`') => skip_quoted(bytes, i),
+        Some(b'$') => skip_dollar(bytes, i),
+        _ => i + 1,
+    }
+}
+
+/// Skip `$tag$ ... $tag$`, `i` at its opening `$`. A `$` that opens no tag is a
+/// single byte.
+fn skip_dollar(bytes: &[u8], i: usize) -> usize {
+    let mut end = i + 1;
+    while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+        end += 1;
+    }
+    if bytes.get(end) != Some(&b'$') {
+        return i + 1;
+    }
+
+    let open = &bytes[i..=end];
+    let mut j = end + 1;
+    while j + open.len() <= bytes.len() {
+        if &bytes[j..j + open.len()] == open {
+            return j + open.len();
+        }
+        j += 1;
+    }
+
+    bytes.len()
+}
+
+/// Tokens of a statement: words, quoted strings and parenthesised groups.
+///
+/// A COPY's options and a column list are read through this: a group is one
+/// token, so a comma inside it is not a separator.
+#[allow(clippy::should_implement_trait)] // a cursor over SQL, not an Iterator
+pub struct Tokens<'a> {
+    rest: &'a str,
+}
+
+#[allow(clippy::should_implement_trait)] // a cursor over SQL, not an Iterator
+impl<'a> Tokens<'a> {
+    pub fn new(sql: &'a str) -> Self {
+        Tokens { rest: sql }
+    }
+
+    pub fn next_is(&mut self, word: &str) -> bool {
+        matches!(self.next(), Some(w) if w.eq_ignore_ascii_case(word))
+    }
+
+    pub fn next(&mut self) -> Option<&'a str> {
+        loop {
+            self.rest = self
+                .rest
+                .trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ';');
+            if self.rest.is_empty() {
+                return None;
+            }
+            match skip_comment(self.rest.as_bytes(), 0) {
+                Some(next) if next > 0 => {
+                    self.rest = &self.rest[next..];
+
+                    continue;
+                }
+                _ => break,
+            }
+        }
+
+        let bytes = self.rest.as_bytes();
+        let word = match bytes[0] {
+            b'\'' | b'"' | b'`' | b'$' => {
+                let end = skip_literal(bytes, 0).max(1).min(bytes.len());
+
+                &self.rest[..end]
+            }
+            b'(' => {
+                let end = matching_paren(bytes, 0).unwrap_or(bytes.len());
+
+                &self.rest[..end]
+            }
+            _ => {
+                let end = (0..bytes.len())
+                    .find(|&i| {
+                        bytes[i].is_ascii_whitespace()
+                            || bytes[i] == b'('
+                            || bytes[i] == b';'
+                            || skip_comment(bytes, i).is_some()
+                    })
+                    .unwrap_or(bytes.len())
+                    .max(1);
+
+                &self.rest[..end]
+            }
+        };
+        self.rest = &self.rest[word.len()..];
+
+        Some(word)
+    }
+}
+
+/// The offset after the `)` matching the `(` at `open`, if there is one.
+pub fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth = depth.checked_sub(1)?;
+                i += 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b'\'' | b'"' | b'`' | b'$' => i = skip_literal(bytes, i),
+            b'-' | b'#' | b'/' => match skip_comment(bytes, i) {
+                Some(next) => i = next,
+                None => i += 1,
+            },
+            _ => i += 1,
+        }
+    }
+
+    None
 }
 
 /// Skip a quoted run, `i` at its opening quote.
@@ -463,12 +599,22 @@ pub fn skip_comment(bytes: &[u8], i: usize) -> Option<usize> {
         b'#' => Some(line_end(bytes, i + 1)),
         b'-' if bytes.get(i + 1) == Some(&b'-') => Some(line_end(bytes, i + 2)),
         b'/' if bytes.get(i + 1) == Some(&b'*') => {
+            // PostgreSQL's block comments nest.
+            let mut depth = 1;
             let mut j = i + 2;
             while j + 1 < bytes.len() {
-                if bytes[j] == b'*' && bytes[j + 1] == b'/' {
-                    return Some(j + 2);
+                if bytes[j] == b'/' && bytes[j + 1] == b'*' {
+                    depth += 1;
+                    j += 2;
+                } else if bytes[j] == b'*' && bytes[j + 1] == b'/' {
+                    depth -= 1;
+                    j += 2;
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                } else {
+                    j += 1;
                 }
-                j += 1;
             }
 
             Some(bytes.len())
@@ -560,7 +706,7 @@ impl<'a> Iterator for Words<'a> {
             }
             match bytes[self.pos] {
                 // A literal or a quoted identifier is not a word.
-                b'\'' | b'"' | b'`' => self.pos = skip_quoted(bytes, self.pos),
+                b'\'' | b'"' | b'`' | b'$' => self.pos = skip_literal(bytes, self.pos),
                 c if is_word_byte(c) => {
                     let end = word_end(bytes, self.pos).unwrap_or(bytes.len());
                     let word = &sql[self.pos..end];
@@ -697,6 +843,31 @@ mod tests {
         assert_eq!(sql_prepare("PREPARE AS select 1"), None, "no name");
         assert_eq!(sql_prepare("select 1"), None);
         assert_eq!(sql_prepare("DEALLOCATE neword"), None);
+    }
+
+    /// **A dollar-quoted body is one literal**, and may hold anything.
+    #[test]
+    fn a_dollar_quoted_body_is_one_literal() {
+        assert_eq!(
+            split_statements("select $$ a; b $$; select 2"),
+            vec!["select $$ a; b $$", " select 2"]
+        );
+        assert_eq!(
+            split_statements("select $fn$ a; b $fn$, 1 from t"),
+            vec!["select $fn$ a; b $fn$, 1 from t"]
+        );
+        assert_eq!(split_top_level("$q$a,b$q$, c"), vec!["$q$a,b$q$", " c"]);
+        assert_eq!(skip_literal(b"$q$a;b$q$ tail", 0), 9);
+    }
+
+    /// **A leading comment is not a word.** `/* x */ INSERT` classified as
+    /// unknown text on PostgreSQL, because its scanner started at the comment.
+    #[test]
+    fn a_leading_comment_is_not_the_first_word() {
+        assert_eq!(first_word("/* x */ insert into t values (1)"), "insert");
+        assert_eq!(first_word("-- x\ninsert into t values (1)"), "insert");
+        assert_eq!(first_word("/* a /* nested */ b */ select 1"), "select");
+        assert_eq!(first_word("  # x\nupdate t set a = 1"), "update");
     }
 
     /// The words of a statement skip literals, identifiers and comments, so a keyword

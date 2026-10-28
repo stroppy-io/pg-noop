@@ -181,15 +181,6 @@ fn starts_with_keyword(sql: &str, kw: &str) -> bool {
 /// The leading alphabetic keyword of `sql`, as a slice into it -- no allocation.
 /// Matching the first word in place answers the same questions, and is strictly more
 /// precise: `starts_with` also accepted "SELECTED" as a SELECT.
-fn first_keyword(sql: &str) -> &str {
-    let rest = sql.trim_start();
-    let end = rest
-        .find(|c: char| !c.is_ascii_alphabetic())
-        .unwrap_or(rest.len());
-
-    &rest[..end]
-}
-
 /// Pre-built stub field vectors for the column counts a benchmark actually produces.
 /// `stub_fields` allocated an Arc, a Vec and a String per column on every SELECT that
 /// was not a metadata select -- which is every `select 1`.
@@ -368,7 +359,7 @@ pub(crate) fn copy_format(sql: &str) -> CopyFormat {
         }
         if let Some(inner) = word.strip_prefix('(') {
             let inner = inner.strip_suffix(')').unwrap_or(inner);
-            for option in split_top_level_commas(inner) {
+            for option in crate::sql::split_top_level(inner) {
                 let mut kv = SqlWords::new(option);
                 if kv.next_is("FORMAT") {
                     return match kv.next().map(|v| v.trim_matches('\'')) {
@@ -386,37 +377,6 @@ pub(crate) fn copy_format(sql: &str) -> CopyFormat {
 
 /// The comma-separated pieces of an option list, ignoring commas inside quotes and
 /// nested parentheses.
-fn split_top_level_commas(inner: &str) -> Vec<&str> {
-    let b = inner.as_bytes();
-    let mut pieces = Vec::new();
-    let mut start = 0;
-    let mut depth = 0i32;
-    let mut quote: Option<u8> = None;
-
-    for (i, &c) in b.iter().enumerate() {
-        match quote {
-            Some(q) => {
-                if c == q {
-                    quote = None;
-                }
-            }
-            None => match c {
-                b'\'' | b'"' => quote = Some(c),
-                b'(' => depth += 1,
-                b')' => depth -= 1,
-                b',' if depth == 0 => {
-                    pieces.push(&inner[start..i]);
-                    start = i + 1;
-                }
-                _ => {}
-            },
-        }
-    }
-    pieces.push(&inner[start..]);
-
-    pieces
-}
-
 /// Walks a SQL statement and yields one word at a time.
 struct SqlWords<'a> {
     rest: &'a str,
@@ -432,163 +392,40 @@ impl<'a> SqlWords<'a> {
     }
 
     fn next(&mut self) -> Option<&'a str> {
-        // Whitespace, statement separators and COMMENTS are all between words.
         loop {
             self.rest = self
                 .rest
                 .trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ';');
-
-            if let Some(after) = self.rest.strip_prefix("--") {
-                self.rest = after.find('\n').map_or("", |i| &after[i + 1..]);
-                continue;
+            if self.rest.is_empty() {
+                return None;
             }
-
-            if self.rest.starts_with("/*") {
-                self.rest = skip_block_comment(self.rest);
-                continue;
+            match crate::sql::skip_comment(self.rest.as_bytes(), 0) {
+                Some(next) if next > 0 => self.rest = &self.rest[next..],
+                _ => break,
             }
-
-            break;
         }
 
-        let mut chars = self.rest.char_indices();
-
-        let (_, first) = chars.next()?;
-
-        // A quoted identifier or string: one word, up to its closing quote.
-        if first == '"' || first == '\'' {
-            let mut end = None;
-            let mut i = 1;
-
-            while i < self.rest.len() {
-                if self.rest.as_bytes()[i] == first as u8 {
-                    // A doubled quote is an escaped one, not the end.
-                    if self.rest.as_bytes().get(i + 1) == Some(&(first as u8)) {
-                        i += 2;
-
-                        continue;
-                    }
-
-                    end = Some(i + 1);
-
-                    break;
-                }
-
-                i += 1;
+        let bytes = self.rest.as_bytes();
+        let end = match bytes[0] {
+            b'\'' | b'"' | b'`' | b'$' => {
+                crate::sql::skip_literal(bytes, 0).max(1).min(bytes.len())
             }
-
-            let end = end.unwrap_or(self.rest.len());
-            let word = &self.rest[..end];
-            self.rest = &self.rest[end..];
-
-            return Some(word);
-        }
-
-        // A parenthesised group: skipped whole, so a comma inside does not become a
-        // word and a newline inside does not end the search.
-        if first == '(' {
-            let end = group_end(self.rest);
-            let word = &self.rest[..end];
-            self.rest = &self.rest[end..];
-
-            return Some(word);
-        }
-
-        // A word ends at whitespace, a parenthesis, a semicolon -- or the start of a
-        // comment.
-        let b = self.rest.as_bytes();
-        let end = (0..b.len())
-            .find(|&i| {
-                b[i].is_ascii_whitespace()
-                    || b[i] == b'('
-                    || b[i] == b';'
-                    || (b[i] == b'-' && b.get(i + 1) == Some(&b'-'))
-                    || (b[i] == b'/' && b.get(i + 1) == Some(&b'*'))
-            })
-            .unwrap_or(b.len());
-
-        // Never an empty word: a lone `/` or `-` at the start is itself.
-        let end = end.max(1).min(self.rest.len());
+            b'(' => crate::sql::matching_paren(bytes, 0).unwrap_or(bytes.len()),
+            _ => (0..bytes.len())
+                .find(|&i| {
+                    bytes[i].is_ascii_whitespace()
+                        || bytes[i] == b'('
+                        || bytes[i] == b';'
+                        || crate::sql::skip_comment(bytes, i).is_some()
+                })
+                .unwrap_or(bytes.len())
+                .max(1),
+        };
         let word = &self.rest[..end];
         self.rest = &self.rest[end..];
 
         Some(word)
     }
-}
-
-/// The index just past the parenthesis matching the `(` that starts `s`, or the end of
-/// `s` when it is unbalanced.
-fn group_end(s: &str) -> usize {
-    let b = s.as_bytes();
-    let mut depth = 0usize;
-    let mut i = 0;
-
-    while i < b.len() {
-        match b[i] {
-            b'\'' | b'"' => {
-                let q = b[i];
-                i += 1;
-                while i < b.len() {
-                    if b[i] == q {
-                        if b.get(i + 1) == Some(&q) {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b'-' if b.get(i + 1) == Some(&b'-') => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-                continue;
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                let rest = skip_block_comment(&s[i..]);
-                i = s.len() - rest.len();
-                continue;
-            }
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return i + 1;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-
-    b.len()
-}
-
-/// The text after a `/* ...
-/// */` comment that starts `s`, nested as PostgreSQL nests them.
-/// An unterminated comment swallows the rest, as it does there.
-fn skip_block_comment(s: &str) -> &str {
-    let b = s.as_bytes();
-    let mut depth = 0usize;
-    let mut i = 0;
-
-    while i < b.len() {
-        if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
-            depth += 1;
-            i += 2;
-        } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
-            depth -= 1;
-            i += 2;
-            if depth == 0 {
-                return &s[i..];
-            }
-        } else {
-            i += 1;
-        }
-    }
-
-    ""
 }
 
 /// Counts columns in `COPY table (col1, col2) FROM STDIN` by finding the paren-group
@@ -614,7 +451,7 @@ pub(crate) fn count_copy_columns(sql: &str) -> usize {
                 return 1;
             }
 
-            return count_top_level_commas(inner) + 1;
+            return crate::sql::split_top_level(inner).len();
         }
 
         // The direction keyword, with no column list between the table and it.
@@ -625,30 +462,6 @@ pub(crate) fn count_copy_columns(sql: &str) -> usize {
 }
 
 /// Commas that separate items, not commas inside a nested group or a quoted name.
-fn count_top_level_commas(s: &str) -> usize {
-    let mut depth = 0usize;
-    let mut quote: Option<char> = None;
-    let mut commas = 0usize;
-
-    for c in s.chars() {
-        match quote {
-            Some(q) => {
-                if c == q {
-                    quote = None;
-                }
-            }
-            None => match c {
-                '\'' | '"' => quote = Some(c),
-                '(' => depth += 1,
-                ')' => depth = depth.saturating_sub(1),
-                ',' if depth == 0 => commas += 1,
-                _ => {}
-            },
-        }
-    }
-
-    commas
-}
 
 #[derive(Debug, Clone)]
 pub struct SelectColumn {
@@ -826,102 +639,50 @@ fn placeholders(sql: &str) -> Result<Vec<(usize, usize)>, PlaceholderError> {
     let mut i = 0;
 
     while i < b.len() {
-        let c = b[i];
+        match b[i] {
+            b'\'' | b'"' => {
+                i = crate::sql::skip_literal(b, i);
 
-        // -- to end of line.
-        if c == b'-' && b.get(i + 1) == Some(&b'-') {
-            i += 2;
-            while i < b.len() && b[i] != b'\n' {
-                i += 1;
+                continue;
             }
-            continue;
-        }
+            b'-' | b'#' | b'/' => {
+                if let Some(next) = crate::sql::skip_comment(b, i) {
+                    i = next;
 
-        // /* ...
-        // */, nested.
-        if c == b'/' && b.get(i + 1) == Some(&b'*') {
-            let mut depth = 1;
-            i += 2;
-            while i < b.len() && depth > 0 {
-                if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
-                    depth += 1;
-                    i += 2;
-                } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            continue;
-        }
-
-        // 'string' and "identifier": doubled quotes are one quote.
-        // An E'...' string also escapes with a backslash.
-        if c == b'\'' || c == b'"' {
-            let escapes = c == b'\''
-                && i > 0
-                && matches!(b[i - 1], b'E' | b'e')
-                && (i == 1 || !is_ident_continue(b[i - 2]));
-            i += 1;
-            while i < b.len() {
-                if escapes && b[i] == b'\\' {
-                    i += 2;
                     continue;
                 }
-                if b[i] == c {
-                    if b.get(i + 1) == Some(&c) {
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
                 i += 1;
-            }
-            continue;
-        }
 
-        if c == b'$' {
-            // $n: the placeholder.
-            if b.get(i + 1).is_some_and(u8::is_ascii_digit) {
-                let start = i + 1;
-                let mut end = start;
-                let mut n: usize = 0;
-                while end < b.len() && b[end].is_ascii_digit() {
-                    n = n
-                        .saturating_mul(10)
-                        .saturating_add(usize::from(b[end] - b'0'));
-                    end += 1;
-                }
-                if n == 0 {
-                    return Err(PlaceholderError::Zero);
-                }
-                if n > MAX_PARAMETERS {
-                    return Err(PlaceholderError::TooMany);
-                }
-                found.push((n, end));
-                i = end;
                 continue;
             }
+            b'$' => {
+                if b.get(i + 1).is_some_and(u8::is_ascii_digit) {
+                    let start = i + 1;
+                    let mut end = start;
+                    let mut n: usize = 0;
+                    while end < b.len() && b[end].is_ascii_digit() {
+                        n = n
+                            .saturating_mul(10)
+                            .saturating_add(usize::from(b[end] - b'0'));
+                        end += 1;
+                    }
+                    if n == 0 {
+                        return Err(PlaceholderError::Zero);
+                    }
+                    if n > MAX_PARAMETERS {
+                        return Err(PlaceholderError::TooMany);
+                    }
+                    found.push((n, end));
+                    i = end;
 
-            // $tag$ ...
-            // $tag$: skip to the matching close.
-            let tag_end = (i + 1..b.len())
-                .find(|&k| !(b[k].is_ascii_alphanumeric() || b[k] == b'_'))
-                .unwrap_or(b.len());
-            if b.get(tag_end) == Some(&b'$') {
-                let open = &sql[i..=tag_end];
-                let body = tag_end + 1;
-                match sql[body..].find(open) {
-                    Some(close) => i = body + close + open.len(),
-                    None => i = b.len(),
+                    continue;
                 }
+                i = crate::sql::skip_literal(b, i);
+
                 continue;
             }
+            _ => i += 1,
         }
-
-        i += 1;
     }
 
     Ok(found)
@@ -1460,7 +1221,7 @@ pub struct PreparedPlan {
 
 impl PreparedPlan {
     pub fn build(sql: &str) -> Self {
-        let head = first_keyword(sql);
+        let head = crate::sql::first_word(sql);
 
         let kind = if head.eq_ignore_ascii_case("SELECT")
             || head.eq_ignore_ascii_case("WITH")
@@ -1616,7 +1377,7 @@ fn respond_to_plan(handler: &NoopHandler, plan: &PreparedPlan) -> Response {
 fn classify_simple(handler: &NoopHandler, sql: &str) -> Vec<Response> {
     handler.apply_schema_change(sql);
 
-    let head = first_keyword(sql);
+    let head = crate::sql::first_word(sql);
     if head.eq_ignore_ascii_case("SELECT")
         || head.eq_ignore_ascii_case("WITH")
         || head.eq_ignore_ascii_case("TABLE")
@@ -1683,7 +1444,7 @@ fn vector_for_copy(sql: &str) -> Vec<Response> {
 fn classify_extended(handler: &NoopHandler, sql: &str) -> Response {
     handler.apply_schema_change(sql);
 
-    let head = first_keyword(sql);
+    let head = crate::sql::first_word(sql);
     if head.eq_ignore_ascii_case("SELECT")
         || head.eq_ignore_ascii_case("WITH")
         || head.eq_ignore_ascii_case("TABLE")
@@ -2140,6 +1901,29 @@ mod placeholder_tests {
 
     fn count(sql: &str) -> usize {
         parameter_types(sql, &[]).expect(sql).len()
+    }
+
+    /// **A leading comment does not hide the statement.** The keyword scanner
+    /// started at the comment, so `/* x */ INSERT` classified as unknown text and
+    /// PostgreSQL answered `SELECT 0` where MySQL answered the insert.
+    #[test]
+    fn a_leading_comment_does_not_hide_the_statement() {
+        for (sql, want) in [
+            ("/* x */ insert into t values (1)", "insert"),
+            ("-- x\nupdate t set a = 1", "update"),
+            ("/* a /* nested */ b */ delete from t", "delete"),
+        ] {
+            assert_eq!(crate::sql::first_word(sql), want, "{sql}");
+            let plan = PreparedPlan::build(sql);
+            assert!(
+                matches!(
+                    plan.kind,
+                    PlanKind::Insert | PlanKind::Update | PlanKind::Delete
+                ),
+                "{sql} classified as {:?}",
+                plan.kind
+            );
+        }
     }
 
     /// `$n` is a placeholder only where SQL would read one.
