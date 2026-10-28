@@ -187,6 +187,22 @@ not SQL: each rule is the shape of a statement, matched on its own words.
 | `select sum(d_next_o_id) from district` (any case and spacing, optional schema prefix, `district` or `tpcc_district`, nothing after the table) | One row: `3001 × districts + NewOrders seen` |
 | `show global status` [`like '<pattern>'`] | A result set of `Com_commit` and `Com_rollback` (MySQL's `%`/`_` matching) |
 | `select @a, @b` (variables only) | One row, one column per variable, every value `1` |
+| A select list of literals and `@@variables` (`select 1`, `select @@version`) | One row of exactly those values |
+
+**A row where a row can be stated.** `select 1` answers one row (`1`), because a
+constant select list is a value the server knows without knowing anything else —
+PostgreSQL has always answered one here, and an empty answer made `mariadb -e
+'select 1'` print nothing at all. A select list that names a table, a column or a
+function keeps its empty result set, and a statement executed as a prepared
+statement answers its rows in the **binary protocol** (a `0x00` header, a NULL
+bitmap, and each value in its type's binary form), which is what a client that
+prepared it decodes.
+
+System variables a client reads at connect answer plausible values rather than an
+empty set: `@@version` (`8.0.0-db-noop`), `@@max_allowed_packet` (`16777216`),
+`@@autocommit` (`1`), `@@tx_isolation`/`@@transaction_isolation`
+(`REPEATABLE-READ`), `@@character_set_*` (`utf8mb4`), the timeouts (`28800`), and
+`1` for anything this server has not heard of.
 
 `districts` is ten per warehouse, and `--warehouses` says how many there are (ten
 by default, which is HammerDB's own default schema). A statement outside a
