@@ -230,7 +230,8 @@ impl Formats {
 struct Portal {
     statement: Arc<Statement>,
     formats: Formats,
-    /// Whether the portal has been read to its end.
+    /// Whether the portal has no rows left to send: a suspended single-row answer
+    /// has none, its row having gone out with the `PortalSuspended`.
     consumed: bool,
 }
 
@@ -1354,10 +1355,11 @@ impl Conn {
 /// The rows and the completion tag for one plan.
 /// A FREE function, not a method: it never needed `self`, and being a method is what
 /// forced a deep clone of the plan at every Execute.
-/// Answer one execution, and say whether the portal is now read to its end.
+/// Answer one execution, and say whether the portal has rows left to send.
 ///
-/// `false` is a `PortalSuspended`: the client asked for fewer rows than the answer
-/// has, so the next Execute is owed the rest.
+/// A single-row answer suspended by `max_rows` has none: the row went out with the
+/// `PortalSuspended`, so the next Execute short of closing the portal answers
+/// `SELECT 0`, which is what PostgreSQL does too.
 fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Run<'_>) -> bool {
     // The statements answered with a number are the TPC-C profile's.
     if let Some((name, value)) = crate::tpcc::number_query(&plan.sql) {
@@ -1389,9 +1391,7 @@ fn answer(plan: &PreparedPlan, out: &mut Vec<u8>, catalog: &CatalogView, run: Ru
             if run.max_rows == 1 {
                 portal_suspended(out);
 
-                // **A suspended portal is not read to its end**: the next Execute has
-                // the rest of it to answer.
-                return false;
+                return true;
             }
             complete(out, "SELECT", Some(1));
 
@@ -1506,7 +1506,7 @@ fn status_answer(out: &mut Vec<u8>, run: Run<'_>, filter: Option<&str>) -> bool 
     if run.max_rows > 0 && written >= run.max_rows as u64 {
         portal_suspended(out);
 
-        return false;
+        return true;
     }
     complete(out, "SELECT", Some(written));
 
@@ -1546,7 +1546,7 @@ fn number_answer(out: &mut Vec<u8>, run: Run<'_>, name: &str, value: u64) -> boo
     if run.max_rows == 1 {
         portal_suspended(out);
 
-        return false;
+        return true;
     }
     complete(out, "SELECT", Some(1));
 
@@ -1586,7 +1586,7 @@ struct Run<'a> {
     formats: &'a Formats,
     /// Execute's row limit; zero is none.
     max_rows: i32,
-    /// Whether the portal was already read to its end.
+    /// Whether the portal has no rows left to send.
     consumed: bool,
 }
 
@@ -2837,64 +2837,6 @@ mod tests {
             "and the Sync after it is still answered, so the stream is in sync"
         );
         assert!(framed < input.len());
-    }
-
-    /// **A suspended portal is not a consumed one.** Execute with a row limit
-    /// answers `PortalSuspended`, and the next Execute is owed the rest; recording
-    /// the portal as read to its end made that second answer `SELECT 0`.
-    #[test]
-    fn a_suspended_portal_answers_again() {
-        let (mut c, v) = connected();
-        let mut out = Vec::new();
-        c.advance(
-            &tagged(b'P', |b| {
-                cstr(b, "s");
-                cstr(b, "select 1");
-                b.extend_from_slice(&0i16.to_be_bytes());
-            }),
-            &mut out,
-            &v,
-        );
-        c.advance(
-            &tagged(b'B', |b| {
-                cstr(b, "");
-                cstr(b, "s");
-                b.extend_from_slice(&0i16.to_be_bytes());
-                b.extend_from_slice(&0i16.to_be_bytes());
-                b.extend_from_slice(&0i16.to_be_bytes());
-            }),
-            &mut out,
-            &v,
-        );
-
-        let mut out = Vec::new();
-        c.advance(
-            &tagged(b'E', |b| {
-                cstr(b, "");
-                b.extend_from_slice(&1i32.to_be_bytes());
-            }),
-            &mut out,
-            &v,
-        );
-        assert_eq!(out[0], b'D', "the row: {out:?}");
-        assert!(
-            out.windows(5).any(|w| w == [b's', 0, 0, 0, 4]),
-            "PortalSuspended: {out:?}"
-        );
-
-        let mut out = Vec::new();
-        c.advance(
-            &tagged(b'E', |b| {
-                cstr(b, "");
-                b.extend_from_slice(&1i32.to_be_bytes());
-            }),
-            &mut out,
-            &v,
-        );
-        assert_eq!(
-            out[0], b'D',
-            "the same portal answers again, not SELECT 0: {out:?}"
-        );
     }
 
     /// **An injected failure is an error through Parse/Bind/Execute too.**
