@@ -2,6 +2,10 @@
 name = "db-noop"
 version = "0.3.0"
 edition = "2021"
+# The floor its dependencies set: pgwire 0.38 and smol_str 0.3 both declare
+# 1.89, so a build on anything older fails here, in cargo's own words, rather
+# than in a container whose image was pinned too low.
+rust-version = "1.89"
 description = "NoOp PostgreSQL and MySQL/MariaDB server for measuring benchmark clients"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/stroppy-io/pg-noop"
