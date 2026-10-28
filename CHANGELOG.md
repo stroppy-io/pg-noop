@@ -28,6 +28,27 @@ server keep working.
 - A stored routine's `BEGIN … END` body is one statement, however many
   semicolons it holds.
 
+### What it answers
+
+- **One answer shape on both protocols.** A literal, `@var` or `@@var` select
+  answers one row of exactly those values; anything that names a table, a column
+  or a function answers its columns and no rows; `INSERT`/`UPDATE`/`DELETE` answer
+  `INSERT 0 0`, `UPDATE 0`, `DELETE 0`. PostgreSQL's row of `1`s for an unseen
+  table -- which made the same client find every item on one protocol and nothing
+  on the other -- is gone.
+- **A transaction is counted when it commits**, not when its statement runs, and a
+  rollback counts nothing. Autocommit is one transaction per statement on both
+  protocols, so a client that never says `BEGIN` still moves the counters a TPM
+  check reads.
+- **The failures a client injects are errors**: `SIGNAL SQLSTATE`, a NULL written
+  into a NOT NULL column, a `RAISE`, and a `CALL` of a procedure with no rule.
+  Answering OK to them turned every injected rollback into a commit.
+- **SQL `PREPARE name AS body` registers the name** for Bind/Execute, which is how
+  HammerDB's PostgreSQL TPC-C prepares at login.
+- **`--profile tpcc`** turns on the synthetic numbers (the district sum, population
+  counts, `pg_stat_database`, `show global status`'s values); off by default, and
+  the stats line says `synthetic NOPM` when it is on.
+
 ### TPC-C
 
 - **A rule set, so a TPC-C client can report a throughput**: transactions are
