@@ -939,6 +939,31 @@ impl Conn {
                     return Some(());
                 }
 
+                // **A failure the client asked for is an error**, so its own
+                // error handling and its rollback run -- and a rollback counts
+                // nothing. An OK here made every injected rollback a commit.
+                if let Some(failure) = crate::tpcc::failure(sql) {
+                    let (code, message) = match failure {
+                        crate::tpcc::Failure::Signal(code) => {
+                            (code, "injected failure".to_string())
+                        }
+                        crate::tpcc::Failure::Null => (
+                            "23502".to_string(),
+                            "null value in a column that is not null".to_string(),
+                        ),
+                        crate::tpcc::Failure::Raise => {
+                            ("P0001".to_string(), "raise_exception".to_string())
+                        }
+                        crate::tpcc::Failure::UnknownProcedure => {
+                            ("42883".to_string(), "function does not exist".to_string())
+                        }
+                    };
+                    self.error(out, &code, &message);
+                    self.ready(out);
+
+                    return Some(());
+                }
+
                 let plan = PreparedPlan::build(sql);
 
                 // A failed transaction runs nothing until it is ended. This

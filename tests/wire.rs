@@ -1285,3 +1285,63 @@ fn a_transaction_is_counted_at_commit_on_both_protocols() {
         "and it is a commit of its own"
     );
 }
+
+/// **The failures a client injects are errors, on both protocols.**
+///
+/// A benchmark exercises its rollback path on purpose: stroppy-rust's MySQL
+/// NewOrder writes a NULL into a NOT NULL column one time in a hundred and ends
+/// the transaction with `SIGNAL SQLSTATE '45000'`, and HammerDB's PostgreSQL arm
+/// raises. A server that answers OK to all of them turns every injected rollback
+/// into a commit -- the counters move, and the client's error handling never
+/// runs -- so each one has to answer with the error the client is expecting.
+#[test]
+fn an_injected_failure_is_an_error_on_both_protocols() {
+    let server = server();
+
+    let mut mysql = Client::connect(server.mysql);
+    for (sql, code, state) in [
+        ("signal sqlstate '45000'", 1644u16, "45000"),
+        (
+            "insert into new_order (no_w_id) values (NULL)",
+            1048,
+            "23000",
+        ),
+        ("call nosuch_procedure(1, 2)", 1305, "42000"),
+    ] {
+        let answer = mysql.query(sql);
+        assert_eq!(answer.len(), 1, "{sql}: {answer:?}");
+        assert_eq!(answer[0].body[0], 0xff, "{sql} must be an error");
+        let (got, message) = answer[0].error();
+        assert_eq!(got, code, "{sql}: {message}");
+        assert_eq!(&answer[0].body[4..9], state.as_bytes(), "{sql}: {message}");
+    }
+
+    let mut pg = PgClient::connect(server.postgres);
+    for (sql, state) in [
+        ("signal sqlstate '45000'", "45000"),
+        ("insert into new_order values (1, NULL, 3)", "23502"),
+        ("select raise_exception('no stock')", "P0001"),
+    ] {
+        let answer = pg.query(sql);
+        assert_eq!(answer[0].0, b'E', "{sql} must be an error: {answer:?}");
+        let text = String::from_utf8_lossy(&answer[0].1).to_string();
+        assert!(text.contains(state), "{sql}: expected {state} in {text:?}");
+    }
+
+    // And a failure inside a transaction aborts it, so the rollback the client
+    // sends next is answered -- and counts nothing.
+    let mut mysql = Client::connect(server.mysql);
+    let sum = |client: &mut Client| -> u64 {
+        let answer = client.query("select sum(d_next_o_id) from district");
+        row(&answer[2])[0].parse().expect("a number")
+    };
+    let before = sum(&mut mysql);
+    mysql.query("begin");
+    mysql.query("insert into new_order (no_w_id) values (NULL)");
+    mysql.query("rollback");
+    assert_eq!(
+        sum(&mut mysql),
+        before,
+        "the failed transaction counted nothing"
+    );
+}

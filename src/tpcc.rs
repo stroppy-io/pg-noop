@@ -256,6 +256,95 @@ pub fn line() -> String {
     line
 }
 
+/// **A failure the client asked for, and the path it exercises.**
+///
+/// A benchmark has to exercise its rollback path, and it does so by making a
+/// statement fail on purpose: stroppy-rust's MySQL NewOrder rolls back one time
+/// in a hundred by writing a NULL into a NOT NULL column, HammerDB's PostgreSQL
+/// arm raises, and a client that wants a specific error sends `SIGNAL SQLSTATE`.
+/// A no-op that answers OK to all of them turns every such rollback into a
+/// commit -- the counters move, and the client's own error handling is never run.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Failure {
+    /// `SIGNAL SQLSTATE '<code>'`: the client names the error it wants.
+    Signal(String),
+    /// A NULL written where a NOT NULL column would refuse it.
+    Null,
+    /// `RAISE`, the PostgreSQL way of failing on purpose.
+    Raise,
+    /// A `CALL` of a procedure this server has no rule for. A client that calls
+    /// something we do not know is a client whose expectations we cannot meet,
+    /// and answering OK hides that.
+    UnknownProcedure,
+}
+
+/// The failure a statement asks for, if it asks for one.
+///
+/// Deliberately mechanical: the shapes are listed here and nowhere else.
+pub fn failure(sql: &str) -> Option<Failure> {
+    let trimmed = sql::trim_leading(sql);
+    let mut words = sql::Words::new(trimmed);
+
+    // `SIGNAL [SQLSTATE] '<code>'`
+    if words
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("SIGNAL"))
+    {
+        let code = sql::quoted_argument(trimmed, "SQLSTATE")
+            .or_else(|| {
+                // `SIGNAL '<code>'` without the keyword.
+                let rest = sql::trim_leading(&trimmed["SIGNAL".len()..]);
+
+                rest.strip_prefix('\'')
+                    .and_then(|r| r.split('\'').next())
+                    .map(str::to_string)
+                    .map(|s| Box::leak(s.into_boxed_str()) as &str)
+            })
+            .unwrap_or("45000");
+
+        return Some(Failure::Signal(code.to_string()));
+    }
+
+    // `RAISE`, as a word anywhere: `select raise(...)`, `raise_exception(...)`,
+    // `raise_sqlstate(...)`. `raise_notice` is a warning and is not one.
+    if sql::Words::new(trimmed).any(|w| {
+        let lower = w.to_ascii_lowercase();
+
+        (lower == "raise" || lower.starts_with("raise_")) && lower != "raise_notice"
+    }) {
+        return Some(Failure::Raise);
+    }
+
+    // A NULL in the statement's values.
+    if writes_null(trimmed) {
+        return Some(Failure::Null);
+    }
+
+    // `CALL name(...)`: known procedures are transactions, the rest are not.
+    if let Some(first) = sql::first_word(trimmed).to_uppercase().as_str().into() {
+        let _ = first;
+    }
+    if sql::Words::new(trimmed)
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("CALL"))
+        && statement_kind(trimmed).is_none()
+    {
+        return Some(Failure::UnknownProcedure);
+    }
+
+    None
+}
+
+/// Whether an INSERT or UPDATE writes the SQL `NULL` literal into a column.
+fn writes_null(sql: &str) -> bool {
+    let head = sql::first_word(sql);
+    if !head.eq_ignore_ascii_case("INSERT") && !head.eq_ignore_ascii_case("UPDATE") {
+        return false;
+    }
+
+    sql::Words::new(sql).any(|w| w.eq_ignore_ascii_case("NULL"))
+}
+
 /// **The district sum a TPC-C client reads for NOPM.**
 ///
 /// `select sum(d_next_o_id) from district`, in any case and spacing, with an
@@ -612,6 +701,41 @@ mod tests {
         assert!(like("%commit", "Com_commit"));
         assert!(like("%", "anything"));
         assert!(!like("", "anything"));
+    }
+
+    /// **The failures a client asks for are recognised**, and nothing else is.
+    #[test]
+    fn an_injected_failure_is_recognised() {
+        assert_eq!(
+            failure("SIGNAL SQLSTATE '45000'"),
+            Some(Failure::Signal("45000".to_string()))
+        );
+        assert_eq!(
+            failure("signal '40001'"),
+            Some(Failure::Signal("40001".to_string()))
+        );
+        assert_eq!(
+            failure("insert into new_order (no_w_id) values (NULL)"),
+            Some(Failure::Null)
+        );
+        assert_eq!(
+            failure("update district set d_next_o_id = NULL"),
+            Some(Failure::Null)
+        );
+        assert_eq!(
+            failure("select raise_exception('no stock')"),
+            Some(Failure::Raise)
+        );
+        assert_eq!(
+            failure("call nosuch_procedure(1, 2)"),
+            Some(Failure::UnknownProcedure)
+        );
+
+        // A known procedure is a transaction, not a failure; a NULL in a
+        // SELECT is a value the server answers.
+        assert_eq!(failure("call NEWORD(1, 2, 3, 4)"), None);
+        assert_eq!(failure("select NULL"), None);
+        assert_eq!(failure("insert into new_order values (1, 2, 3)"), None);
     }
 
     /// **`SELECT @a, @b` answers its variables**, and a select of columns is not
