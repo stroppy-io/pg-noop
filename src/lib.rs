@@ -498,6 +498,7 @@ fn spawn_stats(interval: std::time::Duration) {
 pub fn run() {
     let config = Config::load();
     crate::tpcc::set_warehouses(config.warehouses);
+    crate::tpcc::set_profile(config.tpcc_profile);
     if config.stats_every > 0 {
         spawn_stats(std::time::Duration::from_secs(config.stats_every));
     }

@@ -586,6 +586,12 @@ fn server_with_env(env: &[(&str, &str)], args: &[&str]) -> Server {
     if !args.contains(&"--workers") {
         all.extend_from_slice(&["--workers", "1"]);
     }
+    // **The TPC-C profile, unless a test says otherwise**: the numbers this
+    // server states are what a TPC-C client reads, and a test that checks them is
+    // checking the profile.
+    if !args.contains(&"--profile") {
+        all.extend_from_slice(&["--profile", "tpcc"]);
+    }
     all.extend_from_slice(args);
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_dbnoop"));
@@ -1344,4 +1350,53 @@ fn an_injected_failure_is_an_error_on_both_protocols() {
         before,
         "the failed transaction counted nothing"
     );
+}
+
+/// **The synthetic answers need `--profile tpcc`, and say so when they are on.**
+///
+/// A server that answers a district sum without being asked is asserting numbers
+/// it has no data for, and a figure taken with the answers on must never be read
+/// as a measurement: the stats line says `synthetic NOPM`, and the README says
+/// what the profile is.
+#[test]
+fn the_synthetic_answers_need_the_profile() {
+    let plain = server_with_env(&[], &["--profile", "none"]);
+
+    let mut mysql = Client::connect(plain.mysql);
+    let answer = mysql.query("select sum(d_next_o_id) from district");
+    assert_eq!(answer[0].body, vec![1], "a zero-row result set");
+    assert_eq!(answer.len(), 3, "count, definition, terminator: {answer:?}");
+    let answer = mysql.query("show global status");
+    assert_eq!(answer[0].body, vec![2], "two columns, no rows");
+
+    let mut pg = PgClient::connect(plain.postgres);
+    let answer = pg.query("select sum(d_next_o_id) from district");
+    assert_eq!(
+        answer.len(),
+        2,
+        "RowDescription and CommandComplete {answer:?}"
+    );
+    assert!(String::from_utf8_lossy(&answer[1].1).contains("SELECT 0"));
+    let answer = pg.query("select sum(xact_commit+xact_rollback) from pg_stat_database");
+    assert!(String::from_utf8_lossy(&answer[1].1).contains("SELECT 0"));
+
+    // With the profile, the numbers are the schema's, and the line says they are
+    // synthetic.
+    let profiled = server_with_env(&[], &["--warehouses", "4"]);
+    let mut pg = PgClient::connect(profiled.postgres);
+    let answer = pg.query("select sum(d_next_o_id) from district");
+    assert_eq!(pg_values(&answer[1].1)[0], (3001 * 40).to_string());
+    let answer = pg.query("select max(w_id) from warehouse");
+    assert_eq!(pg_values(&answer[1].1)[0], "4");
+    let answer = pg.query("select sum(xact_commit+xact_rollback) from pg_stat_database");
+    assert!(
+        pg_values(&answer[1].1)[0].parse::<u64>().is_ok(),
+        "TPM is a number: {answer:?}"
+    );
+
+    let mut mysql = Client::connect(profiled.mysql);
+    let answer = mysql.query("select count(*) from orders");
+    assert_eq!(row(&answer[2])[0], (3000 * 40).to_string());
+    let answer = mysql.query("show global status like 'Com_commit'");
+    assert_eq!(row(&answer[3])[0], "Com_commit");
 }

@@ -878,6 +878,7 @@ fn row_value(packet: &[u8]) -> String {
 /// where each test owns a server process.
 #[test]
 fn the_tpcc_rules_answer_with_numbers() {
+    let _profile = tpcc::profile_guard(true);
     let mut c = connected(CAPS);
 
     // `select sum(d_next_o_id) from district`: one column, one row, a number.
@@ -1009,6 +1010,8 @@ fn a_prepared_statement_answers_binary_rows() {
 /// statement**, and its column is the LONGLONG a client decodes it as.
 #[test]
 fn a_prepared_district_sum_answers_a_binary_longe_long() {
+    // The synthetic answers are the profile's; this is what a profile run reads.
+    let _profile = tpcc::profile_guard(true);
     let mut c = connected(CAPS);
 
     let packets = round_trip(
