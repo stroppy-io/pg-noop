@@ -73,7 +73,33 @@ impl Codec {
     }
 }
 
-/// What a shard tells the process about itself, for the startup banner.
+/// Feed bytes from a socket into a session, keeping what an incomplete message
+/// holds.
+///
+/// Both loops read the same way: the codec consumes whole messages, and the bytes
+/// of a message that has not finished arrive are carried to the next read.
+pub fn feed(
+    codec: &Codec,
+    session: &mut Session,
+    pending: &mut Vec<u8>,
+    bytes: &[u8],
+    out: &mut Vec<u8>,
+) {
+    if pending.is_empty() {
+        let used = codec.advance(session, bytes, out);
+        if used < bytes.len() {
+            pending.extend_from_slice(&bytes[used..]);
+        }
+
+        return;
+    }
+
+    pending.extend_from_slice(bytes);
+    let used = codec.advance(session, pending, out);
+    pending.drain(..used);
+}
+
+/// Which wire protocol a listener speaks.
 pub enum Report {
     Pinned { protocol: Protocol, pinned: bool },
     Serving { protocol: Protocol, backend: Io },
