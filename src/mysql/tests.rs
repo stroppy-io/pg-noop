@@ -892,6 +892,35 @@ fn the_tpcc_rules_answer_with_numbers() {
     assert_eq!(row_value(&packets[3]), "1", "the first variable");
 }
 
+/// **A NULL in a prepared statement's bitmap fails a write**, the way a NULL literal
+/// does: the client sends it as a value, not as text.
+#[test]
+fn a_bound_null_fails_a_prepared_insert() {
+    let mut c = connected(CAPS);
+    let packets = round_trip(
+        &mut c,
+        &command(cmd::STMT_PREPARE, b"insert into new_order values (?, ?, ?)"),
+    );
+    let mut r = Reader::new(&packets[0]);
+    r.u8().expect("header");
+    let id = r.u32().expect("statement id");
+    assert_eq!(r.u16(), Some(0), "no columns");
+    assert_eq!(r.u16(), Some(3), "three parameters");
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&id.to_le_bytes());
+    body.push(0x00); // no cursor
+    body.extend_from_slice(&1u32.to_le_bytes()); // iteration count
+    body.push(0b0000_0010); // the first parameter is NULL
+    body.push(0x00); // no parameter types follow
+    let packets = round_trip(&mut c, &command(cmd::STMT_EXECUTE, &body));
+
+    assert_eq!(packets.len(), 1, "{packets:?}");
+    assert_eq!(packets[0][0], 0xff, "an ERR packet");
+    let mut r = Reader::new(&packets[0][1..]);
+    assert_eq!(r.u16(), Some(1048), "ER_BAD_NULL_ERROR");
+}
+
 /// **With the profile off, a TPC-C query is an ordinary select**: its columns,
 /// no rows. The profile is the only thing that makes it answer a number.
 #[test]

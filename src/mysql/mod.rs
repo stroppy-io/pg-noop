@@ -143,6 +143,11 @@ impl Answer {
 /// which is why preparing one is the same work as running one.
 struct Prepared {
     answer: Answer,
+    /// The statement writes a row, so a NULL parameter fails it the way a NULL literal
+    /// does.
+    writes: bool,
+    /// The parameters its text declares.
+    params: u16,
 }
 
 enum Phase {
@@ -603,6 +608,8 @@ impl Conn {
 
         let answer = classify(sql);
         let params = sql::count_placeholders(sql, Dialect::MySql);
+        let head = sql::first_word(sql::trim_leading(sql, Dialect::MySql), Dialect::MySql);
+        let writes = head.eq_ignore_ascii_case("INSERT") || head.eq_ignore_ascii_case("UPDATE");
         let id = self.next_stmt;
         self.next_stmt += 1;
 
@@ -634,7 +641,14 @@ impl Conn {
         result::definitions(out, &mut self.seq, &parameters, status, deprecate);
         result::definitions(out, &mut self.seq, &columns, status, deprecate);
 
-        self.stmts.insert(id, Prepared { answer });
+        self.stmts.insert(
+            id,
+            Prepared {
+                answer,
+                writes,
+                params,
+            },
+        );
     }
 
     /// `COM_STMT_EXECUTE`: the statement's answer, with its parameters ignored.
@@ -646,6 +660,25 @@ impl Conn {
 
             return;
         };
+        // [stmt id][flags][iteration count][null bitmap][new params bound][types/values]
+        let (writes, null) = match self.stmts.get(&id) {
+            Some(prepared) => {
+                let bitmap_at = 4 + 1 + 4;
+                let params = prepared.params;
+                let null = body.get(bitmap_at..).is_some_and(|bits| {
+                    (0..params as usize)
+                        .any(|i| bits.get(i / 8).is_some_and(|b| b & (1 << (i % 8)) != 0))
+                });
+
+                (prepared.writes, null)
+            }
+            None => (false, false),
+        };
+        if writes && null {
+            self.error(out, 1048, "23000", "column cannot be null");
+
+            return;
+        }
         let answer = match self.stmts.get(&id) {
             Some(prepared) => prepared.answer.clone(),
             None => {

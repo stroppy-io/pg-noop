@@ -51,6 +51,11 @@ const ABORTED: &str =
 
 /// The statements PostgreSQL still accepts in a failed transaction: the ones that end
 /// it, and the empty one, which has nothing in it to refuse.
+/// Whether a plan writes a row, which a NULL parameter then fails.
+fn writes_null(kind: &PlanKind) -> bool {
+    matches!(kind, PlanKind::Insert | PlanKind::Update)
+}
+
 fn ends_transaction(kind: &PlanKind) -> bool {
     matches!(
         kind,
@@ -232,6 +237,9 @@ impl Formats {
 struct Portal {
     statement: Arc<Statement>,
     formats: Formats,
+    /// Whether a parameter bound into it is NULL, which an INSERT or UPDATE of a
+    /// NOT NULL column refuses when it runs.
+    bound_null: bool,
     /// Whether the portal has no rows left to send: a suspended single-row answer
     /// has none, its row having gone out with the `PortalSuspended`.
     consumed: bool,
@@ -1080,6 +1088,7 @@ impl Conn {
             Some(cur) => {
                 cur.statement = statement;
                 cur.formats = bind.formats;
+                cur.bound_null = bind.any_null;
                 cur.consumed = false;
             }
             None => {
@@ -1088,6 +1097,7 @@ impl Conn {
                     Portal {
                         statement,
                         formats: bind.formats,
+                        bound_null: bind.any_null,
                         consumed: false,
                     },
                 );
@@ -1155,18 +1165,28 @@ impl Conn {
         exhausted(body, after + 4)?;
         let failed = self.failed();
 
-        // **The injected failure is refused here too**, or a NULL written
-        // through the extended protocol answers OK. Detected before the
-        // mutable borrow, because the error path needs `self`.
-        let injected = self
-            .portals
-            .get(name)
-            .and_then(|p| crate::tpcc::failure(&p.statement.plan.sql, Dialect::Postgres));
-        if let Some(failure) = injected {
-            self.injected_failure(failure, out);
-            self.phase = Phase::AwaitingSync;
+        // **The failed transaction is asked first**: in one, nothing runs but its end,
+        // whatever the statement would otherwise have failed with.
+        let failure = self.portals.get(name).and_then(|p| {
+            if failed && !ends_transaction(&p.statement.plan.kind) {
+                return Some(None);
+            }
+            // A NULL bound into an INSERT or UPDATE is the same injected failure a
+            // NULL literal is, and the client sends it as a value.
+            if p.bound_null && writes_null(&p.statement.plan.kind) {
+                return Some(Some(crate::tpcc::Failure::Null));
+            }
+            crate::tpcc::failure(&p.statement.plan.sql, Dialect::Postgres).map(Some)
+        });
+        match failure {
+            Some(None) => return self.refuse(true, out, "25P02", ABORTED),
+            Some(Some(failure)) => {
+                self.injected_failure(failure, out);
+                self.phase = Phase::AwaitingSync;
 
-            return Some(());
+                return Some(());
+            }
+            None => {}
         }
 
         // No clone: `answer` is a free function precisely so the plan can stay
@@ -1889,6 +1909,8 @@ fn exhausted(body: &[u8], end: usize) -> Option<()> {
 struct BindTail {
     /// How many parameter values it carries.
     params: usize,
+    /// Whether any of them is NULL (length -1), which a NOT NULL column refuses.
+    any_null: bool,
     /// The parameter-format count, when it is not 0, 1 or `params`.
     format_mismatch: Option<usize>,
     /// How many result-format codes it carries, which must be 0, 1 or the statement's
@@ -1919,6 +1941,7 @@ fn bind_tail(body: &[u8], from: usize) -> Option<BindTail> {
 
     let params = usize::try_from(i16_at(body, at)?).ok()?;
     at += 2;
+    let mut any_null = false;
     for _ in 0..params {
         let len = i32::from_be_bytes(body.get(at..at + 4)?.try_into().ok()?);
         at += 4;
@@ -1926,7 +1949,9 @@ fn bind_tail(body: &[u8], from: usize) -> Option<BindTail> {
         if len < -1 {
             return None;
         }
-        if len >= 0 {
+        if len < 0 {
+            any_null = true;
+        } else {
             at += len as usize;
             body.get(..at)?;
         }
@@ -1966,6 +1991,7 @@ fn bind_tail(body: &[u8], from: usize) -> Option<BindTail> {
 
     Some(BindTail {
         params,
+        any_null,
         format_mismatch,
         result_formats: n_rformats,
         formats,
@@ -2852,6 +2878,83 @@ mod tests {
             "and the Sync after it is still answered, so the stream is in sync"
         );
         assert!(framed < input.len());
+    }
+
+    /// **A NULL bound into an INSERT is the same failure a NULL literal is.** The
+    /// client sends it as a parameter value (length -1), so the rule has to look at
+    /// what was bound, not only at the statement's text.
+    #[test]
+    fn a_bound_null_fails_an_insert() {
+        let (mut c, v) = connected();
+        let mut out = Vec::new();
+        c.advance(
+            &parse_msg("ins", "insert into new_order values ($1, $2, $3)", &[]),
+            &mut out,
+            &v,
+        );
+
+        // Bind: one value and two NULLs.
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'B', |b| {
+                cstr(b, "");
+                cstr(b, "ins");
+                b.extend_from_slice(&0i16.to_be_bytes());
+                b.extend_from_slice(&3i16.to_be_bytes());
+                b.extend_from_slice(&2i32.to_be_bytes());
+                b.extend_from_slice(b"1x");
+                b.extend_from_slice(&(-1i32).to_be_bytes());
+                b.extend_from_slice(&(-1i32).to_be_bytes());
+                b.extend_from_slice(&0i16.to_be_bytes());
+            }),
+            &mut out,
+            &v,
+        );
+        assert_eq!(out[0], b'2', "BindComplete: {out:?}");
+
+        let out = execute(&mut c, &v, "", 0);
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("23502"), "the insert must fail: {text}");
+    }
+
+    /// **A failed transaction is asked first.** In one, a NULL bound into an INSERT
+    /// is 25P02 -- nothing runs until the transaction ends -- and not the NULL's 23502.
+    #[test]
+    fn a_failed_transaction_is_refused_before_the_injected_failure() {
+        let (mut c, v) = connected();
+        // Prepared before the transaction fails: a Parse inside one is refused and
+        // would be the only thing this test saw.
+        let mut out = Vec::new();
+        c.advance(
+            &parse_msg("ins", "insert into t values ($1)", &[]),
+            &mut out,
+            &v,
+        );
+
+        for sql in ["begin", "signal sqlstate '45000'"] {
+            let mut out = Vec::new();
+            c.advance(&tagged(b'Q', |b| cstr(b, sql)), &mut out, &v);
+        }
+
+        // The Bind carries the NULL. Inside a failed transaction the answer is 25P02,
+        // so the NULL rule never gets to speak.
+        let mut out = Vec::new();
+        c.advance(
+            &tagged(b'B', |b| {
+                cstr(b, "");
+                cstr(b, "ins");
+                b.extend_from_slice(&0i16.to_be_bytes());
+                b.extend_from_slice(&1i16.to_be_bytes());
+                b.extend_from_slice(&(-1i32).to_be_bytes());
+                b.extend_from_slice(&0i16.to_be_bytes());
+            }),
+            &mut out,
+            &v,
+        );
+
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("25P02"), "the failed transaction: {text}");
+        assert!(!text.contains("23502"), "not the NULL's error: {text}");
     }
 
     /// **An injected failure is an error through Parse/Bind/Execute too.**
