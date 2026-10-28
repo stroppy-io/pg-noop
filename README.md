@@ -53,6 +53,31 @@ Uses [jemalloc](https://github.com/jemalloc/jemalloc) instead of musl's default
 allocator to recover the performance lost in a musl build. The static binary can
 be `scp`'d to any x86-64 Linux server and run directly.
 
+## Docker
+
+```sh
+docker build -t db-noop .
+docker run --network host db-noop
+# or the published image, one tag per release
+docker run --network host ghcr.io/stroppy-io/db-noop:0.3.0 --port 5432 --mysql-port 3306
+```
+
+The image is a static musl build of `dbnoop` on `scratch` — nothing but the
+binary — and its `CMD` already binds `0.0.0.0` on both ports (5432 and 3306).
+Nothing in it needs a shell or a libc.
+
+**io_uring needs the host's seccomp profile opened**, because Docker's default
+refuses `io_uring_setup`:
+
+```sh
+docker run --network host --security-opt seccomp=unconfined ghcr.io/stroppy-io/db-noop:0.3.0
+```
+
+Without it the server says so and serves with epoll, which is correct and slower;
+`--io epoll` asks for it. `--network host` is not decoration: one shard per core
+behind `SO_REUSEPORT` is the point of the thing, and a NAT'd port with a proxy in
+front measures the proxy.
+
 ## Configuration
 
 Parameters are resolved in order: **CLI flag → environment variable → JSON
@@ -166,8 +191,12 @@ flags of every answer say whether a transaction is open (`SERVER_STATUS_IN_TRANS
 
 A **SELECT answers a well-formed result set with zero rows**, named after its
 select list: no value of the server's is worth making up, and an empty result is
-what every driver accepts. A command larger than the protocol's 16 MiB packet is
-reassembled; a pipelined command's answer starts its own sequence at one.
+what every driver accepts. The one exception is a select list of nothing but
+literals and system variables (`select 1`, `select @@version`), which answers one
+row — see the TPC-C rules below. A command larger than the protocol's 16 MiB
+packet is reassembled; a pipelined command's answer starts its own sequence at
+one, and a stored routine's `BEGIN … END` body is one statement however many
+semicolons it holds.
 
 ## TPC-C rules
 
@@ -183,6 +212,7 @@ not SQL: each rule is the shape of a statement, matched on its own words.
 | Rule | Answer |
 |---|---|
 | `CALL NEWORD(...)` — also `PAYMENT`, `DELIVERY`, `OSTAT`/`order_status`, `SLEV`/`stock_level`, any case, optional schema prefix | OK packet; the transaction is counted |
+| A SELECT that CALLS one of them as a function — `select neword(…)`, `SELECT * FROM neword(…)`, PostgreSQL's form of the same, plain or prepared | The ordinary SELECT answer; the transaction is counted |
 | `INSERT` that names `new_order` (or `tpcc_new_order`) | OK packet; counted as a NewOrder |
 | `select sum(d_next_o_id) from district` (any case and spacing, optional schema prefix, `district` or `tpcc_district`, nothing after the table) | One row: `3001 × districts + NewOrders seen` |
 | `show global status` [`like '<pattern>'`] | A result set of `Com_commit` and `Com_rollback` (MySQL's `%`/`_` matching) |
