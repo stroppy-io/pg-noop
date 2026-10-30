@@ -27,10 +27,10 @@ the packets that end an answer.
 `select 1`, extended protocol, statement prepared once, one shard per core on an
 idle 16-core / 32-thread host, 32 connections:
 
-**Historical.** These were measured on the PostgreSQL-only tree at `a436f4c`
-(2026-09-14), and no run log in this tree records them. They are kept as the shape
-of the limit, not as a claim about this build; `saturate` is what would measure it
-again.
+**Historical.** The table as printed is from `a61b119` (2026-09-14, the
+PostgreSQL-only tree): six rows are unchanged from `a436f4c` earlier that day, and
+the depth-1 row was revised there from 2,831,421 to 3,318,093. No run log in this
+tree records either run; `saturate` is what would measure it again.
 
 | depth | q/s | µs/query |
 |---|---|---|
@@ -95,5 +95,8 @@ after the errno that refused it, never silently.
 dbnoop: io_uring granted: SINGLE_ISSUER DEFER_TASKRUN COOP_TASKRUN TASKRUN_FLAG
         NO_SQARRAY CLAMP SUBMIT_ALL CQSIZE RING_FD PBUF_RING
         (PBUF_RING_INC granted, unused: a buffer's ownership is not reported
-         while a receive holds it)
+         while a receive holds it) (SQPOLL not requested)
 ```
+
+With `DBNOOP_SQPOLL` set and granted the list starts `SQPOLL` instead; a refused
+SQPOLL is named under `dropped` with the errno that refused it.

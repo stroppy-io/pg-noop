@@ -14,9 +14,9 @@ against the db-noop tree and added the one datum the report was still missing (D
 | # | Finding | State on the db-noop line | Where |
 |---|---|---|---|
 | 1 | `Slot.closing` written, never read | read: it gates `next_for`, `arm_recv` and the cancel path | `src/uring.rs:193,1594,1649,1766`; the read came in with `24c23c4` |
-| 2 | `TCP_NODELAY` result discarded | discarded on purpose, and the reason is written at the call | `src/uring.rs:1567-1571`; epoll twin at `src/lib.rs:355` |
+| 2 | `TCP_NODELAY` result discarded | discarded on purpose, and the reason is written at the call | `src/uring.rs:1566-1571`; epoll twin at `src/lib.rs:353-355` |
 | 3 | a malformed config file replaced by defaults | refused, and exits 2 like the env knob; test `a_malformed_config_file_names_itself` | `src/config.rs:181-189,336-342` (`efed707`) |
-| 4 | the ring's granted set never reported | printed by `probe()` and again in the banner, through `describe()` | `src/uring.rs:310-345,382,393`; `src/lib.rs:678-696` (`97d7ed8`) |
+| 4 | the ring's granted set never reported | printed by `probe()` and again in the banner, through `describe()` | `src/uring.rs:310-345,382-390,393-395`; `src/lib.rs:688-693` (`97d7ed8`) |
 | 5 | `postgres-types` and the pgwire handler layer dead | both deleted, with `pgwire`, `async-trait` and `futures` | `489b0da` |
 
 **Why:** the review read the PG-only tree. The db-noop line replaced pgwire's handler
@@ -40,9 +40,10 @@ about the one flag set out of band is the gap left in it.
 **Question:** `docs/measurements.md` carries two tables of q/s with no run log in the
 tree. Rewrite, delete, or label?
 
-**Decision:** label. The depth table is marked as measured at `a436f4c`
-(2026-09-14, the PostgreSQL-only tree) and the two-protocol table at `88da3ef`
-(2026-10-28). The numbers are unchanged.
+**Decision:** label. The depth table is marked as from `a61b119` (2026-09-14, the
+PostgreSQL-only tree; six rows unchanged from `a436f4c` earlier that day, the
+depth-1 row revised there) and the two-protocol table at `88da3ef` (2026-10-28).
+The numbers are unchanged.
 
 **Why:** the numbers are a record of what a run once showed, and rewriting them would
 replace evidence with invention. A labelled historical table is honest; an unlabelled
