@@ -1,0 +1,327 @@
+# db-noop gate log
+# tree: 25cee95 (agent/dbnoop-open-lows; parent of the commit that adds this file)
+# base: dd6449b (main-v030, the live db-noop line)
+# host: Linux 7.0.0-31-generic x86_64
+# cores: 32
+# rustc: rustc 1.98.0 (88d9e12ae 2026-08-18)
+# cargo: cargo 1.98.0 (797e8a9bc 2026-08-05)
+# the crate was cleaned first, so nothing below is a cached result
+
+$ cargo fmt --all -- --check
+exit=0
+
+$ cargo clippy --all-targets -- -D warnings
+    Checking db-noop v0.3.0 (/home/dead/letibot-remote/dbnoop-open-lows)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.90s
+exit=0
+
+$ cargo test --workspace
+   Compiling db-noop v0.3.0 (/home/dead/letibot-remote/dbnoop-open-lows)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.65s
+     Running unittests src/lib.rs (target/debug/deps/db_noop-b356409deb229f9f)
+
+running 242 tests
+test banner_tests::the_banner_counts_by_report ... ok
+test catalog::tests::create_table_parser_maps_stroppy_types ... ok
+test mysql::handshake::tests::a_client_without_a_plugin_token_is_on_the_native_plugin ... ok
+test config::tests::a_malformed_config_file_names_itself ... ok
+test mysql::handshake::tests::a_truncated_handshake_response_is_refused ... ok
+test catalog::tests::a_comment_before_create_still_builds_the_table ... ok
+test config::tests::the_ring_plan_spends_the_budget_it_has ... ok
+test config::tests::the_memlock_limit_is_read_from_the_kernel ... ok
+test config::tests::a_malformed_environment_number_is_refused ... ok
+test config::tests::zero_disables_and_unset_is_the_default ... ok
+test error_tests::a_connection_ending_is_not_news ... ok
+test mysql::handshake::tests::a_handshake_response_is_read_in_each_encoding ... ok
+test config::tests::a_malformed_timeout_is_refused ... ok
+test mysql::handshake::tests::the_greeting_offers_what_this_server_speaks ... ok
+test mysql::handshake::tests::an_ssl_request_is_refused ... ok
+test mysql::packet::tests::a_short_body_reads_as_none ... ok
+test mysql::packet::tests::the_sequence_wraps ... ok
+test catalog::tests::drop_table_parser_handles_tpcc_list ... ok
+test mysql::packet::tests::cstrings_need_their_terminator ... ok
+test mysql::packet::tests::length_encoded_strings_round_trip ... ok
+test mysql::packet::tests::a_packet_carries_its_length_and_sequence ... ok
+test mysql::result::tests::a_result_set_is_framed_in_the_order_a_client_reads_it ... ok
+test mysql::result::tests::an_err_packet_carries_a_code_and_a_state ... ok
+test mysql::packet::tests::length_encoded_integers_round_trip ... ok
+test mysql::result::tests::the_terminator_follows_what_the_client_negotiated ... ok
+test mysql::result::tests::an_ok_packet_carries_its_counts_and_flags ... ok
+test mysql::tests::a_bound_null_fails_a_prepared_insert ... ok
+test join_tests::a_panicked_shard_is_reported_and_counted ... ok
+test mysql::tests::a_constant_select_answers_one_row ... ok
+test mysql::tests::a_handshake_is_answered_with_an_ok_packet ... ok
+test mysql::tests::a_closed_prepared_statement_has_no_reply_and_is_unknown ... ok
+test mysql::tests::a_select_answers_a_zero_row_result_set ... ok
+test mysql::tests::a_select_list_is_split_at_its_own_commas ... ok
+test mysql::tests::a_null_is_data_without_the_profile ... ok
+test mysql::tests::a_prepare_response_without_deprecated_eof_has_two_eofs ... ok
+test mysql::tests::a_plain_query_still_splits_and_a_case_expression_closes_nothing ... ok
+test mysql::tests::a_statement_is_classified_the_same_way_either_way ... ok
+test mysql::tests::a_prepared_district_sum_answers_a_binary_longe_long ... ok
+test mysql::tests::com_set_option_toggles_multi_statements ... ok
+test mysql::tests::a_rollback_to_a_savepoint_keeps_the_transaction_open ... ok
+test mysql::tests::com_ping_answers_ok ... ok
+test mysql::tests::a_prepared_dml_statement_has_no_columns ... ok
+test mysql::tests::a_query_without_multi_statements_is_one_statement ... ok
+test mysql::tests::a_prepared_statement_is_prepared_and_executed ... ok
+test mysql::tests::a_trailing_limit_still_leaves_a_constant ... ok
+test mysql::tests::a_routine_body_is_one_statement ... ok
+test mysql::tests::a_statement_that_is_not_utf8_is_refused_without_closing ... ok
+test mysql::tests::a_transaction_shows_in_the_status_flags ... ok
+test mysql::tests::dml_ddl_and_session_statements_answer_ok ... ok
+test mysql::tests::empty_statements_between_semicolons_answer_nothing ... ok
+test mysql::tests::a_truncated_handshake_response_closes_the_connection ... ok
+test mysql::tests::long_data_is_read_without_an_answer ... ok
+test mysql::tests::an_ssl_request_is_refused_with_an_error ... ok
+test mysql::tests::com_statistics_answers_a_string ... ok
+test mysql::tests::an_incomplete_packet_is_left_for_the_next_read ... ok
+test mysql::tests::the_administrative_commands_are_answered ... ok
+test mysql::tests::a_tpcc_query_without_the_profile_is_an_empty_select ... ok
+test mysql::tests::com_quit_closes_without_a_reply ... ok
+test mysql::tests::the_connect_variables_answer_plausible_values ... ok
+test mysql::tests::com_init_db_answers_ok ... ok
+test mysql::tests::every_statement_of_a_multi_statement_query_is_answered ... ok
+test mysql::tests::an_unknown_command_is_refused ... ok
+test mysql::tests::the_tpcc_rules_answer_with_numbers ... ok
+test plan::placeholder_tests::a_leading_comment_does_not_hide_the_statement ... ok
+test plan::placeholder_tests::a_pg_backslash_does_not_hide_a_parameter ... ok
+test mysql::tests::com_reset_connection_clears_the_session ... ok
+test plan::copy_columns::a_copy_without_a_column_list_is_one_column ... ok
+test mysql::tests::every_kind_of_routine_is_one_statement ... ok
+test plan::copy_columns::any_whitespace_finds_the_column_list ... ok
+test mysql::tests::a_prepared_statement_answers_binary_rows ... ok
+test plan::copy_columns::commas_inside_a_quoted_name_do_not_count ... ok
+test mysql::tests::caching_sha2_is_answered_with_the_fast_auth_success ... ok
+test plan::placeholder_tests::placeholders_in_comments_and_quotes_are_not_parameters ... ok
+test plan::copy_columns::leading_whitespace_does_not_shift_the_from_offset ... ok
+test mysql::tests::multi_statement_query_answers_each_statement_with_more_results_except_the_last ... ok
+test plan::copy_direction_tests::a_comment_adjacent_to_a_token_ends_the_token ... ok
+test mysql::tests::com_stmt_reset_answers_ok_or_an_error ... ok
+test mysql::tests::pipelined_commands_are_answered_in_order ... ok
+test plan::placeholder_tests::real_placeholders_are_still_found ... ok
+test plan::copy_direction_tests::comments_are_skipped_by_the_copy_walker ... ok
+test plan::tests::metadata_select_parser_accepts_quoted_schema_and_columns ... ok
+test sql::tests::a_constant_select_is_literals_and_variables ... ok
+test plan::copy_direction_tests::a_table_name_is_not_a_direction ... ok
+test plan::copy_direction_tests::direction_is_read_from_the_statement ... ok
+test sql::tests::a_quoted_argument_is_read ... ok
+test plan::copy_direction_tests::from_stdin_survives_any_whitespace ... ok
+test plan::copy_direction_tests::format_is_read_from_the_options_clause ... ok
+test sql::tests::a_sql_prepare_is_a_name_and_a_body ... ok
+test sql::tests::commas_split_only_at_the_top_level ... ok
+test protocol::tests::only_mysql_has_a_prelude ... ok
+test sql::tests::placeholders_are_counted_outside_quotes_and_comments ... ok
+test sql::tests::statements_split_outside_quotes_and_comments ... ok
+test protocol::tests::each_protocol_is_driven_by_its_own_codec ... ok
+test sql::tests::the_select_list_ends_at_its_own_from ... ok
+test plan::copy_direction_tests::binary_is_recognised_in_both_spellings ... ok
+test sql::tests::words_skip_quotes_and_comments ... ok
+test tests::a_denied_ring_falls_back_to_epoll ... ok
+test sql::tests::a_backslash_escapes_only_where_the_dialect_says ... ok
+test sql::tests::a_leading_comment_is_not_the_first_word ... ok
+test tests::a_working_ring_is_kept ... ok
+test tests::a_literal_resolves_to_itself ... ok
+test sql::tests::a_dollar_quoted_body_is_one_literal ... ok
+test sql::tests::the_dialects_differ_on_comments_and_dollar_quotes ... ok
+test tests::a_hostname_resolves ... ok
+test plan::copy_direction_tests::a_parenthesised_group_honours_quotes_and_nesting ... ok
+test tests::an_explicit_epoll_is_never_replaced_by_the_ring ... ok
+test tests::bind_reports_the_failure_when_nothing_binds ... ok
+test tpcc::tests::a_call_is_counted_by_its_procedure ... ok
+test tests::other_ring_failures_fall_back_too ... ok
+test tests::bind_tries_each_address_until_one_binds ... ok
+test tpcc::tests::a_reset_counts_nothing ... ok
+test tpcc::tests::a_called_function_is_the_same_transaction ... ok
+test tpcc::tests::a_transaction_is_counted_at_commit_not_when_it_runs ... ok
+test tpcc::tests::an_insert_into_new_order_is_a_new_order ... ok
+test tpcc::tests::an_injected_failure_is_recognised ... ok
+test tests::shards_are_mapped_onto_the_affinity_mask ... ok
+test tpcc::tests::select_variables_are_recognised ... ok
+test tpcc::tests::show_global_status_is_recognised_with_its_filter ... ok
+test tpcc::tests::the_district_sum_starts_at_3001_a_district_and_grows_by_new_orders ... ok
+test tpcc::tests::the_counters_are_reported ... ok
+test uring::tests::a_cancelled_receive_is_answered_by_what_the_slot_needs ... ok
+test tpcc::tests::the_status_rows_follow_the_filter ... ok
+test tpcc::tests::the_population_answers_need_the_profile ... ok
+test uring::tests::a_parked_receive_is_armed_again_once ... ok
+test uring::tests::a_pass_processes_the_completions_that_arrive_while_it_works ... ok
+test uring::tests::a_shard_that_ends_with_an_error_closes_its_descriptors ... ok
+test uring::tests::a_transient_submit_failure_is_retried ... ok
+test uring::tests::a_transient_wait_failure_is_not_a_dead_shard ... ok
+test uring::tests::only_a_shortage_pauses_the_accept ... ok
+test uring::tests::the_ladder_drops_only_the_flag_the_kernel_refuses ... ok
+test uring::tests::taskrun_flag_is_never_asked_for_without_coop_or_defer ... ok
+test uring::tests::a_refused_buffer_ring_falls_back_to_per_connection_buffers ... ok
+test uring::tests::the_report_names_what_was_granted_refused_and_asked_for ... ok
+test wire::tests::a_failed_transaction_is_refused_before_the_injected_failure ... ok
+test plan::placeholder_tests::zero_and_oversized_indices_are_refused_before_allocating ... ok
+test wire::tests::a_csv_copy_counts_lines_outside_quotes ... ok
+test wire::tests::a_failed_transaction_refuses_everything_but_its_end ... ok
+test wire::tests::a_comment_glued_to_a_token_still_enters_copy ... ok
+test wire::tests::a_bound_null_fails_an_insert ... ok
+test wire::tests::a_binary_result_format_is_honoured ... ok
+test wire::tests::a_created_tables_columns_come_back_by_name ... ok
+test uring::tests::the_buffer_ring_size_from_the_environment_is_bounded ... ok
+test wire::tests::a_failed_transaction_refuses_extended_messages_too ... ok
+test wire::tests::a_malformed_body_is_answered_and_consumed ... ok
+test wire::tests::a_negative_length_is_rejected_rather_than_stalling ... ok
+test wire::tests::a_negative_startup_length_is_rejected_rather_than_stalling ... ok
+test uring::tests::a_shard_without_a_ring_hands_its_listener_back ... ok
+test wire::tests::a_null_is_data_without_the_profile ... ok
+test wire::tests::a_parse_with_a_truncated_type_list_is_malformed ... ok
+test wire::tests::a_partial_message_is_left_for_the_next_read ... ok
+test wire::tests::a_portal_suspends_at_max_rows_and_does_not_replay ... ok
+test wire::tests::a_portal_keeps_its_plan_when_the_statement_name_is_reused ... ok
+test wire::tests::a_quoted_paren_in_the_column_list_still_enters_copy ... ok
+test wire::tests::a_query_without_a_nul_is_malformed ... ok
+test wire::tests::a_query_during_copy_is_refused_not_run ... ok
+test tests::probe_reports_what_this_box_can_do ... ok
+test wire::tests::a_raw_begin_reports_in_transaction ... ok
+test wire::tests::a_simple_copy_still_ends_at_copy_done ... ok
+test wire::tests::a_binary_copy_header_extension_is_skipped_not_buffered ... ok
+test wire::tests::a_sql_prepare_refuses_a_duplicate_name ... ok
+test wire::tests::a_row_limit_truncates_a_multi_row_answer ... ok
+test wire::tests::a_simple_protocol_error_is_ready_at_once ... ok
+test wire::tests::a_sql_prepare_registers_a_statement_for_bind ... ok
+test wire::tests::a_text_copy_honours_escapes_and_the_end_marker ... ok
+test wire::tests::a_simple_query_answers_and_is_ready_again ... ok
+test wire::tests::an_error_in_an_extended_message_discards_everything_until_sync ... ok
+test wire::tests::an_empty_query_is_allowed_in_a_failed_transaction ... ok
+test wire::tests::an_empty_query_is_an_empty_query_response ... ok
+test wire::tests::an_error_inside_a_transaction_reports_failed ... ok
+test wire::tests::an_empty_prepared_statement_executes_to_an_empty_query_response ... ok
+test wire::tests::a_text_copy_counts_an_unterminated_final_line ... ok
+test wire::tests::an_execute_without_max_rows_is_malformed ... ok
+test wire::tests::an_extended_begin_reports_in_transaction ... ok
+test wire::tests::an_extended_copy_ends_at_sync ... ok
+test wire::tests::an_unsupported_protocol_version_is_refused_at_startup ... ok
+test wire::tests::an_ordinary_startup_still_completes ... ok
+test wire::tests::an_injected_failure_is_refused_through_execute ... ok
+test wire::tests::an_unknown_message_is_consumed_rather_than_desynchronising ... ok
+test wire::tests::an_invalid_placeholder_is_a_parse_error ... ok
+test wire::tests::binary_copy_counts_nulls_and_knows_when_the_stream_is_over ... ok
+test wire::tests::an_unlimited_execute_completes_the_portal ... ok
+test wire::tests::begin_inside_a_transaction_keeps_it_open ... ok
+test wire::tests::binary_copy_data_after_the_trailer_is_an_error ... ok
+test wire::tests::binary_copy_counts_tuples ... ok
+test wire::tests::binary_copy_done_with_a_partial_tuple_is_an_error ... ok
+test wire::tests::binary_copy_rejects_negative_values_other_than_minus_one ... ok
+test wire::tests::binary_copy_done_with_no_header_is_an_error ... ok
+test wire::tests::binary_copy_rejects_critical_flags ... ok
+test wire::tests::binary_copy_skips_the_header_extension ... ok
+test wire::tests::binary_copy_rejects_a_bad_signature ... ok
+test wire::tests::bind_execute_sync_produces_one_contiguous_reply ... ok
+test wire::tests::bind_parameter_length_below_minus_one_is_malformed ... ok
+test wire::tests::bind_counts_are_validated ... ok
+test wire::tests::bind_to_an_unknown_statement_is_an_error ... ok
+test wire::tests::commit_and_rollback_report_idle ... ok
+test wire::tests::bind_result_format_count_must_match_the_columns ... ok
+test wire::tests::commit_of_a_failed_transaction_says_rollback ... ok
+test uring::tests::a_buffer_ring_count_is_clamped_to_what_its_index_can_describe ... ok
+test wire::tests::close_of_an_unknown_name_is_not_an_error ... ok
+test wire::tests::copy_fail_is_an_error_not_a_success ... ok
+test uring::tests::a_query_split_across_reads_is_answered_once ... ok
+test wire::tests::copy_from_a_file_answers_a_copy_tag ... ok
+test wire::tests::binary_copy_without_a_trailer_is_still_complete ... ok
+test wire::tests::copy_fail_in_an_extended_copy_waits_for_sync ... ok
+test wire::tests::copy_from_stdin_gets_its_response_and_row_count ... ok
+test wire::tests::copy_from_stdin_survives_any_whitespace ... ok
+test wire::tests::declared_parameter_types_are_reported ... ok
+test wire::tests::copy_in_announces_the_column_count_under_any_whitespace ... ok
+test wire::tests::copy_to_stdout_answers_copy_out_and_a_copy_tag ... ok
+test wire::tests::describe_and_close_subtypes_are_strict ... ok
+test wire::tests::extended_messages_are_silent_while_awaiting_sync ... ok
+test wire::tests::describe_of_an_unknown_name_is_an_error ... ok
+test wire::tests::describe_statement_reports_text_formats ... ok
+test wire::tests::named_statements_and_portals_are_not_overwritten ... ok
+test wire::tests::known_columns_are_described_with_their_types_and_the_asked_format ... ok
+test wire::tests::only_copy_from_stdin_enters_the_copy_phase ... ok
+test wire::tests::startup_answers_auth_params_key_and_ready ... ok
+test wire::tests::malformed_sync_ends_awaiting_sync_with_an_error ... ok
+test wire::tests::protocol_three_is_accepted_whatever_the_minor ... ok
+test wire::tests::one_result_format_applies_to_every_column ... ok
+test wire::tests::ssl_request_is_declined_without_leaving_startup ... ok
+test wire::tests::terminate_closes_and_stops_consuming ... ok
+test wire::tests::sync_and_flush_require_empty_bodies ... ok
+test wire::tests::terminate_while_awaiting_sync_closes ... ok
+test wire::tests::the_district_sum_is_answered_with_one_row ... ok
+test wire::tests::undeclared_parameters_are_inferred_from_casts_or_reported_unknown ... ok
+test wire::tests::trailing_bytes_after_a_body_are_malformed ... ok
+test wire::tests::binary_copy_skips_a_large_field_without_buffering ... ok
+test tests::a_name_that_does_not_resolve_is_an_error ... ok
+test uring::tests::a_message_larger_than_the_receive_buffer_is_answered_once ... ok
+test uring::tests::a_stopped_shard_closes_its_descriptors ... ok
+test mysql::packet::tests::the_largest_payload_is_the_continuation_marker ... ok
+test uring::tests::many_connections_share_one_small_buffer_ring_without_losing_a_byte ... ok
+test uring::tests::a_recycled_connection_starts_with_nothing_in_it ... ok
+test uring::tests::one_buffer_serves_every_connection ... ok
+test uring::tests::a_signal_interrupting_the_wait_does_not_end_the_shard ... ok
+test uring::tests::multishot_receive_serves_many_reads_from_one_arm ... ok
+test uring::tests::several_messages_in_one_receive_are_all_answered_in_order ... ok
+test uring::tests::an_accept_paused_by_emfile_resumes_while_the_shard_is_busy ... ok
+test mysql::tests::a_command_split_across_packets_is_one_command ... ok
+test uring::tests::a_client_that_never_reads_cannot_grow_the_shard_memory ... ok
+test uring::tests::a_startup_deadline_expires_while_completions_keep_arriving ... ok
+
+test result: ok. 242 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.86s
+
+     Running unittests src/bin/dbnoop.rs (target/debug/deps/dbnoop-55de1afc13d9d8e4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/pgnoop.rs (target/debug/deps/pgnoop-fb1a856ebe479997)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/saturate.rs (target/debug/deps/saturate-de5904e8af3fe64f)
+
+running 5 tests
+test tests::a_reservoir_under_its_cap_keeps_everything ... ok
+test tests::percentiles_of_nothing_are_zero ... ok
+test tests::percentiles_weight_each_worker_by_what_it_saw ... ok
+test tests::a_reservoir_over_its_cap_represents_the_late_stream ... ok
+test tests::the_maximum_is_exact_whatever_the_reservoir_kept ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/wire.rs (target/debug/deps/wire-c1456e7f9f4aae90)
+
+running 23 tests
+test a_prepared_select_answers_a_binary_row ... ok
+test a_reset_connection_counts_no_rollback ... ok
+test a_postgres_function_call_is_a_tpcc_transaction ... ok
+test the_district_sum_is_answered_on_the_postgres_port ... ok
+test the_banner_says_which_backend_each_shard_got ... ok
+test a_prepared_statement_survives_being_executed_twice ... ok
+test out_parameters_answer_one_plausible_row ... ok
+test pipelined_commands_are_answered_in_order ... ok
+test a_multi_statement_query_is_answered_in_order ... ok
+test a_client_connects_queries_and_quits ... ok
+test the_district_sum_follows_the_warehouse_count ... ok
+test a_transaction_shows_in_the_status_of_every_answer ... ok
+test the_district_sum_is_what_a_tpcc_client_reads_for_nopm ... ok
+test a_select_answers_the_same_shape_on_both_protocols ... ok
+test a_routine_body_leaves_no_transaction_behind ... ok
+test an_injected_failure_is_an_error_on_both_protocols ... ok
+test the_commit_counters_are_what_a_tpcc_client_reads_for_tpm ... ok
+test a_transaction_is_counted_at_commit_on_both_protocols ... ok
+test both_binary_names_serve ... ok
+test a_shard_without_a_ring_serves_on_epoll ... ok
+test a_null_is_data_without_the_profile_on_both_ports ... ok
+test the_synthetic_answers_need_the_profile ... ok
+test each_port_speaks_its_own_protocol ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+   Doc-tests db_noop
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+exit=0

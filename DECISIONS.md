@@ -61,3 +61,17 @@ than the ring, and it cannot be validated on the host that found it. It needs
 `#[cfg(target_os = "linux")]` guards (or an `Io::Uring` that exists everywhere and is
 refused by `Io::parse` off Linux) plus a non-Linux CI job. Until then the crate is
 Linux-only in fact, whatever the comment on `libc` says.
+
+## D5 — The gate ran on lab2x1, and its log is added with this entry
+
+**Question:** the gate cannot run on the machine the branch was written on (D4), so how
+is a reviewer to see that it passed?
+
+**Decision:** `docs/gate-2026-10-31.log` holds the exact commands, host, toolchain and
+output of `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` and
+`cargo test --workspace` from lab2x1. The log and this entry are added by the same
+commit, and that commit changes nothing else: the tree the log names is its parent, so
+the log's tree and the head are the same code.
+
+**Why:** a result that lives only in a chat message is not evidence a later reader can
+check, and the host that can run the gate is not the host that holds the worktree.
