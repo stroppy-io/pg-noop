@@ -4,6 +4,9 @@ Throughput of db-noop itself: the number a benchmark plateaus near, with the
 reply count taken from the wire. It says how fast a **client** is when the server
 is not the constraint.
 
+Every number below is a record of a run, not a reproducible artefact of this tree.
+Where a table names the commit it was measured at, that is the tree that produced it.
+
 ## Reproducing
 
 ```sh
@@ -23,6 +26,11 @@ the packets that end an answer.
 
 `select 1`, extended protocol, statement prepared once, one shard per core on an
 idle 16-core / 32-thread host, 32 connections:
+
+**Historical.** These were measured on the PostgreSQL-only tree at `a436f4c`
+(2026-09-14), and no run log in this tree records them. They are kept as the shape
+of the limit, not as a claim about this build; `saturate` is what would measure it
+again.
 
 | depth | q/s | µs/query |
 |---|---|---|
@@ -44,6 +52,9 @@ AMD Ryzen AI MAX+ 395, four shards, 32 connections, `DBNOOP_PBUF=8`, medians of
 three runs. The host carried another tenant's load average of 4–12 throughout, so
 read the shape rather than the ratio: depth 1 is one answer per round trip, and
 MySQL costs what PostgreSQL costs.
+
+**Historical too**, from `88da3ef` (2026-10-28); again, nothing in the tree
+reproduces the run.
 
 | depth | PostgreSQL (q/s) | MySQL (q/s) |
 |---|---|---|
