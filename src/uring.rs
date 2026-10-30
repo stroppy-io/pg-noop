@@ -2715,11 +2715,13 @@ mod tests {
             );
             std::hint::spin_loop();
         }
-        s.write_all(&q[q.len() - 3..]).expect("second half");
+        // Asserted before the second half is written: after it, the shard may already
+        // have read it, and the count would say two for a reason the test is not about.
         assert!(
             stats.reads.load(Ordering::Relaxed) == before + 1,
             "the first half alone must be one receive"
         );
+        s.write_all(&q[q.len() - 3..]).expect("second half");
 
         let frames = read_until_ready(&mut s).expect("reply to a split query");
         assert_eq!(frames.len(), 4, "one answer, not two: {frames:?}");
