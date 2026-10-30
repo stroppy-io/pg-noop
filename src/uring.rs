@@ -325,6 +325,13 @@ impl Plan {
             Some(false) => s.push_str(" PBUF_RING"),
             None => {}
         }
+        // SQPOLL is asked for out of band, so silence about it is ambiguous: say it was
+        // never asked for, rather than let a reader infer it from a missing name.
+        if !self.granted.contains(&"SQPOLL")
+            && !self.dropped.iter().any(|(name, _)| *name == "SQPOLL")
+        {
+            s.push_str(" (SQPOLL not requested)");
+        }
         if !self.dropped.is_empty() {
             s.push_str("; dropped: ");
             for (i, (name, errno)) in self.dropped.iter().enumerate() {
@@ -2598,6 +2605,44 @@ mod tests {
             assert!(plan.granted.contains(&name), "{name} must still be granted");
         }
         assert!(plan.setup.cqsize);
+    }
+
+    /// The report names the granted set, the refusals, and the SQPOLL question: a run
+    /// is only reproducible if its log says which ring produced it.
+    #[test]
+    fn the_report_names_what_was_granted_refused_and_asked_for() {
+        let plan = Plan {
+            setup: Setup::default(),
+            granted: vec!["SINGLE_ISSUER", "COOP_TASKRUN", "DEFER_TASKRUN"],
+            dropped: vec![("SUBMIT_ALL", libc::EINVAL)],
+            ring_fd: true,
+            pbuf: Some(false),
+            pbuf_errno: None,
+            absent: None,
+        };
+        let line = plan.describe();
+        for name in [
+            "SINGLE_ISSUER",
+            "COOP_TASKRUN",
+            "DEFER_TASKRUN",
+            "RING_FD",
+            "PBUF_RING",
+        ] {
+            assert!(line.contains(name), "{name} missing from {line:?}");
+        }
+        assert!(line.contains("SUBMIT_ALL after EINVAL"), "{line}");
+        assert!(line.contains("SQPOLL not requested"), "{line}");
+
+        // Asked for and refused: the refusal is named, and the line does not also claim
+        // the flag was never asked for.
+        let refused = Plan {
+            granted: Vec::new(),
+            dropped: vec![("SQPOLL", libc::EPERM)],
+            ..plan
+        };
+        let line = refused.describe();
+        assert!(line.contains("dropped: SQPOLL after EPERM"), "{line}");
+        assert!(!line.contains("SQPOLL not requested"), "{line}");
     }
 
     /// `TASKRUN_FLAG` is a notification bit the kernel refuses unless task work is

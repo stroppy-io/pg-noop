@@ -678,7 +678,6 @@ pub fn run() {
     // What the ring actually granted, and how it was paid for.
     // Reported here as well as at startup because this is the line a run's log keeps,
     // and a measurement is only reproducible if it says which ring produced it.
-    // What the ring actually granted, and how it was paid for.
     #[cfg(target_os = "linux")]
     {
         let ring: usize = banners
