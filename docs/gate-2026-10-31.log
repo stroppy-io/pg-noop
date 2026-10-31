@@ -1,5 +1,5 @@
 # db-noop gate log
-# tree: 25cee95 (agent/dbnoop-open-lows; parent of the commit that adds this file)
+# tree: 92fc60f (agent/dbnoop-open-lows; the tree of 63d05e3, the parent of the commit that adds this file)
 # base: dd6449b (main-v030, the live db-noop line)
 # host: Linux 7.0.0-31-generic x86_64
 # cores: 32
@@ -325,3 +325,29 @@ running 0 tests
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
 exit=0
+
+## The banner, before and after item 4 — captured, not quoted
+
+Two builds on the campaign host (Linux 7.0.0-31-generic, 2026-10-31T12:20:09Z), the pair item 4's repair exists to show. Both were
+built here from the trees named, and both lines below are copied from what the binaries printed.
+
+**Before** — `f901b6b^` (05c5d1f), built as `pgnoop` because the crate
+carried that name then (`cargo build --release --bin pgnoop`):
+
+```
+pgnoop listening on 0.0.0.0:25433 (32 shards, io_uring, SO_REUSEPORT, pinned=32/32)
+```
+
+The ring is named; **what the kernel granted it is not**.
+
+**After** — `5584872` (this branch's head), `cargo build --release --bin dbnoop`:
+
+```
+dbnoop: io_uring granted: SINGLE_ISSUER DEFER_TASKRUN COOP_TASKRUN TASKRUN_FLAG NO_SQARRAY CLAMP SUBMIT_ALL CQSIZE RING_FD PBUF_RING (PBUF_RING_INC granted, unused: a buffer's ownership is not reported while a receive holds it) (SQPOLL not requested)
+dbnoop postgres listening on 0.0.0.0:25434 (2 shards, SO_REUSEPORT, serving 2/2 (io_uring 2, epoll 0), pinned=2/2)
+```
+
+Two things this pair is worth: the granted set is named, and `(SQPOLL not requested)` says what the run asked
+for rather than leaving a reader to assume. One correction to the surrounding record: the clause itself
+came in `932b016`, before this branch, so the "after" line is the line this branch's log vouches for, not a
+line this branch changed — the branch changes two documents and no code.
